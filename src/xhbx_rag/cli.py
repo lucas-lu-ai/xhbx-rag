@@ -6,9 +6,16 @@ from pathlib import Path
 from typing import Sequence
 
 from .chunk_builder import build_chunks
+from .config import RetrievalConfig
+from .embedding import EmbeddingClient
+from .indexer import index_chunks
+from .milvus_store import MilvusLiteStore
 from .normalizer import normalize_case
 from .parser import ParseFatalError, parse_inputs
+from .query_understanding import QueryUnderstandingAgent
+from .rerank import RerankClient
 from .report import build_parse_report
+from .search import search_evidence
 from .writer import write_outputs
 
 
@@ -22,6 +29,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parse_parser.add_argument("--insights", required=True, type=Path)
     parse_parser.add_argument("--playbook", type=Path, default=None)
     parse_parser.add_argument("--out", required=True, type=Path)
+
+    index_parser = subparsers.add_parser("index", help="写入 chunks.jsonl 到 Milvus Lite")
+    index_parser.add_argument("--chunks", required=True, type=Path)
+
+    search_parser = subparsers.add_parser("search", help="检索销售洞察 evidence chunks")
+    search_parser.add_argument("--query", required=True)
+    search_parser.add_argument("--top-n", type=int, default=20)
+    search_parser.add_argument("--top-k", type=int, default=5)
     return parser
 
 
@@ -69,10 +84,63 @@ def _cmd_parse(args: argparse.Namespace) -> int:
     return 0
 
 
+def _embedding_client(config: RetrievalConfig) -> EmbeddingClient:
+    return EmbeddingClient(
+        base_url=config.embedding_base_url,
+        api_key=config.embedding_api_key,
+        model=config.embedding_model_name,
+    )
+
+
+def _milvus_store(config: RetrievalConfig) -> MilvusLiteStore:
+    return MilvusLiteStore(
+        db_path=config.milvus_lite_path,
+        collection_name=config.milvus_collection,
+    )
+
+
+def _cmd_index(args: argparse.Namespace) -> int:
+    config = RetrievalConfig.from_env()
+    count = index_chunks(
+        args.chunks,
+        _embedding_client(config),
+        _milvus_store(config),
+    )
+    print(json.dumps({"indexed": count}, ensure_ascii=False))
+    return 0
+
+
+def _cmd_search(args: argparse.Namespace) -> int:
+    config = RetrievalConfig.from_env()
+    result = search_evidence(
+        query=args.query,
+        query_agent=QueryUnderstandingAgent(
+            base_url=config.base_url,
+            api_key=config.api_key,
+            model=config.model_name,
+        ),
+        embedding_client=_embedding_client(config),
+        store=_milvus_store(config),
+        reranker=RerankClient(
+            base_url=config.rerank_base_url,
+            api_key=config.rerank_api_key,
+            model=config.rerank_model_name,
+        ),
+        top_n=args.top_n,
+        top_k=args.top_k,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     if args.command == "parse":
         return _cmd_parse(args)
+    if args.command == "index":
+        return _cmd_index(args)
+    if args.command == "search":
+        return _cmd_search(args)
     parser.error(f"未知命令: {args.command}")
     return 2
