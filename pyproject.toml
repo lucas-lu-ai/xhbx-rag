@@ -1,0 +1,25 @@
+[project]
+name = "xhbx-rag"
+version = "0.1.0"
+description = "Sales insight parsing utilities for xhbx Agentic RAG"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "agentscope==2.0.3",
+]
+
+[project.scripts]
+xhbx-rag = "xhbx_rag.cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
