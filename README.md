@@ -84,6 +84,46 @@ uv run xhbx-rag index \
   --trace
 ```
 
+## AgentScope Studio 可视化
+
+如果希望在可视化界面里查看每一步执行结果，可以先启动 AgentScope Studio：
+
+```bash
+npm install -g @agentscope/studio
+as_studio
+```
+
+默认情况下，Studio Web UI 在 `http://localhost:3000`，OTLP gRPC trace endpoint 在 `localhost:4317`。
+
+检索时打开 Studio trace：
+
+```bash
+uv run xhbx-rag search \
+  --query "客户不想聊保险怎么开场？" \
+  --top-n 20 \
+  --top-k 5 \
+  --studio
+```
+
+索引时也可以打开 Studio trace：
+
+```bash
+uv run xhbx-rag index \
+  --chunks parsed/案例a_b2bb7fa579/chunks.jsonl \
+  --studio
+```
+
+如果 Studio 使用了不同的 OTLP gRPC 地址，可以显式指定：
+
+```bash
+uv run xhbx-rag search \
+  --query "客户不想聊保险怎么开场？" \
+  --studio \
+  --studio-endpoint localhost:4317
+```
+
+`--studio` 和 `--trace` 可以同时使用：前者把 span 发到 AgentScope Studio，后者把 JSONL 写到 `stderr`。
+
 `search` 不会直接向量化原始 query。流程是：
 
 1. 调用 query understanding，把原始问题改写成 `rewritten_query` 并抽取过滤条件。

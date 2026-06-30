@@ -119,3 +119,56 @@ def test_cli_search_trace_writes_step_events_to_stderr(monkeypatch, capsys) -> N
     trace_event = json.loads(captured.err)
     assert trace_event["step"] == "search.query_understood"
     assert trace_event["payload"]["rewritten_query"] == "客户抗拒谈保险"
+
+
+def test_cli_search_studio_uses_studio_trace_sink(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(cli.RetrievalConfig, "from_env", _fake_config)
+    monkeypatch.setattr(cli, "QueryUnderstandingAgent", lambda **kwargs: "agent")
+    monkeypatch.setattr(cli, "EmbeddingClient", lambda **kwargs: "embedding")
+    monkeypatch.setattr(cli, "MilvusLiteStore", lambda **kwargs: "store")
+    monkeypatch.setattr(cli, "RerankClient", lambda **kwargs: "reranker")
+    calls = {}
+
+    class _FakeStudioSink:
+        def emit(self, step, payload):
+            calls["emitted"] = {"step": step, "payload": payload}
+
+        def close(self):
+            calls["closed"] = True
+
+    def fake_create_studio_trace_sink(*, endpoint, root_name):
+        calls["studio_endpoint"] = endpoint
+        calls["root_name"] = root_name
+        return _FakeStudioSink()
+
+    def fake_search_evidence(**kwargs):
+        calls["trace"] = kwargs["trace"]
+        kwargs["trace"].emit("search.completed", {"result_count": 1})
+        return {
+            "original_query": "客户不想聊保险怎么开场？",
+            "rewritten_query": "客户抗拒谈保险",
+            "intent": "script_search",
+            "filters": {"chunk_types": ["script"]},
+            "results": [{"chunk_id": "c1"}],
+        }
+
+    monkeypatch.setattr(cli, "create_studio_trace_sink", fake_create_studio_trace_sink)
+    monkeypatch.setattr(cli, "search_evidence", fake_search_evidence)
+
+    exit_code = cli.main(
+        [
+            "search",
+            "--query",
+            "客户不想聊保险怎么开场？",
+            "--studio",
+            "--studio-endpoint",
+            "localhost:4317",
+        ]
+    )
+
+    assert exit_code == 0
+    assert json.loads(capsys.readouterr().out)["results"][0]["chunk_id"] == "c1"
+    assert calls["studio_endpoint"] == "localhost:4317"
+    assert calls["root_name"] == "xhbx-rag.search"
+    assert calls["emitted"] == {"step": "search.completed", "payload": {"result_count": 1}}
+    assert calls["closed"] is True

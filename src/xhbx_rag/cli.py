@@ -12,7 +12,13 @@ from .embedding import EmbeddingClient
 from .indexer import index_chunks
 from .milvus_store import MilvusLiteStore
 from .normalizer import normalize_case
-from .observability import JsonlTraceSink
+from .observability import (
+    CompositeTraceSink,
+    JsonlTraceSink,
+    TraceSink,
+    close_trace,
+    create_studio_trace_sink,
+)
 from .parser import ParseFatalError, parse_inputs
 from .query_understanding import QueryUnderstandingAgent
 from .rerank import RerankClient
@@ -35,12 +41,24 @@ def _build_parser() -> argparse.ArgumentParser:
     index_parser = subparsers.add_parser("index", help="写入 chunks.jsonl 到 Milvus Lite")
     index_parser.add_argument("--chunks", required=True, type=Path)
     index_parser.add_argument("--trace", action="store_true", help="将步骤 trace 以 JSONL 写到 stderr")
+    index_parser.add_argument("--studio", action="store_true", help="将步骤 trace 发送到 AgentScope Studio")
+    index_parser.add_argument(
+        "--studio-endpoint",
+        default="localhost:4317",
+        help="AgentScope Studio OTLP gRPC endpoint，默认 localhost:4317",
+    )
 
     search_parser = subparsers.add_parser("search", help="检索销售洞察 evidence chunks")
     search_parser.add_argument("--query", required=True)
     search_parser.add_argument("--top-n", type=int, default=20)
     search_parser.add_argument("--top-k", type=int, default=5)
     search_parser.add_argument("--trace", action="store_true", help="将步骤 trace 以 JSONL 写到 stderr")
+    search_parser.add_argument("--studio", action="store_true", help="将步骤 trace 发送到 AgentScope Studio")
+    search_parser.add_argument(
+        "--studio-endpoint",
+        default="localhost:4317",
+        help="AgentScope Studio OTLP gRPC endpoint，默认 localhost:4317",
+    )
     return parser
 
 
@@ -103,40 +121,64 @@ def _milvus_store(config: RetrievalConfig) -> MilvusLiteStore:
     )
 
 
+def _trace_sink(args: argparse.Namespace, root_name: str) -> TraceSink | None:
+    sinks: list[TraceSink] = []
+    if args.trace:
+        sinks.append(JsonlTraceSink(sys.stderr))
+    if args.studio:
+        sinks.append(
+            create_studio_trace_sink(
+                endpoint=args.studio_endpoint,
+                root_name=root_name,
+            )
+        )
+    if not sinks:
+        return None
+    if len(sinks) == 1:
+        return sinks[0]
+    return CompositeTraceSink(sinks)
+
+
 def _cmd_index(args: argparse.Namespace) -> int:
     config = RetrievalConfig.from_env()
-    trace = JsonlTraceSink(sys.stderr) if args.trace else None
-    count = index_chunks(
-        args.chunks,
-        _embedding_client(config),
-        _milvus_store(config),
-        trace=trace,
-    )
+    trace = _trace_sink(args, "xhbx-rag.index")
+    try:
+        count = index_chunks(
+            args.chunks,
+            _embedding_client(config),
+            _milvus_store(config),
+            trace=trace,
+        )
+    finally:
+        close_trace(trace)
     print(json.dumps({"indexed": count}, ensure_ascii=False))
     return 0
 
 
 def _cmd_search(args: argparse.Namespace) -> int:
     config = RetrievalConfig.from_env()
-    trace = JsonlTraceSink(sys.stderr) if args.trace else None
-    result = search_evidence(
-        query=args.query,
-        query_agent=QueryUnderstandingAgent(
-            base_url=config.base_url,
-            api_key=config.api_key,
-            model=config.model_name,
-        ),
-        embedding_client=_embedding_client(config),
-        store=_milvus_store(config),
-        reranker=RerankClient(
-            base_url=config.rerank_base_url,
-            api_key=config.rerank_api_key,
-            model=config.rerank_model_name,
-        ),
-        top_n=args.top_n,
-        top_k=args.top_k,
-        trace=trace,
-    )
+    trace = _trace_sink(args, "xhbx-rag.search")
+    try:
+        result = search_evidence(
+            query=args.query,
+            query_agent=QueryUnderstandingAgent(
+                base_url=config.base_url,
+                api_key=config.api_key,
+                model=config.model_name,
+            ),
+            embedding_client=_embedding_client(config),
+            store=_milvus_store(config),
+            reranker=RerankClient(
+                base_url=config.rerank_base_url,
+                api_key=config.rerank_api_key,
+                model=config.rerank_model_name,
+            ),
+            top_n=args.top_n,
+            top_k=args.top_k,
+            trace=trace,
+        )
+    finally:
+        close_trace(trace)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
