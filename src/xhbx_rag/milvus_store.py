@@ -108,6 +108,10 @@ class MilvusLiteStore:
         )
         self.client.flush(self.collection_name)
 
+    def drop_collection(self) -> None:
+        if self.client.has_collection(self.collection_name):
+            self.client.drop_collection(self.collection_name)
+
     def search(
         self,
         vector: list[float],

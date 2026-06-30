@@ -37,7 +37,7 @@ def _evidence_block(refs: list[EvidenceRef]) -> list[str]:
     values: list[str] = []
     seen: set[str] = set()
     for ref in refs:
-        text = ref.context.strip() or ref.quote.strip()
+        text = ref.source_excerpt.strip() or ref.context.strip() or ref.quote.strip()
         if not text or text in seen:
             continue
         seen.add(text)

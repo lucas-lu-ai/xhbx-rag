@@ -29,11 +29,12 @@ def test_cli_index_uses_retrieval_components(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(cli, "EmbeddingClient", lambda **kwargs: "embedding")
     monkeypatch.setattr(cli, "MilvusLiteStore", lambda **kwargs: "store")
 
-    def fake_index_chunks(chunks_path, embedding_client, store, trace=None):
+    def fake_index_chunks(chunks_path, embedding_client, store, trace=None, mode="incremental"):
         calls["chunks_path"] = chunks_path
         calls["embedding_client"] = embedding_client
         calls["store"] = store
         calls["trace"] = trace
+        calls["mode"] = mode
         return 3
 
     monkeypatch.setattr(cli, "index_chunks", fake_index_chunks)
@@ -46,6 +47,38 @@ def test_cli_index_uses_retrieval_components(monkeypatch, tmp_path) -> None:
         "embedding_client": "embedding",
         "store": "store",
         "trace": None,
+        "mode": "incremental",
+    }
+
+
+def test_cli_index_passes_rebuild_mode(monkeypatch, tmp_path) -> None:
+    chunks = tmp_path / "chunks.jsonl"
+    chunks.write_text("", encoding="utf-8")
+    calls = {}
+
+    monkeypatch.setattr(cli.RetrievalConfig, "from_env", _fake_config)
+    monkeypatch.setattr(cli, "EmbeddingClient", lambda **kwargs: "embedding")
+    monkeypatch.setattr(cli, "MilvusLiteStore", lambda **kwargs: "store")
+
+    def fake_index_chunks(chunks_path, embedding_client, store, trace=None, mode="incremental"):
+        calls["chunks_path"] = chunks_path
+        calls["embedding_client"] = embedding_client
+        calls["store"] = store
+        calls["trace"] = trace
+        calls["mode"] = mode
+        return 3
+
+    monkeypatch.setattr(cli, "index_chunks", fake_index_chunks)
+
+    exit_code = cli.main(["index", "--chunks", str(chunks), "--mode", "rebuild"])
+
+    assert exit_code == 0
+    assert calls == {
+        "chunks_path": chunks,
+        "embedding_client": "embedding",
+        "store": "store",
+        "trace": None,
+        "mode": "rebuild",
     }
 
 

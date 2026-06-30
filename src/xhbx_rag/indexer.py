@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 from .chunk_io import load_chunks_jsonl
 from .milvus_store import MilvusChunkRecord
 from .observability import TraceSink, emit_trace
+
+IndexMode = Literal["incremental", "rebuild"]
 
 
 class _EmbeddingClient(Protocol):
@@ -17,6 +19,9 @@ class _Store(Protocol):
     def ensure_collection(self, vector_dim: int) -> None:
         """Ensure target collection exists."""
 
+    def drop_collection(self) -> None:
+        """Drop target collection if it exists."""
+
     def upsert(self, records: list[MilvusChunkRecord]) -> None:
         """Upsert records."""
 
@@ -26,14 +31,20 @@ def index_chunks(
     embedding_client: _EmbeddingClient,
     store: _Store,
     trace: TraceSink | None = None,
+    mode: IndexMode = "incremental",
 ) -> int:
+    if mode not in ("incremental", "rebuild"):
+        raise ValueError(f"未知 index mode: {mode}")
     chunks = load_chunks_jsonl(chunks_path)
     emit_trace(
         trace,
         "index.chunks_loaded",
-        {"chunks_path": str(chunks_path), "chunk_count": len(chunks)},
+        {"chunks_path": str(chunks_path), "chunk_count": len(chunks), "mode": mode},
     )
     if not chunks:
+        if mode == "rebuild":
+            store.drop_collection()
+            emit_trace(trace, "index.collection_dropped", {"mode": mode})
         return 0
     vectors = embedding_client.embed_documents([chunk.text for chunk in chunks])
     if len(vectors) != len(chunks):
@@ -46,6 +57,9 @@ def index_chunks(
         "index.embedding_completed",
         {"chunk_count": len(chunks), "vector_count": len(vectors), "vector_dim": vector_dim},
     )
+    if mode == "rebuild":
+        store.drop_collection()
+        emit_trace(trace, "index.collection_dropped", {"mode": mode})
     store.ensure_collection(vector_dim)
     emit_trace(trace, "index.collection_ready", {"vector_dim": vector_dim})
     store.upsert(

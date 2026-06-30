@@ -207,6 +207,58 @@ def test_sales_insight_agentscope_agent_uses_structured_tool_call() -> None:
     assert "MUST" in call["messages"][1].get_text_content()
 
 
+def test_sales_insight_agent_prompt_includes_line_numbers_for_source_refs() -> None:
+    chat_model = _FakeStructuredToolChatModel(
+        {
+            "case_name": "案例A",
+            "section_name": "第1节",
+            "sales_actions": [
+                {
+                    "action": "识别理赔价值",
+                    "evidence": "客户一周内收到赔款",
+                    "source_refs": [
+                        {
+                            "filename": "a.txt",
+                            "quote": "他这90万的赔款在一周以内全部到账",
+                            "locator": {"line_start": 2, "line_end": 4},
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    agent = SalesInsightAgentScopeAgent(
+        base_url="https://api.example.com/v1",
+        api_key="secret",
+        model="chat-model",
+        chat_model=chat_model,
+        retry_base_delay=0,
+    )
+    section = SourceSection(
+        case_name="案例A",
+        section_name="第1节",
+        section_dir="案例A/第1节",
+        sources=(
+            ParsedSourceFile(
+                source_id="txt:a.txt",
+                source_type="txt",
+                filename="a.txt",
+                source_path="案例A/第1节/a.txt",
+                text="开场白\n他这90万的赔款\n在一周以来\n全部到账\n",
+            ),
+        ),
+    )
+
+    evidence = agent.extract_section(section)
+
+    user_text = chat_model.calls[0]["messages"][1].get_text_content()
+    assert "L001: 开场白" in user_text
+    assert "L002: 他这90万的赔款" in user_text
+    assert "line_start/line_end" in user_text
+    ref = evidence.sales_actions[0].source_refs[0]
+    assert ref.locator["line_start"] == 2
+
+
 def test_sales_insight_agentscope_agent_unwraps_nested_structured_output() -> None:
     chat_model = _FakeStructuredToolChatModel(
         {

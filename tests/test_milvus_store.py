@@ -86,6 +86,19 @@ def test_milvus_lite_store_loads_released_collection_before_search(tmp_path) -> 
     assert results[0].chunk.chunk_id == "chunk-1"
 
 
+def test_milvus_lite_store_drop_collection_removes_existing_collection(tmp_path) -> None:
+    store = MilvusLiteStore(
+        db_path=tmp_path / "rag.db",
+        collection_name="test_chunks",
+    )
+
+    store.ensure_collection(vector_dim=3)
+    store.drop_collection()
+    store.drop_collection()
+
+    assert store.client.has_collection(store.collection_name) is False
+
+
 def test_milvus_lite_store_keyword_search_ranks_exact_term_matches(tmp_path) -> None:
     store = MilvusLiteStore(
         db_path=tmp_path / "rag.db",

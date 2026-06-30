@@ -95,6 +95,12 @@ def _build_parser() -> argparse.ArgumentParser:
     index_parser = subparsers.add_parser("index", help="写入 chunks.jsonl 到 Milvus Lite")
     index_parser.add_argument("--chunks", required=True, type=Path)
     index_parser.add_argument(
+        "--mode",
+        choices=["incremental", "rebuild"],
+        default="incremental",
+        help="入库模式：incremental 使用 upsert 增量覆盖同 chunk_id；rebuild 清空 collection 后重新入库",
+    )
+    index_parser.add_argument(
         "--trace",
         action="store_true",
         help="将步骤 trace 以 JSONL 写到 stderr",
@@ -282,6 +288,7 @@ def _cmd_index(args: argparse.Namespace) -> int:
             _embedding_client(config),
             _milvus_store(config),
             trace=trace,
+            mode=args.mode,
         )
     finally:
         close_trace(trace)

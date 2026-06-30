@@ -27,14 +27,22 @@ class _FakeStore:
     def __init__(self) -> None:
         self.ensured_dims: list[int] = []
         self.records = []
+        self.drop_calls = 0
+        self.operations: list[str] = []
         self.search_calls = []
         self.hits: list[MilvusSearchHit] = []
 
     def ensure_collection(self, vector_dim: int) -> None:
         self.ensured_dims.append(vector_dim)
+        self.operations.append(f"ensure_collection:{vector_dim}")
 
     def upsert(self, records) -> None:
         self.records.extend(records)
+        self.operations.append(f"upsert:{len(records)}")
+
+    def drop_collection(self) -> None:
+        self.drop_calls += 1
+        self.operations.append("drop_collection")
 
     def search(self, vector: list[float], top_k: int, filters: dict):
         self.search_calls.append({"vector": vector, "top_k": top_k, "filters": filters})
@@ -118,6 +126,23 @@ def test_index_chunks_embeds_chunk_text_and_upserts_records(tmp_path) -> None:
     assert embedding.documents == [["文本1", "文本2"]]
     assert store.ensured_dims == [2]
     assert [record.chunk.chunk_id for record in store.records] == ["c1", "c2"]
+    assert store.drop_calls == 0
+
+
+def test_index_chunks_rebuild_drops_collection_before_upsert(tmp_path) -> None:
+    chunks_path = tmp_path / "chunks.jsonl"
+    chunks_path.write_text(
+        json.dumps(_chunk("c1", "文本1").model_dump(mode="json"), ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    embedding = _FakeEmbedding()
+    store = _FakeStore()
+
+    count = index_chunks(chunks_path, embedding, store, mode="rebuild")
+
+    assert count == 1
+    assert embedding.documents == [["文本1"]]
+    assert store.operations == ["drop_collection", "ensure_collection:2", "upsert:1"]
 
 
 def test_index_chunks_emits_trace_events(tmp_path) -> None:

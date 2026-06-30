@@ -48,6 +48,7 @@ uv run xhbx-rag generate-insights \
 - 对单个来源文件失败做隔离，其他来源仍会继续处理
 - 对接口/网络错误走模型客户端重试；对结构化内容错误，会把校验错误和上次输出加入上下文后继续请求模型修复
 - 对章节失败做隔离并写入 `*.sales_evidence.failed.json`，只要还有成功章节，就继续汇总输出案例级 JSON 和 MD
+- 给模型的素材会带 `L001` 形式的行号；模型可以写归纳后的 `quote`，但必须在 `locator.line_start/line_end` 标明支撑它的原文行
 - 使用结构化 tool-call 生成节级/案例级 JSON，默认开启 Qwen 思考模式；如需快速调试或网络不稳可加 `--no-thinking`
 
 网络不稳或模型响应慢时，可以调这些参数：
@@ -68,8 +69,9 @@ uv run xhbx-rag generate-insights \
 ```json
 {
   "filename": "第1节.track-0.txt",
-  "quote": "客户说每年不能超过80万",
+  "quote": "客户每年保费预算不能超过80万",
   "context": "老师开场\n客户说每年不能超过80万\n销售回应可以看缴费期满的保单",
+  "source_excerpt": "客户说每年不能超过80万",
   "source_type": "txt",
   "source_path": "案例A/第1节/第1节.track-0.txt",
   "locator": {
@@ -78,10 +80,16 @@ uv run xhbx-rag generate-insights \
     "char_start": 4,
     "char_end": 17
   },
-  "locator_confidence": "exact",
+  "locator_confidence": "validated_span",
+  "locator_error": "",
   "anchor_id": "txt:第1节.track-0.txt#line-2"
 }
 ```
+
+如果模型给出的行号不合法，且 `quote` 也无法回查到原文，系统会尽量补上
+`source_path/source_type`，并将 `locator_confidence` 标记为 `unmatched`、
+`locator_error` 标明失败原因。已有旧 JSON 不会自动补全这些字段，需要重新执行
+`generate-insights -> parse -> index`。
 
 ## 解析销售洞察
 
@@ -114,6 +122,23 @@ uv run xhbx-rag answer --query "客户说每年不能超过80万怎么办？" --
 ```bash
 uv run xhbx-rag index \
   --chunks parsed/案例a_b2bb7fa579/chunks.jsonl
+```
+
+默认入库模式是增量更新：
+
+```bash
+uv run xhbx-rag index \
+  --chunks parsed/案例a_b2bb7fa579/chunks.jsonl \
+  --mode incremental
+```
+
+`incremental` 会使用 `chunk_id` 做 upsert：同一个 `chunk_id` 会被覆盖，不同 `chunk_id`
+会继续保留。如果希望清空当前 Milvus collection 的所有内容后再重新入库，使用：
+
+```bash
+uv run xhbx-rag index \
+  --chunks parsed/案例a_b2bb7fa579/chunks.jsonl \
+  --mode rebuild
 ```
 
 本地检索命令：

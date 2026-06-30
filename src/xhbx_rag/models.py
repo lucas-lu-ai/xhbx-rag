@@ -50,8 +50,10 @@ class EvidenceRef(BaseModel):
     source_path: str = ""
     quote: str = ""
     context: str = ""
+    source_excerpt: str = ""
     locator: dict[str, Any] = Field(default_factory=dict)
     locator_confidence: str = ""
+    locator_error: str = ""
     anchor_id: str = ""
 
 

@@ -935,6 +935,7 @@ def _render_section_material(
         f"案例：{section.case_name}",
         f"章节：{section.section_name}",
         "请基于以下原始素材采集销售证据。",
+        "引用定位要求：素材正文带 L 行号，source_refs.locator 必须填写 line_start/line_end。",
     ]
     for source in section.sources:
         if source.is_empty:
@@ -944,12 +945,12 @@ def _render_section_material(
             f"{source.source_type} ｜ 文件：{source.filename} "
             f"｜ source_id：{source.source_id} ====="
         )
-        text = source.text
+        text = _numbered_source_text(source.text)
         used = len("\n\n".join(blocks))
         remaining = max_chars - used - len(header) - 4
         marker = "\n[内容已截断]"
         if remaining <= len(marker):
-            blocks.append("[后续素材因上下文长度限制省略]")
+            blocks.append("[后续素材因上下文长度限制省略]\n[内容已截断]")
             break
         if len(text) > remaining:
             text = text[: max(0, remaining - len(marker))].rstrip() + marker
@@ -964,6 +965,13 @@ def _render_section_material(
         if len("\n\n".join(blocks)) >= max_chars:
             break
     return "\n\n".join(blocks)
+
+
+def _numbered_source_text(text: str) -> str:
+    lines = text.splitlines()
+    if not lines:
+        return ""
+    return "\n".join(f"L{index:03d}: {line}" for index, line in enumerate(lines, start=1))
 
 
 def _render_case_sales_evidence(
@@ -1531,11 +1539,14 @@ _SECTION_SYSTEM_PROMPT = """你是保险公司 AI 教练系统的销售证据采
 
 要求：
 1. 严格基于素材，不得杜撰客户背景、产品条款、收益、理赔或监管要求。
-2. 每条 source_refs 至少保留 filename 和 quote；如果素材里能判断 section_name/source_id，也要保留。
-3. source_refs 的 quote 必须尽量使用素材原文短片段，便于系统回查行号/页码。
-4. evidence、response_evidence、reason 需要写成 1-3 句完整证据说明，包含客户场景、销售动作或可复用点，不要只写标签。
-5. 只做证据采集，不要把单节内容包装成完整方法论。
-6. 不提取寒暄、致谢、无信息量口号和个人情绪抒发。"""
+2. 每条 source_refs 至少保留 filename、source_id、quote 和 locator。
+3. 素材正文每行都有 L001 这样的行号；source_refs.locator 必须填写能支持该证据的
+   line_start/line_end，行号只写数字，不要带 L 前缀。
+4. source_refs.quote 可以是对原文的简短证据表达，但必须被 locator 指向的原文行支持。
+   不要把无法定位到原文行的内容写入 source_refs。
+5. evidence、response_evidence、reason 需要写成 1-3 句完整证据说明，包含客户场景、销售动作或可复用点，不要只写标签。
+6. 只做证据采集，不要把单节内容包装成完整方法论。
+7. 不提取寒暄、致谢、无信息量口号和个人情绪抒发。"""
 
 
 _CASE_SYSTEM_PROMPT = """你是保险公司 AI 教练系统的案例级销售洞察专家。
@@ -1559,7 +1570,8 @@ _CASE_SYSTEM_PROMPT = """你是保险公司 AI 教练系统的案例级销售洞
 2. 策略是对证据的抽象，不能把没有证据的通用销售理论塞进结果。
 3. customer_journey、strategies、scripts、objection_handling 中每一项都必须保留 evidence_refs。
 4. evidence_refs 必须从输入证据的 source_refs 继承，保留 filename、quote、context、
-   source_id、source_type、source_path、locator、locator_confidence、anchor_id 等字段。
+   source_excerpt、source_id、source_type、source_path、locator、locator_confidence、
+   locator_error、anchor_id 等字段。
 5. coach_wording 可以更适合教练训练，但必须忠于 source_quote 的语义。
 6. 涉及收益、理赔、核保、产品责任、竞品比较时必须写合规提醒。
 7. 如果某个策略只是模型归纳，请保留 inferred=true，不要包装成公司标准打法。"""

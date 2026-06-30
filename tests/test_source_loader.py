@@ -45,6 +45,59 @@ def test_parse_txt_source_keeps_line_locator(tmp_path) -> None:
     )
 
 
+def test_enrich_ref_uses_model_provided_line_span_when_quote_is_paraphrased(
+    tmp_path,
+) -> None:
+    source = tmp_path / "第1节.track-0.txt"
+    source.write_text(
+        "开场白\n"
+        "他这90万的赔款\n"
+        "在一周以来\n"
+        "全部到账\n"
+        "客户很认可\n",
+        encoding="utf-8",
+    )
+    parsed = parse_source_file(source)
+    ref = EvidenceRef(
+        filename="第1节.track-0.txt",
+        quote="他这90万的赔款在一周以内全部到账",
+        locator={"line_start": 2, "line_end": 4},
+    )
+
+    enriched = enrich_evidence_ref_location(ref, (parsed,))
+
+    assert enriched.source_path == str(source)
+    assert enriched.locator["line_start"] == 2
+    assert enriched.locator["line_end"] == 4
+    assert enriched.locator["char_start"] == len("开场白\n")
+    assert enriched.locator_confidence == "validated_span"
+    assert enriched.source_excerpt == "他这90万的赔款\n在一周以来\n全部到账"
+    assert enriched.context == (
+        "开场白\n他这90万的赔款\n在一周以来\n全部到账\n客户很认可"
+    )
+
+
+def test_enrich_ref_marks_unmatched_when_line_span_and_quote_do_not_resolve(
+    tmp_path,
+) -> None:
+    source = tmp_path / "第1节.track-0.txt"
+    source.write_text("开场白\n客户关注预算\n", encoding="utf-8")
+    parsed = parse_source_file(source)
+    ref = EvidenceRef(
+        filename="第1节.track-0.txt",
+        quote="完全不存在的归纳句",
+        locator={"line_start": 99, "line_end": 100},
+    )
+
+    enriched = enrich_evidence_ref_location(ref, (parsed,))
+
+    assert enriched.source_type == "txt"
+    assert enriched.source_path == str(source)
+    assert enriched.locator == {}
+    assert enriched.locator_confidence == "unmatched"
+    assert enriched.locator_error == "line_span_invalid_and_quote_not_found"
+
+
 def test_load_case_sections_groups_supported_files_by_section_dir(tmp_path) -> None:
     case_dir = tmp_path / "案例A"
     section_dir = case_dir / "第1节"

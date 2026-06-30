@@ -254,7 +254,8 @@ def _evidence_text(search_result: dict[str, Any]) -> str:
                     filename=citation.get("filename", ""),
                     section=citation.get("section_name", ""),
                     location=_citation_location_text(citation),
-                    quote=citation.get("quote", ""),
+                    quote=citation.get("source_excerpt")
+                    or citation.get("quote", ""),
                 )
             )
             citation_index += 1

@@ -72,6 +72,7 @@ def _search_result() -> dict:
                         "section_name": "5.1 流程",
                         "source_id": "",
                         "quote": "用问话引导客户看表格，使其自行发现问题并产生解决意愿。",
+                        "source_excerpt": "客户自己看表后说，原来这里还有这么大的缺口。",
                     }
                 ],
             },
@@ -130,6 +131,7 @@ def test_answer_agent_posts_evidence_context_and_parses_json_response() -> None:
     assert "保单整理对客户有什么作用？" in user_content
     assert "[证据1]" in user_content
     assert "[引用1]" in user_content
+    assert "原文：客户自己看表后说，原来这里还有这么大的缺口。" in user_content
 
 
 def test_answer_agent_retries_transient_http_errors() -> None:

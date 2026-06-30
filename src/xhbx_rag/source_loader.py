@@ -117,39 +117,44 @@ def enrich_evidence_ref_location(
 ) -> EvidenceRef:
     candidates = _candidate_sources(ref, sources)
     for source in candidates:
+        span = _validated_line_span(ref, source)
+        if span is not None:
+            return _ref_with_resolved_span(
+                ref,
+                source,
+                span[0],
+                span[1],
+                confidence="validated_span",
+            )
         match = _find_quote_match(ref.quote, source.text)
         if match is None:
             continue
         start, end, confidence = match
         line_start = _line_number(source.text, start)
         line_end = _line_number(source.text, max(start, end - 1))
-        locator = dict(ref.locator)
-        locator.update(
-            {
-                "line_start": line_start,
-                "line_end": line_end,
-                "char_start": start,
-                "char_end": end,
-            }
-        )
-        locator.update(_structured_locator(source, source.text, line_start))
-        return ref.model_copy(
-            update={
-                "source_id": ref.source_id or source.source_id,
-                "filename": ref.filename or source.filename,
-                "source_type": ref.source_type or source.source_type,
-                "source_path": ref.source_path or source.source_path,
-                "context": ref.context
-                or _context_window(source.text, line_start, line_end),
-                "locator": locator,
-                "locator_confidence": ref.locator_confidence or confidence,
-                "anchor_id": ref.anchor_id
-                or f"{source.source_id}#line-{line_start}",
-            }
+        return _ref_with_resolved_span(
+            ref,
+            source,
+            line_start,
+            line_end,
+            confidence=confidence,
+            char_start=start,
+            char_end=end,
         )
 
-    if ref.locator:
-        return _fill_source_identity(ref, candidates[0]) if candidates else ref
+    if candidates:
+        error = (
+            "line_span_invalid_and_quote_not_found"
+            if _has_line_span(ref)
+            else "quote_not_found"
+        )
+        return _fill_source_identity(ref, candidates[0]).model_copy(
+            update={
+                "locator": {},
+                "locator_confidence": ref.locator_confidence or "unmatched",
+                "locator_error": ref.locator_error or error,
+            }
+        )
     return ref
 
 
@@ -463,6 +468,84 @@ def _fill_source_identity(ref: EvidenceRef, source: ParsedSourceFile) -> Evidenc
             "source_path": ref.source_path or source.source_path,
         }
     )
+
+
+def _has_line_span(ref: EvidenceRef) -> bool:
+    locator = ref.locator or {}
+    return "line_start" in locator or "line_end" in locator
+
+
+def _validated_line_span(
+    ref: EvidenceRef,
+    source: ParsedSourceFile,
+) -> tuple[int, int] | None:
+    locator = ref.locator or {}
+    try:
+        line_start = int(locator.get("line_start"))
+        line_end = int(locator.get("line_end"))
+    except (TypeError, ValueError):
+        return None
+    if line_start < 1 or line_end < line_start:
+        return None
+    line_count = len(source.text.splitlines())
+    if line_count == 0 or line_end > line_count:
+        return None
+    return line_start, line_end
+
+
+def _ref_with_resolved_span(
+    ref: EvidenceRef,
+    source: ParsedSourceFile,
+    line_start: int,
+    line_end: int,
+    *,
+    confidence: str,
+    char_start: int | None = None,
+    char_end: int | None = None,
+) -> EvidenceRef:
+    start, end = (
+        (char_start, char_end)
+        if char_start is not None and char_end is not None
+        else _line_span_offsets(source.text, line_start, line_end)
+    )
+    locator = dict(ref.locator)
+    locator.update(
+        {
+            "line_start": line_start,
+            "line_end": line_end,
+            "char_start": start,
+            "char_end": end,
+        }
+    )
+    locator.update(_structured_locator(source, source.text, line_start))
+    return ref.model_copy(
+        update={
+            "source_id": ref.source_id or source.source_id,
+            "filename": ref.filename or source.filename,
+            "source_type": ref.source_type or source.source_type,
+            "source_path": ref.source_path or source.source_path,
+            "context": _context_window(source.text, line_start, line_end),
+            "source_excerpt": _line_span_excerpt(source.text, line_start, line_end),
+            "locator": locator,
+            "locator_confidence": ref.locator_confidence or confidence,
+            "locator_error": "",
+            "anchor_id": ref.anchor_id or f"{source.source_id}#line-{line_start}",
+        }
+    )
+
+
+def _line_span_offsets(text: str, line_start: int, line_end: int) -> tuple[int, int]:
+    lines = text.splitlines(keepends=True)
+    start = sum(len(line) for line in lines[: line_start - 1])
+    end = start + sum(len(line) for line in lines[line_start - 1 : line_end])
+    while end > start and text[end - 1] in "\r\n":
+        end -= 1
+    return start, end
+
+
+def _line_span_excerpt(text: str, line_start: int, line_end: int) -> str:
+    lines = text.splitlines()
+    return "\n".join(lines[line_start - 1 : line_end])
 
 
 def _find_quote_match(quote: str, text: str) -> tuple[int, int, str] | None:
