@@ -113,6 +113,7 @@ class MilvusLiteStore:
     ) -> list[MilvusSearchHit]:
         if not self.client.has_collection(self.collection_name):
             raise MilvusStoreError("Milvus collection 不存在，请先运行 index")
+        self.client.load_collection(self.collection_name)
         expr = _build_filter_expr(filters or {})
         results = self.client.search(
             collection_name=self.collection_name,

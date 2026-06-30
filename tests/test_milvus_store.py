@@ -55,3 +55,32 @@ def test_milvus_lite_store_round_trips_records(tmp_path) -> None:
     assert len(results) == 1
     assert results[0].chunk.chunk_id == "chunk-1"
     assert results[0].chunk.text == "客户不想聊保险时先聊家庭责任"
+
+
+def test_milvus_lite_store_loads_released_collection_before_search(tmp_path) -> None:
+    store = MilvusLiteStore(
+        db_path=tmp_path / "rag.db",
+        collection_name="test_chunks",
+    )
+    chunk = RagChunk(
+        chunk_id="chunk-1",
+        chunk_type="script",
+        text="客户不想聊保险时先聊家庭责任",
+        metadata={"case_name": "案例A", "stage": "售前"},
+        citations=[],
+        source_file="case.sales_insights.json",
+    )
+    record = MilvusChunkRecord.from_chunk(chunk, vector=[0.1, 0.2, 0.3])
+
+    store.ensure_collection(vector_dim=3)
+    store.upsert([record])
+    store.client.release_collection(store.collection_name)
+
+    results = store.search(
+        vector=[0.1, 0.2, 0.3],
+        top_k=1,
+        filters={"chunk_types": ["script"]},
+    )
+
+    assert len(results) == 1
+    assert results[0].chunk.chunk_id == "chunk-1"
