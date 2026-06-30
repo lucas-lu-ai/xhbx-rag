@@ -84,3 +84,46 @@ def test_milvus_lite_store_loads_released_collection_before_search(tmp_path) -> 
 
     assert len(results) == 1
     assert results[0].chunk.chunk_id == "chunk-1"
+
+
+def test_milvus_lite_store_keyword_search_ranks_exact_term_matches(tmp_path) -> None:
+    store = MilvusLiteStore(
+        db_path=tmp_path / "rag.db",
+        collection_name="test_chunks",
+    )
+    chunks = [
+        RagChunk(
+            chunk_id="chunk-1",
+            chunk_type="strategy",
+            text="客户可以通过保单整理发现家庭保障缺口",
+            metadata={"case_name": "案例A"},
+            citations=[],
+            source_file="case.sales_insights.json",
+        ),
+        RagChunk(
+            chunk_id="chunk-2",
+            chunk_type="script",
+            text="客户提出每年交费不能超过80万时，可以使用预算释放与置换法",
+            metadata={"case_name": "案例A", "stage": "异议处理"},
+            citations=[],
+            source_file="case.sales_insights.json",
+        ),
+    ]
+
+    store.ensure_collection(vector_dim=3)
+    store.upsert(
+        [
+            MilvusChunkRecord.from_chunk(chunks[0], vector=[0.1, 0.2, 0.3]),
+            MilvusChunkRecord.from_chunk(chunks[1], vector=[0.2, 0.1, 0.3]),
+        ]
+    )
+
+    results = store.keyword_search(
+        query="预算释放 80万",
+        top_k=1,
+        filters={"chunk_types": ["script"]},
+    )
+
+    assert len(results) == 1
+    assert results[0].chunk.chunk_id == "chunk-2"
+    assert results[0].score > 0

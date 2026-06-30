@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sys
 from pathlib import Path
 from typing import Sequence
 
+from .answer import AnswerAgent, answer_query
 from .chunk_builder import build_chunks
 from .config import RetrievalConfig
 from .embedding import EmbeddingClient
@@ -23,6 +25,11 @@ from .parser import ParseFatalError, parse_inputs
 from .query_understanding import QueryUnderstandingAgent
 from .rerank import RerankClient
 from .report import build_parse_report
+from .sales_generation import (
+    SalesInsightAgentScopeAgent,
+    VisionImageDescriptionAgent,
+    generate_case_sales_insights_async,
+)
 from .search import search_evidence
 from .writer import write_outputs
 
@@ -38,10 +45,65 @@ def _build_parser() -> argparse.ArgumentParser:
     parse_parser.add_argument("--playbook", type=Path, default=None)
     parse_parser.add_argument("--out", required=True, type=Path)
 
+    generate_parser = subparsers.add_parser(
+        "generate-insights",
+        help="从案例素材目录生成 case.sales_insights.json 与 case.sales_playbook.md",
+    )
+    generate_parser.add_argument("--case-dir", required=True, type=Path)
+    generate_parser.add_argument("--case-name", default=None)
+    generate_parser.add_argument("--out", required=True, type=Path)
+    generate_parser.add_argument("--timeout", type=float, default=600.0)
+    generate_parser.add_argument("--retry-attempts", type=int, default=5)
+    generate_parser.add_argument("--retry-base-delay", type=float, default=1.0)
+    generate_parser.add_argument("--max-section-chars", type=int, default=18000)
+    generate_parser.add_argument(
+        "--section-concurrency",
+        type=int,
+        default=3,
+        help="并发生成章节 sales_evidence 的任务数，默认 3",
+    )
+    thinking_group = generate_parser.add_mutually_exclusive_group()
+    generate_parser.set_defaults(enable_thinking=True)
+    thinking_group.add_argument(
+        "--enable-thinking",
+        dest="enable_thinking",
+        action="store_true",
+        help="生成销售洞察时启用模型思考模式；默认启用",
+    )
+    thinking_group.add_argument(
+        "--no-thinking",
+        dest="enable_thinking",
+        action="store_false",
+        help="生成销售洞察时关闭模型思考模式，用于网络不稳或快速调试",
+    )
+    generate_parser.add_argument(
+        "--trace",
+        action="store_true",
+        help="将步骤 trace 以 JSONL 写到 stderr",
+    )
+    generate_parser.add_argument(
+        "--studio",
+        action="store_true",
+        help="将步骤 trace 发送到 AgentScope Studio",
+    )
+    generate_parser.add_argument(
+        "--studio-endpoint",
+        default="localhost:4317",
+        help="AgentScope Studio OTLP gRPC endpoint，默认 localhost:4317",
+    )
+
     index_parser = subparsers.add_parser("index", help="写入 chunks.jsonl 到 Milvus Lite")
     index_parser.add_argument("--chunks", required=True, type=Path)
-    index_parser.add_argument("--trace", action="store_true", help="将步骤 trace 以 JSONL 写到 stderr")
-    index_parser.add_argument("--studio", action="store_true", help="将步骤 trace 发送到 AgentScope Studio")
+    index_parser.add_argument(
+        "--trace",
+        action="store_true",
+        help="将步骤 trace 以 JSONL 写到 stderr",
+    )
+    index_parser.add_argument(
+        "--studio",
+        action="store_true",
+        help="将步骤 trace 发送到 AgentScope Studio",
+    )
     index_parser.add_argument(
         "--studio-endpoint",
         default="localhost:4317",
@@ -52,9 +114,37 @@ def _build_parser() -> argparse.ArgumentParser:
     search_parser.add_argument("--query", required=True)
     search_parser.add_argument("--top-n", type=int, default=20)
     search_parser.add_argument("--top-k", type=int, default=5)
-    search_parser.add_argument("--trace", action="store_true", help="将步骤 trace 以 JSONL 写到 stderr")
-    search_parser.add_argument("--studio", action="store_true", help="将步骤 trace 发送到 AgentScope Studio")
     search_parser.add_argument(
+        "--trace",
+        action="store_true",
+        help="将步骤 trace 以 JSONL 写到 stderr",
+    )
+    search_parser.add_argument(
+        "--studio",
+        action="store_true",
+        help="将步骤 trace 发送到 AgentScope Studio",
+    )
+    search_parser.add_argument(
+        "--studio-endpoint",
+        default="localhost:4317",
+        help="AgentScope Studio OTLP gRPC endpoint，默认 localhost:4317",
+    )
+
+    answer_parser = subparsers.add_parser("answer", help="检索 evidence 并生成基于证据的回答")
+    answer_parser.add_argument("--query", required=True)
+    answer_parser.add_argument("--top-n", type=int, default=20)
+    answer_parser.add_argument("--top-k", type=int, default=5)
+    answer_parser.add_argument(
+        "--trace",
+        action="store_true",
+        help="将步骤 trace 以 JSONL 写到 stderr",
+    )
+    answer_parser.add_argument(
+        "--studio",
+        action="store_true",
+        help="将步骤 trace 发送到 AgentScope Studio",
+    )
+    answer_parser.add_argument(
         "--studio-endpoint",
         default="localhost:4317",
         help="AgentScope Studio OTLP gRPC endpoint，默认 localhost:4317",
@@ -104,6 +194,50 @@ def _cmd_parse(args: argparse.Namespace) -> int:
         _write_fatal_report(args.out, args.insights, args.playbook, str(exc))
         return 1
     return 0
+
+
+def _cmd_generate_insights(args: argparse.Namespace) -> int:
+    config = RetrievalConfig.from_env()
+    trace = _trace_sink(args, "xhbx-rag.generate-insights")
+    agent = SalesInsightAgentScopeAgent(
+        base_url=config.base_url,
+        api_key=config.api_key,
+        model=config.model_name,
+        timeout=args.timeout,
+        retry_attempts=args.retry_attempts,
+        retry_base_delay=args.retry_base_delay,
+        max_section_chars=args.max_section_chars,
+        enable_thinking=args.enable_thinking,
+    )
+    vision_agent = (
+        VisionImageDescriptionAgent(
+            base_url=config.base_url,
+            api_key=config.api_key,
+            model=config.vision_model_name,
+            timeout=args.timeout,
+            retry_attempts=args.retry_attempts,
+            retry_base_delay=args.retry_base_delay,
+        )
+        if config.vision_model_name
+        else None
+    )
+    try:
+        result = asyncio.run(
+            generate_case_sales_insights_async(
+                case_dir=args.case_dir,
+                output_dir=args.out,
+                case_name=args.case_name,
+                section_agent=agent,
+                case_agent=agent,
+                vision_agent=vision_agent,
+                trace=trace,
+                section_concurrency=args.section_concurrency,
+            )
+        )
+    finally:
+        close_trace(trace)
+    print(json.dumps(_generation_result_payload(result), ensure_ascii=False, indent=2))
+    return 0 if result.status == "ok" else 1
 
 
 def _embedding_client(config: RetrievalConfig) -> EmbeddingClient:
@@ -183,14 +317,63 @@ def _cmd_search(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_answer(args: argparse.Namespace) -> int:
+    config = RetrievalConfig.from_env()
+    trace = _trace_sink(args, "xhbx-rag.answer")
+    try:
+        result = answer_query(
+            query=args.query,
+            query_agent=QueryUnderstandingAgent(
+                base_url=config.base_url,
+                api_key=config.api_key,
+                model=config.model_name,
+            ),
+            embedding_client=_embedding_client(config),
+            store=_milvus_store(config),
+            reranker=RerankClient(
+                base_url=config.rerank_base_url,
+                api_key=config.rerank_api_key,
+                model=config.rerank_model_name,
+            ),
+            answer_agent=AnswerAgent(
+                base_url=config.base_url,
+                api_key=config.api_key,
+                model=config.model_name,
+            ),
+            top_n=args.top_n,
+            top_k=args.top_k,
+            trace=trace,
+        )
+    finally:
+        close_trace(trace)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _generation_result_payload(result) -> dict:
+    return {
+        "case_name": result.case_name,
+        "status": result.status,
+        "evidence_paths": [str(path) for path in result.evidence_paths],
+        "failure_paths": [str(path) for path in result.failure_paths],
+        "insights_path": str(result.insights_path) if result.insights_path else None,
+        "playbook_path": str(result.playbook_path) if result.playbook_path else None,
+        "error": result.error,
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     if args.command == "parse":
         return _cmd_parse(args)
+    if args.command == "generate-insights":
+        return _cmd_generate_insights(args)
     if args.command == "index":
         return _cmd_index(args)
     if args.command == "search":
         return _cmd_search(args)
+    if args.command == "answer":
+        return _cmd_answer(args)
     parser.error(f"未知命令: {args.command}")
     return 2

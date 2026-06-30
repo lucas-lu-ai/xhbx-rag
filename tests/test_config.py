@@ -31,7 +31,28 @@ def test_retrieval_config_reads_env_file_without_exposing_secrets(tmp_path) -> N
     assert config.milvus_lite_path == Path(".local/milvus/xhbx_rag.db")
     assert config.milvus_collection == "xhbx_sales_chunks"
     assert config.milvus_vector_dim is None
+    assert config.vision_model_name == ""
     assert "secret" not in config.safe_summary()
+
+
+def test_retrieval_config_reads_optional_vision_model_name() -> None:
+    config = RetrievalConfig.from_env(
+        env={
+            "API_KEY": "chat",
+            "BASE_URL": "https://api.example.com/v1",
+            "MODEL_NAME": "chat-model",
+            "VISION_MODEL_NAME": "qwen3.7-plus",
+            "EMBEDDING_BASE_URL": "https://api.siliconflow.com/v1",
+            "EMBEDDING_MODEL_NAME": "embed",
+            "EMBEDDING_API_KEY": "embedding-key",
+            "RERANK_BASE_URL": "https://api.siliconflow.com/v1",
+            "RERANK_MODEL_NAME": "rerank",
+            "RERANK_API_KEY": "rerank-key",
+        },
+        env_file=None,
+    )
+
+    assert config.vision_model_name == "qwen3.7-plus"
 
 
 def test_retrieval_config_requires_embedding_and_rerank_keys() -> None:

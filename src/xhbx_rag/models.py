@@ -22,13 +22,139 @@ def _coerce_model_list(value: object) -> list[object]:
     return []
 
 
+def _coerce_confidence_level(value: object) -> ConfidenceLevel:
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if number >= 0.75:
+            return "high"
+        if number >= 0.4:
+            return "mid"
+        return "low"
+    text = str(value or "").strip().lower()
+    if text in {"high", "高", "高置信", "高置信度"}:
+        return "high"
+    if text in {"mid", "medium", "middle", "中", "中等", "中置信度"}:
+        return "mid"
+    if text in {"low", "低", "低置信", "低置信度"}:
+        return "low"
+    return "low"
+
+
 class EvidenceRef(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     section_name: str = ""
     source_id: str = ""
     filename: str = ""
+    source_type: str = ""
+    source_path: str = ""
     quote: str = ""
+    context: str = ""
+    locator: dict[str, Any] = Field(default_factory=dict)
+    locator_confidence: str = ""
+    anchor_id: str = ""
+
+
+class CustomerSignal(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    signal: str = ""
+    evidence: str = ""
+    source_refs: list[EvidenceRef] = Field(default_factory=list)
+
+    @field_validator("source_refs", mode="before")
+    @classmethod
+    def _source_refs(cls, value: object) -> list[object]:
+        return _coerce_model_list(value)
+
+
+class SalesAction(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    action: str = ""
+    stage_hint: str = ""
+    evidence: str = ""
+    source_refs: list[EvidenceRef] = Field(default_factory=list)
+
+    @field_validator("source_refs", mode="before")
+    @classmethod
+    def _source_refs(cls, value: object) -> list[object]:
+        return _coerce_model_list(value)
+
+
+class ScriptQuote(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    quote: str = ""
+    speaker: str = ""
+    stage_hint: str = ""
+    scenario_hint: str = ""
+    source_refs: list[EvidenceRef] = Field(default_factory=list)
+
+    @field_validator("source_refs", mode="before")
+    @classmethod
+    def _source_refs(cls, value: object) -> list[object]:
+        return _coerce_model_list(value)
+
+
+class ObjectionEvidence(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    objection: str = ""
+    response_evidence: str = ""
+    source_refs: list[EvidenceRef] = Field(default_factory=list)
+
+    @field_validator("source_refs", mode="before")
+    @classmethod
+    def _source_refs(cls, value: object) -> list[object]:
+        return _coerce_model_list(value)
+
+
+ConfidenceLevel = Literal["high", "mid", "low"]
+
+
+class StrategyCandidate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    name: str = ""
+    reason: str = ""
+    confidence: ConfidenceLevel = "low"
+    inferred: bool = True
+    source_refs: list[EvidenceRef] = Field(default_factory=list)
+
+    @field_validator("source_refs", mode="before")
+    @classmethod
+    def _source_refs(cls, value: object) -> list[object]:
+        return _coerce_model_list(value)
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _confidence(cls, value: object) -> ConfidenceLevel:
+        return _coerce_confidence_level(value)
+
+
+class SectionSalesEvidence(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    case_name: str = ""
+    section_name: str = ""
+    customer_signals: list[CustomerSignal] = Field(default_factory=list)
+    sales_actions: list[SalesAction] = Field(default_factory=list)
+    script_quotes: list[ScriptQuote] = Field(default_factory=list)
+    objections: list[ObjectionEvidence] = Field(default_factory=list)
+    strategy_candidates: list[StrategyCandidate] = Field(default_factory=list)
+
+    @field_validator(
+        "customer_signals",
+        "sales_actions",
+        "script_quotes",
+        "objections",
+        "strategy_candidates",
+        mode="before",
+    )
+    @classmethod
+    def _lists(cls, value: object) -> list[object]:
+        return _coerce_model_list(value)
 
 
 class CustomerJourneyStep(BaseModel):
@@ -81,6 +207,11 @@ class CaseSalesStrategy(BaseModel):
     @classmethod
     def _evidence_refs(cls, value: object) -> list[object]:
         return _coerce_model_list(value)
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _confidence(cls, value: object) -> ConfidenceLevel:
+        return _coerce_confidence_level(value)
 
 
 class CaseSalesScript(BaseModel):

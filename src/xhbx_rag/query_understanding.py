@@ -6,6 +6,8 @@ from typing import Literal, Protocol
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .http_retry import post_json_with_retry
+
 
 Intent = Literal[
     "script_search",
@@ -15,6 +17,13 @@ Intent = Literal[
     "general_sales_qa",
     "out_of_scope",
 ]
+
+_ALLOWED_CHUNK_TYPES = {
+    "customer_journey",
+    "strategy",
+    "script",
+    "objection_handling",
+}
 
 
 class QueryUnderstandingError(RuntimeError):
@@ -42,15 +51,29 @@ class QueryFilters(BaseModel):
     objection: str = ""
     strategy_names: list[str] = Field(default_factory=list)
 
-    @field_validator("chunk_types", "strategy_names", mode="before")
+    @field_validator("chunk_types", mode="before")
+    @classmethod
+    def _chunk_types(cls, value: object) -> list[str]:
+        return [
+            item
+            for item in _str_list(value)
+            if item in _ALLOWED_CHUNK_TYPES
+        ]
+
+    @field_validator("strategy_names", mode="before")
     @classmethod
     def _str_list(cls, value: object) -> list[str]:
+        return _str_list(value)
+
+    @field_validator("stage", "scenario", "objection", mode="before")
+    @classmethod
+    def _str_value(cls, value: object) -> str:
         if value is None:
-            return []
+            return ""
         if isinstance(value, list):
-            return [str(item).strip() for item in value if str(item).strip()]
-        text = str(value).strip()
-        return [text] if text else []
+            values = [str(item).strip() for item in value if str(item).strip()]
+            return values[0] if len(values) == 1 else ""
+        return str(value).strip()
 
 
 class QueryUnderstanding(BaseModel):
@@ -76,15 +99,20 @@ class QueryUnderstandingAgent:
         model: str,
         http_client: _HttpClient | None = None,
         timeout: float = 60.0,
+        retry_attempts: int = 3,
+        retry_base_delay: float = 0.5,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
         self.http_client = http_client or httpx.Client()
         self.timeout = timeout
+        self.retry_attempts = retry_attempts
+        self.retry_base_delay = retry_base_delay
 
     def understand(self, query: str) -> QueryUnderstanding:
-        response = self.http_client.post(
+        response = post_json_with_retry(
+            self.http_client,
             f"{self.base_url}/chat/completions",
             headers={
                 "Authorization": f"Bearer {self.api_key}",
@@ -106,8 +134,9 @@ class QueryUnderstandingAgent:
                 "response_format": {"type": "json_object"},
             },
             timeout=self.timeout,
+            retry_attempts=self.retry_attempts,
+            retry_base_delay=self.retry_base_delay,
         )
-        response.raise_for_status()  # type: ignore[attr-defined]
         payload = response.json()  # type: ignore[attr-defined]
         content = _extract_content(payload)
         try:
@@ -135,8 +164,19 @@ _SYSTEM_PROMPT = """你是销售洞察 RAG 的查询理解节点。
 - rewritten_query: 独立、明确、适合检索的问题；如果 needs_retrieval=false 可为空
 - needs_retrieval: boolean
 - filters: object，包含 chunk_types, stage, scenario, objection, strategy_names
+  - chunk_types 只能使用 customer_journey | strategy | script | objection_handling，不要输出 qa。
 要求：
 1. 不要增加用户没有表达的事实约束。
 2. 不能直接回答用户问题。
 3. 如果问题不属于保险销售洞察、话术、异议、策略或客户旅程，intent=out_of_scope 且 needs_retrieval=false。
+4. 通用解释、作用、价值、原因类问题使用 general_sales_qa，chunk_types 通常留空，除非用户明确限定只查话术、策略、异议或客户旅程。
 """
+
+
+def _str_list(value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value).strip()
+    return [text] if text else []

@@ -4,6 +4,8 @@ from typing import Protocol
 
 import httpx
 
+from .http_retry import post_json_with_retry
+
 
 class EmbeddingError(RuntimeError):
     """Raised when embedding API response is invalid."""
@@ -29,12 +31,16 @@ class EmbeddingClient:
         model: str,
         http_client: _HttpClient | None = None,
         timeout: float = 60.0,
+        retry_attempts: int = 3,
+        retry_base_delay: float = 0.5,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
         self.http_client = http_client or httpx.Client()
         self.timeout = timeout
+        self.retry_attempts = retry_attempts
+        self.retry_base_delay = retry_base_delay
 
     def embed_query(self, text: str) -> list[float]:
         return self.embed_documents([text])[0]
@@ -42,7 +48,8 @@ class EmbeddingClient:
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
-        response = self.http_client.post(
+        response = post_json_with_retry(
+            self.http_client,
             _endpoint_url(self.base_url, "embeddings"),
             headers={
                 "Authorization": f"Bearer {self.api_key}",
@@ -50,8 +57,9 @@ class EmbeddingClient:
             },
             json={"model": self.model, "input": texts},
             timeout=self.timeout,
+            retry_attempts=self.retry_attempts,
+            retry_base_delay=self.retry_base_delay,
         )
-        response.raise_for_status()  # type: ignore[attr-defined]
         data = response.json()  # type: ignore[attr-defined]
         items = data.get("data", [])
         if len(items) != len(texts):

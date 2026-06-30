@@ -90,17 +90,45 @@ def search_evidence(
         },
     )
     filter_dict = _search_filters(understanding)
-    hits = store.search(vector=vector, top_k=top_n, filters=filter_dict)
+    vector_hits = store.search(vector=vector, top_k=top_n, filters=filter_dict)
     emit_trace(
         trace,
         "search.vector_searched",
         {
             "filters": filter_dict,
             "requested_top_n": top_n,
-            "candidate_count": len(hits),
-            "candidates": [_serialize_candidate(hit) for hit in hits],
+            "candidate_count": len(vector_hits),
+            "candidates": [_serialize_candidate(hit) for hit in vector_hits],
         },
     )
+    keyword_hits = _keyword_search_if_available(
+        store,
+        query=rewritten_query,
+        top_k=top_n,
+        filters=filter_dict,
+    )
+    if keyword_hits is not None:
+        emit_trace(
+            trace,
+            "search.keyword_searched",
+            {
+                "filters": filter_dict,
+                "requested_top_n": top_n,
+                "candidate_count": len(keyword_hits),
+                "candidates": [_serialize_candidate(hit) for hit in keyword_hits],
+            },
+        )
+        hits = _rrf_fuse(vector_hits, keyword_hits, limit=top_n)
+        emit_trace(
+            trace,
+            "search.hybrid_fused",
+            {
+                "result_count": len(hits),
+                "candidates": [_serialize_candidate(hit) for hit in hits],
+            },
+        )
+    else:
+        hits = vector_hits
     reranked = reranker.rerank(
         rewritten_query,
         [hit.chunk.text for hit in hits],
@@ -132,11 +160,55 @@ def search_evidence(
 def _search_filters(understanding: QueryUnderstanding) -> dict:
     filters = understanding.filters
     result: dict = {}
-    if filters.chunk_types:
+    if filters.chunk_types and understanding.intent != "general_sales_qa":
         result["chunk_types"] = filters.chunk_types
     if filters.stage:
         result["stage"] = filters.stage
     return result
+
+
+def _keyword_search_if_available(
+    store: _Store,
+    *,
+    query: str,
+    top_k: int,
+    filters: dict,
+) -> list[MilvusSearchHit] | None:
+    keyword_search = getattr(store, "keyword_search", None)
+    if keyword_search is None:
+        return None
+    return keyword_search(query=query, top_k=top_k, filters=filters)
+
+
+def _rrf_fuse(
+    vector_hits: list[MilvusSearchHit],
+    keyword_hits: list[MilvusSearchHit],
+    *,
+    limit: int,
+) -> list[MilvusSearchHit]:
+    scores: dict[str, float] = {}
+    hits_by_id: dict[str, MilvusSearchHit] = {}
+    first_seen: dict[str, int] = {}
+    seen_order = 0
+    rrf_k = 60
+
+    for hit_list in (vector_hits, keyword_hits):
+        for rank, hit in enumerate(hit_list, start=1):
+            chunk_id = hit.chunk.chunk_id
+            if chunk_id not in hits_by_id:
+                hits_by_id[chunk_id] = hit
+                first_seen[chunk_id] = seen_order
+                seen_order += 1
+            scores[chunk_id] = scores.get(chunk_id, 0.0) + 1 / (rrf_k + rank)
+
+    ranked_ids = sorted(
+        scores,
+        key=lambda chunk_id: (-scores[chunk_id], first_seen[chunk_id]),
+    )
+    return [
+        MilvusSearchHit(chunk=hits_by_id[chunk_id].chunk, score=scores[chunk_id])
+        for chunk_id in ranked_ids[:limit]
+    ]
 
 
 def _serialize_hit(hit: MilvusSearchHit, rerank: RerankResult) -> dict:

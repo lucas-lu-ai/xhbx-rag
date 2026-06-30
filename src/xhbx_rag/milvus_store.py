@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import math
+import re
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -134,21 +137,46 @@ class MilvusLiteStore:
         hits: list[MilvusSearchHit] = []
         for item in results[0] if results else []:
             entity = item.get("entity", {})
-            metadata = json.loads(entity.get("metadata_json", "{}") or "{}")
-            citations = [
-                EvidenceRef.model_validate(citation)
-                for citation in json.loads(entity.get("citations_json", "[]") or "[]")
-            ]
-            chunk = RagChunk(
-                chunk_id=entity["chunk_id"],
-                chunk_type=entity["chunk_type"],
-                text=entity["text"],
-                metadata=metadata,
-                citations=citations,
-                source_file="case.sales_insights.json",
+            hits.append(
+                MilvusSearchHit(
+                    chunk=_chunk_from_entity(entity),
+                    score=float(item.get("distance", 0.0)),
+                )
             )
-            hits.append(MilvusSearchHit(chunk=chunk, score=float(item.get("distance", 0.0))))
         return hits
+
+    def keyword_search(
+        self,
+        query: str,
+        top_k: int,
+        filters: dict[str, Any] | None = None,
+    ) -> list[MilvusSearchHit]:
+        if top_k <= 0:
+            return []
+        if not self.client.has_collection(self.collection_name):
+            raise MilvusStoreError("Milvus collection 不存在，请先运行 index")
+        query_tokens = _bm25_tokens(query)
+        if not query_tokens:
+            return []
+        self.client.load_collection(self.collection_name)
+        expr = _build_filter_expr(filters or {})
+        rows = self.client.query(
+            collection_name=self.collection_name,
+            filter=expr,
+            limit=max(1000, top_k * 20),
+            output_fields=[
+                "chunk_id",
+                "text",
+                "case_name",
+                "chunk_type",
+                "stage",
+                "scenario",
+                "metadata_json",
+                "citations_json",
+            ],
+        )
+        scored_hits = _bm25_rank(query_tokens, rows)
+        return scored_hits[:top_k]
 
     def _collection_vector_dim(self) -> int:
         description = self.client.describe_collection(self.collection_name)
@@ -174,3 +202,81 @@ def _build_filter_expr(filters: dict[str, Any]) -> str:
 
 def _escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _chunk_from_entity(entity: dict[str, Any]) -> RagChunk:
+    metadata = json.loads(entity.get("metadata_json", "{}") or "{}")
+    citations = [
+        EvidenceRef.model_validate(citation)
+        for citation in json.loads(entity.get("citations_json", "[]") or "[]")
+    ]
+    return RagChunk(
+        chunk_id=entity["chunk_id"],
+        chunk_type=entity["chunk_type"],
+        text=entity["text"],
+        metadata=metadata,
+        citations=citations,
+        source_file="case.sales_insights.json",
+    )
+
+
+def _bm25_rank(query_tokens: list[str], rows: list[dict[str, Any]]) -> list[MilvusSearchHit]:
+    if not rows:
+        return []
+    tokenized_docs = [_bm25_tokens(str(row.get("text", ""))) for row in rows]
+    doc_lengths = [len(tokens) for tokens in tokenized_docs]
+    avg_doc_length = sum(doc_lengths) / len(doc_lengths) if doc_lengths else 0.0
+    if avg_doc_length == 0:
+        return []
+
+    document_frequency: Counter[str] = Counter()
+    for tokens in tokenized_docs:
+        document_frequency.update(set(tokens))
+
+    query_counts = Counter(query_tokens)
+    scored: list[tuple[float, dict[str, Any]]] = []
+    total_docs = len(rows)
+    k1 = 1.2
+    b = 0.75
+    for row, tokens, doc_length in zip(rows, tokenized_docs, doc_lengths, strict=True):
+        token_counts = Counter(tokens)
+        score = 0.0
+        for token, query_frequency in query_counts.items():
+            frequency = token_counts.get(token, 0)
+            if frequency == 0:
+                continue
+            idf = math.log(
+                ((total_docs - document_frequency[token] + 0.5)
+                / (document_frequency[token] + 0.5))
+                + 1
+            )
+            denominator = frequency + k1 * (1 - b + b * doc_length / avg_doc_length)
+            score += idf * (frequency * (k1 + 1) / denominator) * query_frequency
+        if score > 0:
+            scored.append((score, row))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [
+        MilvusSearchHit(chunk=_chunk_from_entity(row), score=score)
+        for score, row in scored
+    ]
+
+
+def _bm25_tokens(text: str) -> list[str]:
+    normalized = text.lower()
+    tokens: list[str] = []
+    for match in re.finditer(r"[\u4e00-\u9fff]+|[a-z0-9]+", normalized):
+        segment = match.group(0)
+        if re.fullmatch(r"[\u4e00-\u9fff]+", segment):
+            tokens.extend(_cjk_ngrams(segment))
+        else:
+            tokens.append(segment)
+    return tokens
+
+
+def _cjk_ngrams(text: str) -> list[str]:
+    tokens: list[str] = []
+    max_size = min(4, len(text))
+    for size in range(1, max_size + 1):
+        tokens.extend(text[index : index + size] for index in range(len(text) - size + 1))
+    return tokens

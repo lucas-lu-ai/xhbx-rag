@@ -33,6 +33,19 @@ def _citations(refs: list[EvidenceRef]) -> list[EvidenceRef]:
     return refs
 
 
+def _evidence_block(refs: list[EvidenceRef]) -> list[str]:
+    values: list[str] = []
+    seen: set[str] = set()
+    for ref in refs:
+        text = ref.context.strip() or ref.quote.strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        source = ref.filename or ref.source_id
+        values.append(f"{source}：{text}" if source else text)
+    return _bullet_block("来源原文", values)
+
+
 def _journey_chunk(
     case_id: str,
     case_name: str,
@@ -48,6 +61,7 @@ def _journey_chunk(
                 f"客户状态：{item.customer_state}",
                 f"销售目标：{item.sales_goal}",
                 *_bullet_block("关键动作", item.key_actions),
+                *_evidence_block(item.evidence_refs),
             ]
         )
     )
@@ -87,6 +101,7 @@ def _strategy_chunk(
                 *_bullet_block("避免做法", item.dont),
                 f"置信度：{item.confidence}",
                 f"模型归纳：{'是' if item.inferred else '否'}",
+                *_evidence_block(item.evidence_refs),
             ]
         )
     )
@@ -130,6 +145,7 @@ def _script_chunk(
                 else "",
                 *_bullet_block("追问建议", item.follow_up_questions),
                 *_bullet_block("合规提醒", item.compliance_notes),
+                *_evidence_block(item.evidence_refs),
             ]
         )
     )
@@ -170,6 +186,7 @@ def _objection_chunk(
                 f"关联话术：{'、'.join(item.related_script_ids)}"
                 if item.related_script_ids
                 else "",
+                *_evidence_block(item.evidence_refs),
             ]
         )
     )

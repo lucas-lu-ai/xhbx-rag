@@ -9,3 +9,5 @@ build/
 data/
 .env
 output/
+.local/
+parsed/

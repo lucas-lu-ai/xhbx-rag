@@ -85,6 +85,53 @@ def test_cli_search_prints_json_result(monkeypatch, capsys) -> None:
     assert output["results"][0]["chunk_id"] == "c1"
 
 
+def test_cli_answer_prints_json_result(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(cli.RetrievalConfig, "from_env", _fake_config)
+    monkeypatch.setattr(cli, "QueryUnderstandingAgent", lambda **kwargs: "agent")
+    monkeypatch.setattr(cli, "EmbeddingClient", lambda **kwargs: "embedding")
+    monkeypatch.setattr(cli, "MilvusLiteStore", lambda **kwargs: "store")
+    monkeypatch.setattr(cli, "RerankClient", lambda **kwargs: "reranker")
+    monkeypatch.setattr(cli, "AnswerAgent", lambda **kwargs: "answer-agent")
+
+    def fake_answer_query(**kwargs):
+        assert kwargs["query"] == "保单整理对客户有什么作用？"
+        assert kwargs["query_agent"] == "agent"
+        assert kwargs["embedding_client"] == "embedding"
+        assert kwargs["store"] == "store"
+        assert kwargs["reranker"] == "reranker"
+        assert kwargs["answer_agent"] == "answer-agent"
+        assert kwargs["top_n"] == 20
+        assert kwargs["top_k"] == 5
+        assert kwargs["trace"] is None
+        return {
+            "original_query": "保单整理对客户有什么作用？",
+            "rewritten_query": "保单整理对客户的作用和价值是什么？",
+            "intent": "general_sales_qa",
+            "answer": "保单整理能帮助客户看清保障缺口。",
+            "citations": [{"filename": "第3节.docx"}],
+            "evidence_count": 5,
+        }
+
+    monkeypatch.setattr(cli, "answer_query", fake_answer_query)
+
+    exit_code = cli.main(
+        [
+            "answer",
+            "--query",
+            "保单整理对客户有什么作用？",
+            "--top-n",
+            "20",
+            "--top-k",
+            "5",
+        ]
+    )
+
+    assert exit_code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["answer"] == "保单整理能帮助客户看清保障缺口。"
+    assert output["citations"][0]["filename"] == "第3节.docx"
+
+
 def test_cli_search_trace_writes_step_events_to_stderr(monkeypatch, capsys) -> None:
     monkeypatch.setattr(cli.RetrievalConfig, "from_env", _fake_config)
     monkeypatch.setattr(cli, "QueryUnderstandingAgent", lambda **kwargs: "agent")

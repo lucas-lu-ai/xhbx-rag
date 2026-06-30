@@ -41,6 +41,17 @@ class _FakeStore:
         return self.hits
 
 
+class _FakeHybridStore(_FakeStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.keyword_calls = []
+        self.keyword_hits: list[MilvusSearchHit] = []
+
+    def keyword_search(self, query: str, top_k: int, filters: dict):
+        self.keyword_calls.append({"query": query, "top_k": top_k, "filters": filters})
+        return self.keyword_hits
+
+
 class _FakeQueryAgent:
     def understand(self, query: str) -> QueryUnderstanding:
         assert query == "客户不想聊保险怎么开场？"
@@ -56,6 +67,23 @@ class _FakeReranker:
     def rerank(self, query: str, documents: list[str], top_k: int) -> list[RerankResult]:
         assert query == "客户抗拒谈保险时如何开场"
         return [RerankResult(index=1, relevance_score=0.99, text=documents[1])]
+
+
+class _CapturingReranker:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def rerank(self, query: str, documents: list[str], top_k: int) -> list[RerankResult]:
+        self.calls.append({"query": query, "documents": documents, "top_k": top_k})
+        return [
+            RerankResult(index=index, relevance_score=1.0 - index * 0.1, text=document)
+            for index, document in enumerate(documents[:top_k])
+        ]
+
+
+class _EmptyReranker:
+    def rerank(self, query: str, documents: list[str], top_k: int) -> list[RerankResult]:
+        return []
 
 
 def _chunk(chunk_id: str, text: str) -> RagChunk:
@@ -137,6 +165,88 @@ def test_search_evidence_embeds_rewritten_query_not_raw_query() -> None:
     assert result["rewritten_query"] == "客户抗拒谈保险时如何开场"
     assert result["results"][0]["chunk_id"] == "c2"
     assert result["results"][0]["rerank_score"] == 0.99
+
+
+def test_search_evidence_ignores_chunk_type_filters_for_general_sales_qa() -> None:
+    class _GeneralQaAgent:
+        def understand(self, query: str) -> QueryUnderstanding:
+            return QueryUnderstanding(
+                intent="general_sales_qa",
+                rewritten_query="保单整理对客户的作用和价值是什么？",
+                needs_retrieval=True,
+                filters=QueryFilters(chunk_types=["strategy", "script"]),
+            )
+
+    embedding = _FakeEmbedding()
+    store = _FakeStore()
+
+    search_evidence(
+        query="保单整理对客户有什么作用？",
+        query_agent=_GeneralQaAgent(),
+        embedding_client=embedding,
+        store=store,
+        reranker=_EmptyReranker(),
+        top_n=20,
+        top_k=5,
+    )
+
+    assert store.search_calls[0]["filters"] == {}
+
+
+def test_search_evidence_hybrid_retrieval_fuses_vector_and_keyword_hits() -> None:
+    class _BudgetQueryAgent:
+        def understand(self, query: str) -> QueryUnderstanding:
+            return QueryUnderstanding(
+                intent="objection_handling",
+                rewritten_query="客户每年交费不能超过80万时如何处理预算异议？",
+                needs_retrieval=True,
+                filters=QueryFilters(chunk_types=["objection_handling", "script"]),
+            )
+
+    embedding = _FakeEmbedding()
+    store = _FakeHybridStore()
+    vector_hit = MilvusSearchHit(chunk=_chunk("vector", "泛泛讲预算异议"), score=0.7)
+    keyword_hit = MilvusSearchHit(
+        chunk=_chunk("keyword", "每年交费不能超过80万时使用预算释放与置换法"),
+        score=3.2,
+    )
+    store.hits = [vector_hit]
+    store.keyword_hits = [keyword_hit, vector_hit]
+    reranker = _CapturingReranker()
+    trace = MemoryTraceSink()
+
+    result = search_evidence(
+        query="客户说每年不能超过80万怎么办？",
+        query_agent=_BudgetQueryAgent(),
+        embedding_client=embedding,
+        store=store,
+        reranker=reranker,
+        top_n=20,
+        top_k=2,
+        trace=trace,
+    )
+
+    assert store.search_calls[0]["top_k"] == 20
+    assert store.keyword_calls[0] == {
+        "query": "客户每年交费不能超过80万时如何处理预算异议？",
+        "top_k": 20,
+        "filters": {"chunk_types": ["objection_handling", "script"]},
+    }
+    assert reranker.calls[0]["documents"] == [
+        "泛泛讲预算异议",
+        "每年交费不能超过80万时使用预算释放与置换法",
+    ]
+    assert [item["chunk_id"] for item in result["results"]] == ["vector", "keyword"]
+    assert [event.step for event in trace.events] == [
+        "search.query_received",
+        "search.query_understood",
+        "search.query_embedded",
+        "search.vector_searched",
+        "search.keyword_searched",
+        "search.hybrid_fused",
+        "search.reranked",
+        "search.completed",
+    ]
 
 
 def test_search_evidence_emits_step_trace_events() -> None:

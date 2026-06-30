@@ -15,6 +15,7 @@ class RetrievalConfig:
     api_key: str
     base_url: str
     model_name: str
+    vision_model_name: str
     embedding_base_url: str
     embedding_model_name: str
     embedding_api_key: str
@@ -56,6 +57,7 @@ class RetrievalConfig:
             api_key=values["API_KEY"].strip(),
             base_url=values["BASE_URL"].strip(),
             model_name=values["MODEL_NAME"].strip(),
+            vision_model_name=values.get("VISION_MODEL_NAME", "").strip(),
             embedding_base_url=values["EMBEDDING_BASE_URL"].strip(),
             embedding_model_name=values["EMBEDDING_MODEL_NAME"].strip(),
             embedding_api_key=values["EMBEDDING_API_KEY"].strip(),
@@ -78,6 +80,7 @@ class RetrievalConfig:
             "RetrievalConfig("
             f"base_url={self.base_url}, "
             f"model_name={self.model_name}, "
+            f"vision_model_name={self.vision_model_name}, "
             f"embedding_base_url={self.embedding_base_url}, "
             f"embedding_model_name={self.embedding_model_name}, "
             f"rerank_base_url={self.rerank_base_url}, "

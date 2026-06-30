@@ -9,7 +9,12 @@ from xhbx_rag.models import (
 
 
 def _knowledge() -> StructuredCaseKnowledge:
-    ref = EvidenceRef(section_name="第1节", filename="讲义.txt", quote="客户不想聊保险。")
+    ref = EvidenceRef(
+        section_name="第1节",
+        filename="讲义.txt",
+        quote="客户不想聊保险。",
+        context="客户：我不想聊保险。\n销售：那我们先聊家庭责任和最近担心的风险。",
+    )
     return StructuredCaseKnowledge(
         case_id="案例a_1234567890",
         case_name="案例A",
@@ -73,6 +78,8 @@ def test_script_chunk_contains_retrieval_text_metadata_and_citations() -> None:
 
     assert "场景：客户抗拒保险" in script_chunk.text
     assert "教练推荐话术：先聊家庭责任。" in script_chunk.text
+    assert "来源原文：" in script_chunk.text
+    assert "销售：那我们先聊家庭责任和最近担心的风险。" in script_chunk.text
     assert script_chunk.metadata["stage"] == "售前"
     assert script_chunk.metadata["strategy_names"] == ["风险唤醒"]
     assert script_chunk.citations[0].quote == "客户不想聊保险。"
