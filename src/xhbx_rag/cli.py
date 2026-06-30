@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Sequence
 
@@ -11,6 +12,7 @@ from .embedding import EmbeddingClient
 from .indexer import index_chunks
 from .milvus_store import MilvusLiteStore
 from .normalizer import normalize_case
+from .observability import JsonlTraceSink
 from .parser import ParseFatalError, parse_inputs
 from .query_understanding import QueryUnderstandingAgent
 from .rerank import RerankClient
@@ -32,11 +34,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
     index_parser = subparsers.add_parser("index", help="写入 chunks.jsonl 到 Milvus Lite")
     index_parser.add_argument("--chunks", required=True, type=Path)
+    index_parser.add_argument("--trace", action="store_true", help="将步骤 trace 以 JSONL 写到 stderr")
 
     search_parser = subparsers.add_parser("search", help="检索销售洞察 evidence chunks")
     search_parser.add_argument("--query", required=True)
     search_parser.add_argument("--top-n", type=int, default=20)
     search_parser.add_argument("--top-k", type=int, default=5)
+    search_parser.add_argument("--trace", action="store_true", help="将步骤 trace 以 JSONL 写到 stderr")
     return parser
 
 
@@ -101,10 +105,12 @@ def _milvus_store(config: RetrievalConfig) -> MilvusLiteStore:
 
 def _cmd_index(args: argparse.Namespace) -> int:
     config = RetrievalConfig.from_env()
+    trace = JsonlTraceSink(sys.stderr) if args.trace else None
     count = index_chunks(
         args.chunks,
         _embedding_client(config),
         _milvus_store(config),
+        trace=trace,
     )
     print(json.dumps({"indexed": count}, ensure_ascii=False))
     return 0
@@ -112,6 +118,7 @@ def _cmd_index(args: argparse.Namespace) -> int:
 
 def _cmd_search(args: argparse.Namespace) -> int:
     config = RetrievalConfig.from_env()
+    trace = JsonlTraceSink(sys.stderr) if args.trace else None
     result = search_evidence(
         query=args.query,
         query_agent=QueryUnderstandingAgent(
@@ -128,6 +135,7 @@ def _cmd_search(args: argparse.Namespace) -> int:
         ),
         top_n=args.top_n,
         top_k=args.top_k,
+        trace=trace,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0

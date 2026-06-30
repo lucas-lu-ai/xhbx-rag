@@ -7,7 +7,7 @@
 - `case.sales_insights.json`
 - `case.sales_playbook.md`（可选）
 
-本项目不会调用上游 `xhbx` 项目，不会解析原始 `docx / pptx / pdf / txt` 素材，不会生成 embedding，也不会写入向量库。
+本项目不会调用上游 `xhbx` 项目，不会解析原始 `docx / pptx / pdf / txt` 素材。当前已支持把解析后的 `chunks.jsonl` 写入本地 Milvus Lite，并基于 query 改写、向量召回、rerank 做本地检索验证。
 
 ## 环境准备
 
@@ -55,6 +55,33 @@ uv run xhbx-rag search \
   --query "客户不想聊保险怎么开场？" \
   --top-n 20 \
   --top-k 5
+```
+
+调试每一步运行结果时可以打开 trace：
+
+```bash
+uv run xhbx-rag search \
+  --query "客户不想聊保险怎么开场？" \
+  --top-n 20 \
+  --top-k 5 \
+  --trace
+```
+
+`--trace` 会把步骤事件按 JSONL 写到 `stderr`，最终检索结果仍写到 `stdout`，便于脚本继续解析最终 JSON。当前会输出这些关键步骤：
+
+- `search.query_received`：原始问题和 topN/topK 参数
+- `search.query_understood`：意图识别、query 改写、过滤条件
+- `search.query_embedded`：被向量化的改写 query、向量维度和向量前几个数值
+- `search.vector_searched`：Milvus 过滤条件、候选数量和候选 chunk 预览
+- `search.reranked`：rerank 后的 chunk 顺序和分数
+- `search.completed`：最终结果数量
+
+索引命令也支持 `--trace`：
+
+```bash
+uv run xhbx-rag index \
+  --chunks parsed/案例a_b2bb7fa579/chunks.jsonl \
+  --trace
 ```
 
 `search` 不会直接向量化原始 query。流程是：

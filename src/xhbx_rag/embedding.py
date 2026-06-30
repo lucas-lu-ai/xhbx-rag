@@ -43,7 +43,7 @@ class EmbeddingClient:
         if not texts:
             return []
         response = self.http_client.post(
-            f"{self.base_url}/embeddings",
+            _endpoint_url(self.base_url, "embeddings"),
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
@@ -72,3 +72,11 @@ class EmbeddingClient:
         if any(vector is None for vector in vectors):
             raise EmbeddingError("embedding 响应缺少部分输入的向量")
         return [vector for vector in vectors if vector is not None]
+
+
+def _endpoint_url(base_url: str, endpoint: str) -> str:
+    normalized = base_url.rstrip("/")
+    suffix = f"/{endpoint}"
+    if normalized.endswith(suffix):
+        return normalized
+    return f"{normalized}{suffix}"

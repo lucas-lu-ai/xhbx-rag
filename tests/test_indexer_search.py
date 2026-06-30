@@ -3,6 +3,7 @@ import json
 from xhbx_rag.indexer import index_chunks
 from xhbx_rag.milvus_store import MilvusSearchHit
 from xhbx_rag.models import RagChunk
+from xhbx_rag.observability import MemoryTraceSink
 from xhbx_rag.query_understanding import QueryFilters, QueryUnderstanding
 from xhbx_rag.rerank import RerankResult
 from xhbx_rag.search import search_evidence
@@ -91,6 +92,27 @@ def test_index_chunks_embeds_chunk_text_and_upserts_records(tmp_path) -> None:
     assert [record.chunk.chunk_id for record in store.records] == ["c1", "c2"]
 
 
+def test_index_chunks_emits_trace_events(tmp_path) -> None:
+    chunks_path = tmp_path / "chunks.jsonl"
+    chunks_path.write_text(
+        json.dumps(_chunk("c1", "文本1").model_dump(mode="json"), ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    trace = MemoryTraceSink()
+
+    count = index_chunks(chunks_path, _FakeEmbedding(), _FakeStore(), trace=trace)
+
+    assert count == 1
+    assert [event.step for event in trace.events] == [
+        "index.chunks_loaded",
+        "index.embedding_completed",
+        "index.collection_ready",
+        "index.upsert_completed",
+    ]
+    assert trace.events[0].payload["chunk_count"] == 1
+    assert trace.events[1].payload["vector_dim"] == 2
+
+
 def test_search_evidence_embeds_rewritten_query_not_raw_query() -> None:
     embedding = _FakeEmbedding()
     store = _FakeStore()
@@ -115,3 +137,36 @@ def test_search_evidence_embeds_rewritten_query_not_raw_query() -> None:
     assert result["rewritten_query"] == "客户抗拒谈保险时如何开场"
     assert result["results"][0]["chunk_id"] == "c2"
     assert result["results"][0]["rerank_score"] == 0.99
+
+
+def test_search_evidence_emits_step_trace_events() -> None:
+    embedding = _FakeEmbedding()
+    store = _FakeStore()
+    store.hits = [
+        MilvusSearchHit(chunk=_chunk("c1", "不相关话术"), score=0.2),
+        MilvusSearchHit(chunk=_chunk("c2", "客户抗拒时先聊家庭责任"), score=0.1),
+    ]
+    trace = MemoryTraceSink()
+
+    search_evidence(
+        query="客户不想聊保险怎么开场？",
+        query_agent=_FakeQueryAgent(),
+        embedding_client=embedding,
+        store=store,
+        reranker=_FakeReranker(),
+        top_n=20,
+        top_k=1,
+        trace=trace,
+    )
+
+    assert [event.step for event in trace.events] == [
+        "search.query_received",
+        "search.query_understood",
+        "search.query_embedded",
+        "search.vector_searched",
+        "search.reranked",
+        "search.completed",
+    ]
+    assert trace.events[1].payload["rewritten_query"] == "客户抗拒谈保险时如何开场"
+    assert trace.events[3].payload["candidate_count"] == 2
+    assert trace.events[4].payload["results"][0]["chunk_id"] == "c2"

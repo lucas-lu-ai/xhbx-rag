@@ -58,6 +58,20 @@ def test_embedding_client_posts_siliconflow_shape_and_restores_order() -> None:
     }
 
 
+def test_embedding_client_accepts_full_endpoint_url() -> None:
+    http = _FakeHttpClient({"data": [{"embedding": [0.1, 0.4], "index": 0}]})
+    client = EmbeddingClient(
+        base_url="https://api.siliconflow.com/v1/embeddings",
+        api_key="secret",
+        model="Qwen/Qwen3-Embedding-8B",
+        http_client=http,
+    )
+
+    client.embed_query("文本1")
+
+    assert http.calls[0]["url"] == "https://api.siliconflow.com/v1/embeddings"
+
+
 def test_rerank_client_returns_top_k_ranked_results() -> None:
     http = _FakeHttpClient(
         {
@@ -86,3 +100,23 @@ def test_rerank_client_returns_top_k_ranked_results() -> None:
         "query": "Apple",
         "documents": ["apple", "banana", "fruit"],
     }
+
+
+def test_rerank_client_accepts_full_endpoint_url() -> None:
+    http = _FakeHttpClient(
+        {
+            "results": [
+                {"index": 0, "relevance_score": 0.6, "document": {"text": "apple"}},
+            ]
+        }
+    )
+    client = RerankClient(
+        base_url="https://api.siliconflow.com/v1/rerank",
+        api_key="secret",
+        model="Qwen/Qwen3-Reranker-8B",
+        http_client=http,
+    )
+
+    client.rerank("Apple", ["apple"], top_k=1)
+
+    assert http.calls[0]["url"] == "https://api.siliconflow.com/v1/rerank"

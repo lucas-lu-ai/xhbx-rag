@@ -48,7 +48,7 @@ class RerankClient:
         if not documents or top_k <= 0:
             return []
         response = self.http_client.post(
-            f"{self.base_url}/rerank",
+            _endpoint_url(self.base_url, "rerank"),
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
@@ -81,3 +81,11 @@ class RerankClient:
             )
         results.sort(key=lambda item: item.relevance_score, reverse=True)
         return results[:top_k]
+
+
+def _endpoint_url(base_url: str, endpoint: str) -> str:
+    normalized = base_url.rstrip("/")
+    suffix = f"/{endpoint}"
+    if normalized.endswith(suffix):
+        return normalized
+    return f"{normalized}{suffix}"
