@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from xhbx_rag.answer import AnswerAgent, answer_query
 from xhbx_rag.config import ConfigError, RetrievalConfig
@@ -35,7 +35,7 @@ def get_status(*, project_root: Path | None = None) -> dict[str, Any]:
     root = project_root or project_root_from_module()
     try:
         config = RetrievalConfig.from_env()
-    except ConfigError as exc:
+    except (ConfigError, ValueError) as exc:
         return {
             "ok": False,
             "data_dir": str(root / "data"),
@@ -65,6 +65,7 @@ def answer_question(
     stripped_query = query.strip()
     if not stripped_query:
         raise ValueError("问题不能为空")
+    _validate_limits(top_n=top_n, top_k=top_k)
 
     config = RetrievalConfig.from_env()
     result = answer_query(
@@ -106,10 +107,17 @@ def answer_question(
 
 
 def _citation_for_ui(
-    citation: dict[str, Any],
+    citation: object,
     *,
     project_root: Path | None = None,
 ) -> dict[str, Any]:
+    if not isinstance(citation, Mapping):
+        return {
+            "display_location": "未提供精确位置",
+            "display_excerpt": str(citation or ""),
+            "can_reveal": False,
+        }
+
     ui_citation = dict(citation)
     locator = citation.get("locator") or {}
     source_path = str(citation.get("source_path") or "")
@@ -119,6 +127,15 @@ def _citation_for_ui(
         bool(source_path) and can_reveal_source(source_path, project_root=project_root)
     )
     return ui_citation
+
+
+def _validate_limits(*, top_n: int, top_k: int) -> None:
+    if not isinstance(top_n, int) or isinstance(top_n, bool) or not 1 <= top_n <= 100:
+        raise ValueError("top_n 必须在 1 到 100 之间")
+    if not isinstance(top_k, int) or isinstance(top_k, bool) or not 1 <= top_k <= 20:
+        raise ValueError("top_k 必须在 1 到 20 之间")
+    if top_k > top_n:
+        raise ValueError("top_k 不能大于 top_n")
 
 
 def _missing_config_map(error: str) -> dict[str, bool]:
