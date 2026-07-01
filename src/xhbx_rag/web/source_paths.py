@@ -67,7 +67,10 @@ def resolve_data_source_path(
 
     candidate = Path(raw_path)
     if not candidate.is_absolute():
-        candidate = root / candidate
+        if candidate.parts and candidate.parts[0] == "data":
+            candidate = root / candidate
+        else:
+            candidate = data_root / candidate
     resolved = candidate.resolve()
 
     try:

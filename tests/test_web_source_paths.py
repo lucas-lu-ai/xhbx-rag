@@ -67,6 +67,19 @@ def test_resolve_data_source_path_accepts_data_file(tmp_path: Path) -> None:
     assert resolved == source.resolve()
 
 
+def test_resolve_data_source_path_accepts_path_relative_to_data_root(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "data" / "案例A" / "a.txt"
+    source.parent.mkdir(parents=True)
+    source.write_text("hello", encoding="utf-8")
+
+    resolved = resolve_data_source_path("案例A/a.txt", project_root=tmp_path)
+
+    assert resolved == source.resolve()
+    assert can_reveal_source("案例A/a.txt", project_root=tmp_path) is True
+
+
 def test_resolve_data_source_path_maps_embedded_resource_to_host_file(
     tmp_path: Path,
 ) -> None:
