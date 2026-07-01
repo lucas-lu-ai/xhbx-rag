@@ -35,6 +35,13 @@ export type AnswerResponse = {
   [key: string]: unknown;
 };
 
+export type ChatTurn = {
+  id: string;
+  query: string;
+  response?: AnswerResponse;
+  error?: string;
+};
+
 export type AnswerRequest = {
   query: string;
   top_n?: number;
