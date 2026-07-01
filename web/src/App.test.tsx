@@ -613,6 +613,166 @@ test("downloads a backfilled comma-separated answer file", async () => {
   restore();
 });
 
+test("exports bad case jsonl only for non-usable batch feedback", async () => {
+  const user = userEvent.setup();
+  const { requests } = installFetchStub();
+  const { textParts, restore } = installDownloadStub();
+  render(<App />);
+
+  await user.click(screen.getByRole("button", { name: "批量" }));
+  await user.type(
+    screen.getByLabelText("批量问题内容"),
+    "问题,答案\n客户说每年不能超过80万怎么办？,人工答案"
+  );
+  await user.click(screen.getByRole("button", { name: "解析内容" }));
+  await user.click(await screen.findByRole("button", { name: "开始批量运行" }));
+  await user.click(await screen.findByRole("button", { name: "不完整" }));
+  await user.click(screen.getByLabelText("缺关键话术"));
+  await user.type(screen.getByLabelText("哪里不对"), "当前回答没有讲清楚保障缺口。");
+  await user.type(screen.getByLabelText("正确回答应包含什么"), "应该命中保障缺口分析。");
+  await user.click(screen.getByRole("button", { name: "保存反馈" }));
+
+  expect(await screen.findByText("反馈已保存。")).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "下载 bad case JSONL" }));
+
+  await waitFor(() => {
+    const jsonl = textParts.join("");
+    const record = JSON.parse(jsonl.trim());
+    expect(record).toMatchObject({
+      batch_source_label: "pasted.csv",
+      row_index: 2,
+      input_answer: "人工答案",
+      query: "客户说每年不能超过80万怎么办？",
+      answer: "先承接预算，再讨论缴费期和保障缺口。",
+      feedback_result: "incomplete",
+      problem_tags: ["missing_talk_track"]
+    });
+  });
+  expect(requests).toContainEqual(
+    expect.objectContaining({
+      url: "/api/bad-cases",
+      body: expect.objectContaining({
+        query: "客户说每年不能超过80万怎么办？",
+        feedback_result: "incomplete"
+      })
+    })
+  );
+  restore();
+});
+
+test("does not export usable batch feedback to bad case jsonl", async () => {
+  const user = userEvent.setup();
+  const { requests } = installFetchStub();
+  render(<App />);
+
+  await user.click(screen.getByRole("button", { name: "批量" }));
+  await user.type(
+    screen.getByLabelText("批量问题内容"),
+    "问题,答案\n客户说每年不能超过80万怎么办？,人工答案"
+  );
+  await user.click(screen.getByRole("button", { name: "解析内容" }));
+  await user.click(await screen.findByRole("button", { name: "开始批量运行" }));
+  await user.click(await screen.findByRole("button", { name: "可用" }));
+
+  expect(await screen.findByText("已记录可用反馈。")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "下载 bad case JSONL" })).toBeDisabled();
+  expect(requests).toContainEqual(
+    expect.objectContaining({
+      url: "/api/bad-cases",
+      body: expect.objectContaining({
+        query: "客户说每年不能超过80万怎么办？",
+        feedback_result: "usable"
+      })
+    })
+  );
+});
+
+test("clears batch bad case jsonl records when a row is rerun", async () => {
+  const user = userEvent.setup();
+  const { requests } = installFetchStub();
+  render(<App />);
+
+  await user.click(screen.getByRole("button", { name: "批量" }));
+  await user.type(
+    screen.getByLabelText("批量问题内容"),
+    "问题,答案\n客户说每年不能超过80万怎么办？,人工答案"
+  );
+  await user.click(screen.getByRole("button", { name: "解析内容" }));
+  await user.click(await screen.findByRole("button", { name: "开始批量运行" }));
+  await user.click(await screen.findByRole("button", { name: "不完整" }));
+  await user.click(screen.getByLabelText("缺关键话术"));
+  await user.type(screen.getByLabelText("哪里不对"), "当前回答没有讲清楚保障缺口。");
+  await user.type(screen.getByLabelText("正确回答应包含什么"), "应该命中保障缺口分析。");
+  await user.click(screen.getByRole("button", { name: "保存反馈" }));
+
+  expect(await screen.findByText("反馈已保存。")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "下载 bad case JSONL" })).toBeEnabled();
+
+  await user.click(screen.getByRole("button", { name: "开始批量运行" }));
+
+  await waitFor(() => {
+    expect(
+      requests.filter((request) => request.url.endsWith("/api/answer/stream"))
+    ).toHaveLength(2);
+  });
+  expect(screen.getByRole("button", { name: "下载 bad case JSONL" })).toBeDisabled();
+});
+
+test("ignores delayed batch bad case saves after reparsing the batch", async () => {
+  const user = userEvent.setup();
+  const badCaseDeferred = deferredResponse();
+  const badCaseRequests: unknown[] = [];
+  const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith("/api/status")) {
+      return jsonResponse(statusPayload);
+    }
+    if (url.endsWith("/api/answer/stream")) {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      return batchAnswerStreamResponse(body.query);
+    }
+    if (url.endsWith("/api/bad-cases")) {
+      badCaseRequests.push(JSON.parse(String(init?.body ?? "{}")));
+      return badCaseDeferred.promise;
+    }
+    return jsonResponse({ detail: "not found" }, { status: 404 });
+  });
+  vi.stubGlobal("fetch", fetcher);
+  render(<App />);
+
+  await user.click(screen.getByRole("button", { name: "批量" }));
+  await user.type(screen.getByLabelText("批量问题内容"), "问题,答案\n旧问题,旧答案");
+  await user.click(screen.getByRole("button", { name: "解析内容" }));
+  await user.click(await screen.findByRole("button", { name: "开始批量运行" }));
+  await user.click(await screen.findByRole("button", { name: "不完整" }));
+  await user.click(screen.getByLabelText("缺关键话术"));
+  await user.type(screen.getByLabelText("哪里不对"), "旧反馈");
+  await user.type(screen.getByLabelText("正确回答应包含什么"), "旧期望");
+  await user.click(screen.getByRole("button", { name: "保存反馈" }));
+
+  await waitFor(() => {
+    expect(badCaseRequests).toHaveLength(1);
+  });
+
+  await user.clear(screen.getByLabelText("批量问题内容"));
+  await user.type(screen.getByLabelText("批量问题内容"), "问题,答案\n新问题,新答案");
+  await user.click(screen.getByRole("button", { name: "解析内容" }));
+
+  expect(screen.getByText("新问题")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "下载 bad case JSONL" })).toBeDisabled();
+
+  await act(async () => {
+    badCaseDeferred.resolve(jsonResponse({ ok: true, bad_case_id: "bad-case-late" }));
+    await badCaseDeferred.promise;
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  expect(screen.getByText("新问题")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "下载 bad case JSONL" })).toBeDisabled();
+});
+
 beforeEach(() => {
   installStorageStub();
 });

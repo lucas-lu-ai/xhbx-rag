@@ -34,15 +34,19 @@ import {
 } from "./api";
 import {
   backfilledDownloadName,
+  badCaseJsonlDownloadName,
   buildBackfilledDelimitedText,
+  buildBadCaseJsonl,
   parseBatchDelimitedInput
 } from "./batch";
 import type {
   AnswerResponse,
   AnswerProcessStep,
+  BadCaseRequest,
   BadCaseFeedbackResult,
   BadCaseIssueType,
   BadCaseProblemTag,
+  BatchBadCaseJsonlRecord,
   BatchQuestion,
   BatchRunState,
   BatchSourceFormat,
@@ -719,7 +723,8 @@ function BatchPanel({
         process_steps: [],
         streaming_answer: "",
         response: undefined,
-        error: undefined
+        error: undefined,
+        bad_case_payload: undefined
       }),
       { active_question_id: question.id }
     );
@@ -819,6 +824,75 @@ function BatchPanel({
       questions: batchState.questions
     });
     downloadTextFile(backfilledDownloadName(batchState.source_label), text);
+  }
+
+  function batchBadCaseSourceLabel(
+    state: Pick<BatchRunState, "source_label" | "source_format">
+  ): string {
+    const label = state.source_label;
+    const format = state.source_format;
+    return format === "pasted" && label === "pasted" ? "pasted.csv" : label;
+  }
+
+  function saveBatchBadCasePayload(
+    question: BatchQuestion,
+    payload: BadCaseRequest
+  ) {
+    const expectedSourceLabel = batchState?.source_label;
+    const expectedSourceFormat = batchState?.source_format;
+    setBatchState((current) => {
+      if (
+        !current ||
+        current.source_label !== expectedSourceLabel ||
+        current.source_format !== expectedSourceFormat
+      ) {
+        return current;
+      }
+
+      let saved = false;
+      const questions = current.questions.map((item) => {
+        if (
+          item.id !== question.id ||
+          item.query !== question.query ||
+          item.response !== question.response
+        ) {
+          return item;
+        }
+
+        saved = true;
+        return {
+          ...item,
+          bad_case_payload: {
+            ...payload,
+            batch_source_label: batchBadCaseSourceLabel(current),
+            row_index: item.row_index,
+            input_answer: item.input_answer
+          }
+        };
+      });
+
+      return saved ? { ...current, questions } : current;
+    });
+  }
+
+  function batchBadCaseRecords(): BatchBadCaseJsonlRecord[] {
+    return (
+      batchState?.questions
+        .map((question) => question.bad_case_payload)
+        .filter((payload): payload is BatchBadCaseJsonlRecord => Boolean(payload)) ??
+      []
+    );
+  }
+
+  function downloadBadCaseJsonl() {
+    if (!batchState) {
+      return;
+    }
+
+    downloadTextFile(
+      badCaseJsonlDownloadName(batchState.source_label),
+      buildBadCaseJsonl(batchBadCaseRecords())
+    );
   }
 
   async function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
@@ -984,6 +1058,9 @@ function BatchPanel({
                           <BadCasePanel
                             turn={batchQuestionToChatTurn(question)}
                             response={question.response}
+                            onSavedBadCase={(payload) =>
+                              saveBatchBadCasePayload(question, payload)
+                            }
                           />
                         </>
                       )}
@@ -1017,6 +1094,14 @@ function BatchPanel({
           onClick={downloadBackfilledFile}
         >
           下载回填文件
+        </button>
+        <button
+          className="secondary-button compact-button"
+          type="button"
+          disabled={running || batchBadCaseRecords().length === 0}
+          onClick={downloadBadCaseJsonl}
+        >
+          下载 bad case JSONL
         </button>
       </div>
     </section>
@@ -1188,10 +1273,12 @@ const problemTagOptions: Array<{ value: BadCaseProblemTag; label: string }> = [
 
 function BadCasePanel({
   turn,
-  response
+  response,
+  onSavedBadCase
 }: {
   turn: ChatTurn;
   response: AnswerResponse;
+  onSavedBadCase?: (payload: BadCaseRequest) => void;
 }) {
   const [selectedResult, setSelectedResult] =
     useState<BadCaseFeedbackResult | null>(null);
@@ -1261,7 +1348,7 @@ function BadCasePanel({
       const issueTypes = Array.from(
         new Set<BadCaseIssueType>([feedbackResult, ...draft.problemTags])
       );
-      await submitBadCase({
+      const payload: BadCaseRequest = {
         query: turn.query,
         rewritten_query: response.rewritten_query ?? "",
         answer: response.answer,
@@ -1279,7 +1366,11 @@ function BadCasePanel({
         note: draft.problemDetail,
         citations: response.citations,
         retrieval_evidences: evidences
-      });
+      };
+      await submitBadCase(payload);
+      if (feedbackResult !== "usable") {
+        onSavedBadCase?.(payload);
+      }
       setMessage(
         feedbackResult === "usable" ? "已记录可用反馈。" : "反馈已保存。"
       );
