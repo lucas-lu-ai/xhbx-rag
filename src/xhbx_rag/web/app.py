@@ -1,19 +1,22 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .services import answer_question, get_status
 from .source_paths import SourcePathError, reveal_in_finder
 
+logger = logging.getLogger(__name__)
+
 
 class AnswerRequest(BaseModel):
     query: str = Field(min_length=1)
-    top_n: int = Field(default=20, ge=1, le=100)
-    top_k: int = Field(default=5, ge=1, le=20)
+    top_n: int = Field(default=20, ge=1, le=100, strict=True)
+    top_k: int = Field(default=5, ge=1, le=20, strict=True)
 
     @field_validator("query")
     @classmethod
@@ -21,6 +24,12 @@ class AnswerRequest(BaseModel):
         if not value.strip():
             raise ValueError("问题不能为空")
         return value
+
+    @model_validator(mode="after")
+    def _top_k_not_greater_than_top_n(self) -> AnswerRequest:
+        if self.top_k > self.top_n:
+            raise ValueError("top_k 不能大于 top_n")
+        return self
 
 
 class RevealRequest(BaseModel):
@@ -52,7 +61,8 @@ def create_app() -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:  # noqa: BLE001 - API boundary returns safe summary
-            raise HTTPException(status_code=502, detail=f"问答失败: {exc}") from exc
+            logger.exception("Answer route failed")
+            raise HTTPException(status_code=502, detail="问答服务暂时不可用") from exc
 
     @web_app.post("/api/source/reveal")
     def reveal(request: RevealRequest) -> dict[str, Any]:
@@ -61,7 +71,8 @@ def create_app() -> FastAPI:
         except (SourcePathError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:  # noqa: BLE001 - OS reveal failures are reported safely
-            raise HTTPException(status_code=500, detail=f"无法在 Finder 中显示文件: {exc}") from exc
+            logger.exception("Reveal source route failed")
+            raise HTTPException(status_code=500, detail="无法在 Finder 中显示文件") from exc
         return {"ok": True, "resolved_path": str(resolved_path)}
 
     return web_app
