@@ -192,3 +192,38 @@ export type BadCaseResponse = {
   ok: boolean;
   bad_case_id: string;
 };
+
+export type BatchSourceFormat = "txt" | "csv" | "pasted";
+
+export type BatchQuestionStatus = "pending" | "running" | "succeeded" | "failed";
+
+export type BatchBadCaseJsonlRecord = BadCaseRequest & {
+  batch_source_label: string;
+  row_index: number;
+  input_answer: string;
+};
+
+export type BatchQuestion = {
+  id: string;
+  row_index: number;
+  query: string;
+  input_answer: string;
+  top_n: number;
+  top_k: number;
+  status: BatchQuestionStatus;
+  process_steps: AnswerProcessStep[];
+  streaming_answer: string;
+  response?: AnswerResponse;
+  error?: string;
+  bad_case_payload?: BatchBadCaseJsonlRecord;
+};
+
+export type BatchRunState = {
+  source_label: string;
+  source_format: BatchSourceFormat;
+  headers: string[];
+  rows: string[][];
+  questions: BatchQuestion[];
+  running: boolean;
+  active_question_id?: string;
+};
