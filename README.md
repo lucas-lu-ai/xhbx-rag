@@ -251,6 +251,28 @@ uv run xhbx-rag answer \
 
 证据不足或问题不属于检索范围时，`answer` 会返回“当前检索结果不足以确认。”
 
+## Web 问答界面
+
+如果希望在浏览器里直接问答并查看溯源，可以启动本机 Web 界面。第一版只读取已有索引，不在 Web 内执行 `generate-insights -> parse -> index`。
+
+后端：
+
+```bash
+uv run uvicorn xhbx_rag.web.app:app --reload --host 127.0.0.1 --port 8000
+```
+
+前端：
+
+```bash
+cd web
+npm install
+npm run dev
+```
+
+打开 `http://localhost:5173`。
+
+原始数据文件应放在项目 `data/` 目录下。点击引用时，页面会展示 `source_path`、来源类型、locator、原文摘录和定位置信心。点击“在 Finder 中显示文件”只会打开 `data/` 目录内的本地文件；第一版不会尝试把 Word/PPT/PDF 精确跳转到段落或页内锚点。
+
 ## 环境变量
 
 对话模型：
