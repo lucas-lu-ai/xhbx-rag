@@ -5,7 +5,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .services import REQUIRED_CONFIG_KEYS, answer_question, get_status
 from .source_paths import SourcePathError, reveal_in_finder
@@ -39,6 +39,8 @@ def _is_safe_answer_error(message: str) -> bool:
 
 
 class AnswerRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     query: str = Field(min_length=1)
     top_n: int = Field(default=20, ge=1, le=100, strict=True)
     top_k: int = Field(default=5, ge=1, le=20, strict=True)
@@ -58,6 +60,8 @@ class AnswerRequest(BaseModel):
 
 
 class RevealRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     source_path: str = Field(min_length=1)
 
 

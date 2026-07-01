@@ -236,6 +236,26 @@ def test_answer_route_rejects_top_k_greater_than_top_n(monkeypatch) -> None:
     assert response.status_code == 422
 
 
+def test_answer_route_rejects_extra_fields(monkeypatch) -> None:
+    def fail_if_called(*, query: str, top_n: int, top_k: int):
+        raise AssertionError("answer_question should not be called")
+
+    monkeypatch.setattr(web_app, "answer_question", fail_if_called)
+    client = TestClient(web_app.create_app())
+
+    response = client.post(
+        "/api/answer",
+        json={
+            "query": "保单整理有什么作用？",
+            "top_n": 20,
+            "top_k": 5,
+            "debug": True,
+        },
+    )
+
+    assert response.status_code == 422
+
+
 def test_reveal_route_calls_finder_reveal(monkeypatch, tmp_path: Path) -> None:
     calls = {}
 
@@ -288,6 +308,21 @@ def test_reveal_route_hides_missing_source_path_detail() -> None:
     assert "/Users" not in response.text
     assert "xhbx-rag" not in response.text
     assert "__missing_task4_review__" not in response.text
+
+
+def test_reveal_route_rejects_extra_fields(monkeypatch) -> None:
+    def fail_if_called(source_path: str):
+        raise AssertionError("reveal_in_finder should not be called")
+
+    monkeypatch.setattr(web_app, "reveal_in_finder", fail_if_called)
+    client = TestClient(web_app.create_app())
+
+    response = client.post(
+        "/api/source/reveal",
+        json={"source_path": "data/a.txt", "debug": True},
+    )
+
+    assert response.status_code == 422
 
 
 def test_reveal_route_hides_value_error_detail_and_logs(monkeypatch, caplog) -> None:
