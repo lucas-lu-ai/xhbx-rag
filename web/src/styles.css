@@ -508,6 +508,14 @@ h2 {
   color: var(--color-accent-hover);
 }
 
+.citation-toggle {
+  gap: 6px;
+  background: rgb(255 255 255 / 0.66);
+  color: var(--color-accent-hover);
+  font-size: 13px;
+  font-weight: 700;
+}
+
 .question-form {
   display: grid;
   gap: 10px;

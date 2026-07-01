@@ -50,6 +50,22 @@ const answerPayload = {
   ]
 };
 
+function answerPayloadWithCitations(count: number) {
+  return {
+    ...answerPayload,
+    citations: Array.from({ length: count }, (_, index) => ({
+      filename: `第${index + 1}节.track-0.txt`,
+      source_type: "txt",
+      source_path: `data/案例A/第${index + 1}节.track-0.txt`,
+      display_location: `L${index + 1}`,
+      display_excerpt: `第${index + 1}条引用原文`,
+      locator_confidence: "validated_span",
+      can_reveal: true
+    })),
+    evidence_count: count
+  };
+}
+
 function jsonResponse(body: unknown, init: ResponseInit = {}): Response {
   return new Response(JSON.stringify(body), {
     status: 200,
@@ -312,6 +328,59 @@ test("titles a new session from the first submitted question and persists it", a
   ).toBeInTheDocument();
   const stored = JSON.parse(localStorage.getItem("xhbx-rag.chat-sessions.v1") ?? "");
   expect(stored.sessions[0].title).toBe("客户说每年不能超过80万怎么办？");
+});
+
+test("collapses long citation lists and toggles all citations", async () => {
+  const user = userEvent.setup();
+  localStorage.setItem(
+    "xhbx-rag.chat-sessions.v1",
+    JSON.stringify({
+      version: 1,
+      active_session_id: "session-1",
+      sessions: [
+        {
+          id: "session-1",
+          title: "多引用回答",
+          created_at: "2026-07-01T08:00:00.000Z",
+          updated_at: "2026-07-01T08:01:00.000Z",
+          turns: [
+            {
+              id: "turn-1",
+              query: "客户预算有限怎么办？",
+              top_n: 20,
+              top_k: 10,
+              response: answerPayloadWithCitations(5)
+            }
+          ]
+        }
+      ]
+    })
+  );
+  installFetchStub();
+  render(<App />);
+
+  const citationList = await screen.findByLabelText("引用列表");
+  expect(within(citationList).getByRole("button", { name: /引用 1/ })).toBeInTheDocument();
+  expect(within(citationList).getByRole("button", { name: /引用 3/ })).toBeInTheDocument();
+  expect(
+    within(citationList).queryByRole("button", { name: /引用 4/ })
+  ).not.toBeInTheDocument();
+  expect(
+    within(citationList).queryByRole("button", { name: /引用 5/ })
+  ).not.toBeInTheDocument();
+
+  await user.click(within(citationList).getByRole("button", { name: "显示更多" }));
+
+  expect(within(citationList).getByRole("button", { name: /引用 4/ })).toBeInTheDocument();
+  expect(within(citationList).getByRole("button", { name: /引用 5/ })).toBeInTheDocument();
+  expect(within(citationList).getByRole("button", { name: "收起" })).toBeInTheDocument();
+
+  await user.click(within(citationList).getByRole("button", { name: "收起" }));
+
+  expect(
+    within(citationList).queryByRole("button", { name: /引用 4/ })
+  ).not.toBeInTheDocument();
+  expect(within(citationList).getByRole("button", { name: "显示更多" })).toBeInTheDocument();
 });
 
 test("loads status and submits a question", async () => {

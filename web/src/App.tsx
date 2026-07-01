@@ -2,6 +2,8 @@ import {
   AlertCircle,
   Activity,
   CheckCircle2,
+  ChevronDown,
+  ChevronUp,
   Database,
   ExternalLink,
   FileText,
@@ -383,31 +385,14 @@ export function App() {
                   )}
                   {turn.response && (
                     <>
-                      <div className="citation-list" aria-label="引用列表">
-                        {turn.response.citations.length === 0 ? (
-                          <span className="meta-text">没有可展示引用。</span>
-                        ) : (
-                          turn.response.citations.map((citation, index) => (
-                            <button
-                              className={
-                                citation === selectedCitation
-                                  ? "citation-chip selected"
-                                  : "citation-chip"
-                              }
-                              key={`${citation.source_path ?? citation.filename ?? "citation"}-${index}`}
-                              type="button"
-                              aria-pressed={citation === selectedCitation}
-                              onClick={() => {
-                                setSelectedCitation(citation);
-                                setRevealMessage("");
-                              }}
-                            >
-                              引用 {index + 1} · {citation.filename || "未知文件"} ·{" "}
-                              {citation.display_location || "未提供精确位置"}
-                            </button>
-                          ))
-                        )}
-                      </div>
+                      <CitationList
+                        citations={turn.response.citations}
+                        selectedCitation={selectedCitation}
+                        onSelect={(citation) => {
+                          setSelectedCitation(citation);
+                          setRevealMessage("");
+                        }}
+                      />
                       <BadCasePanel turn={turn} response={turn.response} />
                     </>
                   )}
@@ -591,6 +576,70 @@ function ProcessTimeline({
         </ol>
       )}
     </section>
+  );
+}
+
+function CitationList({
+  citations,
+  selectedCitation,
+  onSelect
+}: {
+  citations: Citation[];
+  selectedCitation: Citation | null;
+  onSelect: (citation: Citation) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const maxCollapsedCitations = 3;
+  const canToggle = citations.length > maxCollapsedCitations;
+  const visibleCitations =
+    expanded || !canToggle
+      ? citations
+      : citations.slice(0, maxCollapsedCitations);
+
+  useEffect(() => {
+    setExpanded(false);
+  }, [citations]);
+
+  return (
+    <div className="citation-list" aria-label="引用列表">
+      {citations.length === 0 ? (
+        <span className="meta-text">没有可展示引用。</span>
+      ) : (
+        <>
+          {visibleCitations.map((citation, index) => (
+            <button
+              className={
+                citation === selectedCitation
+                  ? "citation-chip selected"
+                  : "citation-chip"
+              }
+              key={`${citation.source_path ?? citation.filename ?? "citation"}-${index}`}
+              type="button"
+              aria-pressed={citation === selectedCitation}
+              onClick={() => onSelect(citation)}
+            >
+              引用 {index + 1} · {citation.filename || "未知文件"} ·{" "}
+              {citation.display_location || "未提供精确位置"}
+            </button>
+          ))}
+          {canToggle && (
+            <button
+              className="inline-button citation-toggle"
+              type="button"
+              aria-expanded={expanded}
+              onClick={() => setExpanded((value) => !value)}
+            >
+              {expanded ? (
+                <ChevronUp size={16} aria-hidden="true" />
+              ) : (
+                <ChevronDown size={16} aria-hidden="true" />
+              )}
+              {expanded ? "收起" : "显示更多"}
+            </button>
+          )}
+        </>
+      )}
+    </div>
   );
 }
 
