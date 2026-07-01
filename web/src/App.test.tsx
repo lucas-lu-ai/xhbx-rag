@@ -3,6 +3,8 @@ import userEvent from "@testing-library/user-event";
 
 import { App } from "./App";
 
+const cleanupCallbacks: Array<() => void> = [];
+
 const statusPayload = {
   ok: true,
   data_dir: "data",
@@ -199,6 +201,42 @@ function installStorageStub() {
     value: storage
   });
   return storage;
+}
+
+function installDownloadStub() {
+  const textParts: string[] = [];
+  const originalCreateElement = document.createElement.bind(document);
+  const click = vi.fn();
+  const createObjectUrlSpy = vi.spyOn(URL, "createObjectURL").mockImplementation((blob) => {
+    if (blob instanceof Blob) {
+      void blob.text().then((text) => textParts.push(text));
+    }
+    return "blob:batch-download";
+  });
+  const revokeObjectUrlSpy = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+  const createElementSpy = vi.spyOn(document, "createElement").mockImplementation((tagName: string) => {
+    const element = originalCreateElement(tagName);
+    if (tagName.toLowerCase() === "a") {
+      Object.defineProperty(element, "click", { value: click });
+    }
+    return element;
+  });
+  let restored = false;
+  const restore = () => {
+    if (restored) {
+      return;
+    }
+    restored = true;
+    createObjectUrlSpy.mockRestore();
+    revokeObjectUrlSpy.mockRestore();
+    createElementSpy.mockRestore();
+  };
+  cleanupCallbacks.push(restore);
+
+  return {
+    textParts,
+    restore
+  };
 }
 
 test("uses default retrieval and citation limits", async () => {
@@ -549,11 +587,40 @@ test("continues batch execution after one row fails and retries the failed row",
   expect(screen.getByRole("button", { name: "单问" })).toBeEnabled();
 });
 
+test("downloads a backfilled comma-separated answer file", async () => {
+  const user = userEvent.setup();
+  const { textParts, restore } = installDownloadStub();
+  installFetchStub();
+  render(<App />);
+
+  await user.click(screen.getByRole("button", { name: "批量" }));
+  await user.type(
+    screen.getByLabelText("批量问题内容"),
+    "问题,答案,标签\n客户说每年不能超过80万怎么办？,,预算"
+  );
+  await user.click(screen.getByRole("button", { name: "解析内容" }));
+  await user.click(await screen.findByRole("button", { name: "开始批量运行" }));
+  expect(await screen.findByText("先承接预算，再讨论缴费期和保障缺口。")).toBeInTheDocument();
+
+  await user.click(screen.getByRole("button", { name: "下载回填文件" }));
+
+  await waitFor(() => {
+    expect(textParts.join("")).toContain("问题,答案,标签");
+    expect(textParts.join("")).toContain(
+      "客户说每年不能超过80万怎么办？,先承接预算，再讨论缴费期和保障缺口。,预算"
+    );
+  });
+  restore();
+});
+
 beforeEach(() => {
   installStorageStub();
 });
 
 afterEach(() => {
+  while (cleanupCallbacks.length > 0) {
+    cleanupCallbacks.pop()?.();
+  }
   vi.unstubAllGlobals();
 });
 

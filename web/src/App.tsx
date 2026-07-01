@@ -32,7 +32,11 @@ import {
   revealSource,
   submitBadCase
 } from "./api";
-import { parseBatchDelimitedInput } from "./batch";
+import {
+  backfilledDownloadName,
+  buildBackfilledDelimitedText,
+  parseBatchDelimitedInput
+} from "./batch";
 import type {
   AnswerResponse,
   AnswerProcessStep,
@@ -56,6 +60,21 @@ const CHAT_SESSIONS_STORAGE_KEY = "xhbx-rag.chat-sessions.v1";
 const DEFAULT_SESSION_TITLE = "新会话";
 
 type WorkMode = "single" | "batch";
+
+function downloadTextFile(filename: string, text: string) {
+  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.append(link);
+  try {
+    link.click();
+  } finally {
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+  }
+}
 
 const emptyStatus: StatusResponse = {
   ok: false,
@@ -789,6 +808,19 @@ function BatchPanel({
     }
   }
 
+  function downloadBackfilledFile() {
+    if (!batchState) {
+      return;
+    }
+
+    const text = buildBackfilledDelimitedText({
+      headers: batchState.headers,
+      rows: batchState.rows,
+      questions: batchState.questions
+    });
+    downloadTextFile(backfilledDownloadName(batchState.source_label), text);
+  }
+
   async function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
     if (runningRef.current) {
       return;
@@ -973,6 +1005,18 @@ function BatchPanel({
         >
           {running && <LoaderCircle className="spin" size={18} aria-hidden="true" />}
           开始批量运行
+        </button>
+        <button
+          className="secondary-button compact-button"
+          type="button"
+          disabled={
+            running ||
+            !batchState ||
+            !batchState.questions.some((question) => question.status === "succeeded")
+          }
+          onClick={downloadBackfilledFile}
+        >
+          下载回填文件
         </button>
       </div>
     </section>
