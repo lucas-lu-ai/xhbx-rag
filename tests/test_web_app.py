@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import logging
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -101,6 +103,28 @@ def test_answer_route_maps_service_value_error_to_bad_request(monkeypatch) -> No
     assert response.json()["detail"] == "top_k 不能大于 top_n"
 
 
+def test_answer_route_hides_unknown_value_error_detail_and_logs(
+    monkeypatch, caplog
+) -> None:
+    def fail_answer_question(*, query: str, top_n: int, top_k: int):
+        raise ValueError("secret-token leaked from /Users/milan/.env")
+
+    monkeypatch.setattr(web_app, "answer_question", fail_answer_question)
+    caplog.set_level(logging.ERROR, logger=web_app.logger.name)
+    client = TestClient(web_app.create_app())
+
+    response = client.post(
+        "/api/answer",
+        json={"query": "保单整理有什么作用？", "top_n": 20, "top_k": 5},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "问答服务暂时不可用"
+    assert "secret-token" not in response.text
+    assert "/Users/milan" not in response.text
+    assert any(record.message == "Answer route failed" for record in caplog.records)
+
+
 def test_answer_route_hides_generic_exception_detail_and_logs(monkeypatch) -> None:
     log_messages = []
 
@@ -143,6 +167,22 @@ def test_answer_route_rejects_non_strict_top_n(monkeypatch, top_n) -> None:
     assert response.status_code == 422
 
 
+@pytest.mark.parametrize("top_k", [True, "5"])
+def test_answer_route_rejects_non_strict_top_k(monkeypatch, top_k) -> None:
+    def fail_if_called(*, query: str, top_n: int, top_k: int):
+        raise AssertionError("answer_question should not be called")
+
+    monkeypatch.setattr(web_app, "answer_question", fail_if_called)
+    client = TestClient(web_app.create_app())
+
+    response = client.post(
+        "/api/answer",
+        json={"query": "保单整理有什么作用？", "top_n": 20, "top_k": top_k},
+    )
+
+    assert response.status_code == 422
+
+
 def test_answer_route_rejects_top_k_greater_than_top_n(monkeypatch) -> None:
     def fail_if_called(*, query: str, top_n: int, top_k: int):
         raise AssertionError("answer_question should not be called")
@@ -180,7 +220,7 @@ def test_reveal_route_calls_finder_reveal(monkeypatch, tmp_path: Path) -> None:
 
 def test_reveal_route_returns_safe_error(monkeypatch) -> None:
     def fail_reveal(source_path: str):
-        raise ValueError("引用路径必须位于 data 目录内")
+        raise web_app.SourcePathError("引用路径必须位于 data 目录内")
 
     monkeypatch.setattr(web_app, "reveal_in_finder", fail_reveal)
     client = TestClient(web_app.create_app())
@@ -189,6 +229,25 @@ def test_reveal_route_returns_safe_error(monkeypatch) -> None:
 
     assert response.status_code == 400
     assert response.json()["detail"] == "引用路径必须位于 data 目录内"
+
+
+def test_reveal_route_hides_value_error_detail_and_logs(monkeypatch, caplog) -> None:
+    def fail_reveal(source_path: str):
+        raise ValueError("secret-token /Users/milan/data/a.txt")
+
+    monkeypatch.setattr(web_app, "reveal_in_finder", fail_reveal)
+    caplog.set_level(logging.ERROR, logger=web_app.logger.name)
+    client = TestClient(web_app.create_app())
+
+    response = client.post("/api/source/reveal", json={"source_path": "data/a.txt"})
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == "无法在 Finder 中显示文件"
+    assert "secret-token" not in response.text
+    assert "/Users/milan" not in response.text
+    assert any(
+        record.message == "Reveal source route failed" for record in caplog.records
+    )
 
 
 def test_reveal_route_hides_generic_exception_detail_and_logs(monkeypatch) -> None:
@@ -227,3 +286,18 @@ def test_cors_preflight_allows_localhost_vite_origin() -> None:
 
     assert response.status_code == 200
     assert response.headers["access-control-allow-origin"] == "http://localhost:5173"
+
+
+def test_cors_preflight_rejects_unlisted_origin() -> None:
+    client = TestClient(web_app.create_app())
+
+    response = client.options(
+        "/api/answer",
+        headers={
+            "Origin": "http://example.com",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "access-control-allow-origin" not in response.headers

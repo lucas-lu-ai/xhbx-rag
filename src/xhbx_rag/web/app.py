@@ -12,6 +12,20 @@ from .source_paths import SourcePathError, reveal_in_finder
 
 logger = logging.getLogger(__name__)
 
+_SAFE_ANSWER_ERROR_MESSAGES = {
+    "问题不能为空",
+    "top_n 必须在 1 到 100 之间",
+    "top_k 必须在 1 到 20 之间",
+    "top_k 不能大于 top_n",
+    "配置解析失败，请检查 .env 中的数值配置。",
+}
+
+
+def _is_safe_answer_error(message: str) -> bool:
+    return message in _SAFE_ANSWER_ERROR_MESSAGES or message.startswith(
+        "缺少必要环境变量:"
+    )
+
 
 class AnswerRequest(BaseModel):
     query: str = Field(min_length=1)
@@ -59,7 +73,11 @@ def create_app() -> FastAPI:
                 top_k=request.top_k,
             )
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            message = str(exc)
+            if _is_safe_answer_error(message):
+                raise HTTPException(status_code=400, detail=message) from exc
+            logger.exception("Answer route failed")
+            raise HTTPException(status_code=502, detail="问答服务暂时不可用") from exc
         except Exception as exc:  # noqa: BLE001 - API boundary returns safe summary
             logger.exception("Answer route failed")
             raise HTTPException(status_code=502, detail="问答服务暂时不可用") from exc
@@ -68,7 +86,7 @@ def create_app() -> FastAPI:
     def reveal(request: RevealRequest) -> dict[str, Any]:
         try:
             resolved_path = reveal_in_finder(request.source_path)
-        except (SourcePathError, ValueError) as exc:
+        except SourcePathError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:  # noqa: BLE001 - OS reveal failures are reported safely
             logger.exception("Reveal source route failed")
