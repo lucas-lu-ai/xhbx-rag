@@ -182,9 +182,12 @@ def answer_from_search_result(
         )
 
     generated = answer_agent.generate(search_result)
-    citations = _selected_citations(
-        _all_citations(search_result),
-        getattr(generated, "citation_indexes", []),
+    citations = _citations_with_evidence_fallback(
+        search_result,
+        _selected_citations(
+            _all_citations(search_result),
+            getattr(generated, "citation_indexes", []),
+        ),
     )
     answer = _strip_inline_citation_markers(str(getattr(generated, "answer")))
     emit_trace(
@@ -283,6 +286,34 @@ def _selected_citations(
         seen_indexes.add(index)
         selected.append(citations[index - 1])
     return selected
+
+
+def _citations_with_evidence_fallback(
+    search_result: dict[str, Any],
+    selected: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    citations = list(selected)
+    seen_keys = {_citation_key(citation) for citation in citations}
+    for item in search_result.get("results", []) or []:
+        for citation in item.get("citations", []) or []:
+            if not isinstance(citation, dict):
+                continue
+            key = _citation_key(citation)
+            if key in seen_keys:
+                continue
+            citations.append(dict(citation))
+            seen_keys.add(key)
+    return citations
+
+
+def _citation_key(citation: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        citation.get("source_path"),
+        citation.get("filename"),
+        citation.get("section_name"),
+        json.dumps(citation.get("locator") or {}, sort_keys=True, default=str),
+        citation.get("source_excerpt") or citation.get("quote"),
+    )
 
 
 def _extract_content(payload: dict[str, Any]) -> str:

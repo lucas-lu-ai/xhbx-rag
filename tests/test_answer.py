@@ -195,6 +195,29 @@ def test_answer_from_search_result_maps_selected_citations_and_emits_trace() -> 
     assert trace.events[0].payload["citation_count"] == 2
 
 
+def test_answer_from_search_result_supplements_underselected_citations_with_evidence_sources() -> None:
+    class _UnderselectingAnswerAgent:
+        def generate(self, search_result: dict):
+            return type(
+                "Answer",
+                (),
+                {
+                    "answer": "保单整理能帮助客户发现保障缺口，并建立专业信任。",
+                    "citation_indexes": [1],
+                },
+            )()
+
+    result = answer_from_search_result(
+        _search_result(),
+        answer_agent=_UnderselectingAnswerAgent(),
+    )
+
+    assert [citation["filename"] for citation in result["citations"]] == [
+        "第3节.docx",
+        "第1节.docx",
+    ]
+
+
 def test_answer_from_search_result_skips_model_when_no_results() -> None:
     class _FailingAnswerAgent:
         def generate(self, search_result: dict):
