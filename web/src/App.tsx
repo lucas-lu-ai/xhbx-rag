@@ -65,6 +65,11 @@ export function App() {
       setFormError("请输入问题后再发送。");
       return;
     }
+    const limitError = validateLimits(topN, topK);
+    if (limitError) {
+      setFormError(limitError);
+      return;
+    }
 
     setFormError("");
     setRevealMessage("");
@@ -120,7 +125,12 @@ export function App() {
             <p className="eyebrow">xhbx-rag Web</p>
             <h1>销售知识库问答</h1>
           </div>
-          <button className="ghost-button" type="button" onClick={clearTurns}>
+          <button
+            className="ghost-button"
+            type="button"
+            onClick={clearTurns}
+            disabled={loading}
+          >
             <Trash2 size={18} aria-hidden="true" />
             清空
           </button>
@@ -180,6 +190,7 @@ export function App() {
                           }
                           key={`${citation.source_path ?? citation.filename ?? "citation"}-${index}`}
                           type="button"
+                          aria-pressed={citation === selectedCitation}
                           onClick={() => {
                             setSelectedCitation(citation);
                             setRevealMessage("");
@@ -222,7 +233,10 @@ export function App() {
                 max={100}
                 type="number"
                 value={topN}
-                onChange={(event) => setTopN(Number(event.target.value))}
+                onChange={(event) => {
+                  setTopN(Number(event.target.value));
+                  setFormError("");
+                }}
               />
             </label>
             <label className="number-field">
@@ -233,7 +247,10 @@ export function App() {
                 max={20}
                 type="number"
                 value={topK}
-                onChange={(event) => setTopK(Number(event.target.value))}
+                onChange={(event) => {
+                  setTopK(Number(event.target.value));
+                  setFormError("");
+                }}
               />
             </label>
             <button className="primary-button" type="submit" disabled={loading}>
@@ -339,4 +356,17 @@ function makeTurnId(): string {
     return crypto.randomUUID();
   }
   return `${Date.now()}-${Math.random()}`;
+}
+
+function validateLimits(topN: number, topK: number): string {
+  if (!Number.isInteger(topN) || topN < 1 || topN > 100) {
+    return "召回数量必须在 1 到 100 之间。";
+  }
+  if (!Number.isInteger(topK) || topK < 1 || topK > 20) {
+    return "引用数量必须在 1 到 20 之间。";
+  }
+  if (topK > topN) {
+    return "引用数量不能大于召回数量。";
+  }
+  return "";
 }

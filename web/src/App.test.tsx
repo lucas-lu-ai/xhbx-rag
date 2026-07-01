@@ -62,6 +62,14 @@ function installFetchStub() {
   return { fetcher, requests };
 }
 
+function deferredResponse() {
+  let resolve!: (value: Response) => void;
+  const promise = new Promise<Response>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 afterEach(() => {
   vi.unstubAllGlobals();
 });
@@ -118,4 +126,46 @@ test("does not submit an empty question", async () => {
   await waitFor(() => {
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
+});
+
+test("validates citation count before submit", async () => {
+  const user = userEvent.setup();
+  const { fetcher } = installFetchStub();
+  render(<App />);
+
+  await user.clear(screen.getByLabelText("召回数量"));
+  await user.type(screen.getByLabelText("召回数量"), "1");
+  await user.type(screen.getByLabelText("输入问题"), "客户说每年不能超过80万怎么办？");
+  await user.click(screen.getByRole("button", { name: "发送" }));
+
+  expect(screen.getByText("引用数量不能大于召回数量。")).toBeInTheDocument();
+  await waitFor(() => {
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+});
+
+test("disables clear while an answer is loading", async () => {
+  const user = userEvent.setup();
+  const answer = deferredResponse();
+  const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.endsWith("/api/status")) {
+      return jsonResponse(statusPayload);
+    }
+    if (url.endsWith("/api/answer")) {
+      return answer.promise;
+    }
+    return jsonResponse({ detail: "not found" }, { status: 404 });
+  });
+  vi.stubGlobal("fetch", fetcher);
+  render(<App />);
+
+  await user.type(screen.getByLabelText("输入问题"), "客户说每年不能超过80万怎么办？");
+  await user.click(screen.getByRole("button", { name: "发送" }));
+
+  expect(screen.getByRole("button", { name: "清空" })).toBeDisabled();
+
+  answer.resolve(jsonResponse(answerPayload));
+  expect(await screen.findByText("先承接预算，再讨论缴费期和保障缺口。")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "清空" })).toBeEnabled();
 });
