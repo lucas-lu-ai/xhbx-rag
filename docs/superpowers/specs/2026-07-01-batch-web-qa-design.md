@@ -6,7 +6,7 @@
 
 当前 Web 界面已经支持单条问题的流式 RAG 问答、执行步骤展示、引用与检索证据展示，以及 bad case 反馈落盘。业务人员希望提供一个包含多个问题的文档，上传后系统批量调用 RAG 生成回答，并能看到每个问题的执行状态，同时对回答不佳的条目提交 bad case 反馈。
 
-首版选择前端编排批量执行：前端解析逗号分隔的 `.txt` 或 `.csv` 文件得到问题列表，然后串行复用现有 `/api/answer/stream` 接口。执行完成后，前端把模型回答回填到第二列“答案”中，并生成 JSONL 结果。这样能最大化复用当前稳定链路，避免新增后端任务系统、任务持久化和恢复语义。
+首版选择前端编排批量执行：前端解析逗号分隔的 `.txt` 或 `.csv` 文件得到问题列表，然后串行复用现有 `/api/answer/stream` 接口。执行完成后，前端把模型回答回填到第二列“答案”中；如果业务人员对某些回答提交 bad case 反馈，前端同时支持导出 bad case JSONL。这样能最大化复用当前稳定链路，避免新增后端任务系统、任务持久化和恢复语义。
 
 ## 目标
 
@@ -18,14 +18,15 @@
 - 运行中的问题展示现有 RAG trace 步骤和增量回答。
 - 成功的问题展示回答、引用、检索证据，并复用现有 bad case 反馈能力。
 - 失败的问题保留错误摘要，并支持单条重试。
-- 执行后生成两类结果：回填“答案”列后的逗号分隔文件内容，以及一行一条结果的 JSONL。
+- 执行后生成回填“答案”列后的逗号分隔文件内容。
+- 支持对批量结果提交 bad case 反馈，并生成 bad case JSONL。
 - 保持现有单问会话、引用详情、Finder reveal、bad case API 和本地会话持久化行为不变。
 
 ## 非目标
 
 - 首版不支持 `.docx`、`.xlsx`、`.pdf` 直接解析。
 - 首版不新增后端 batch job、任务恢复、队列持久化或跨页面继续执行。
-- 首版不把批量结果上传或保存到后端，只在浏览器端生成可下载结果。
+- 首版不把整批问答结果上传或保存到后端，只在浏览器端生成可下载回填文件；bad case 反馈继续通过现有 `/api/bad-cases` 落盘。
 - 首版不把批量执行结果写入现有聊天会话历史。
 - 首版不改变 RAG 核心检索和回答链路。
 
@@ -35,7 +36,7 @@
 
 这个方案的取舍：
 
-- 优点：复用现有 `/api/answer/stream`、执行步骤展示和 bad case 反馈结构；后端改动少；每条问题都有实时中间状态；失败隔离清楚；结果回填和 JSONL 生成可以完全在前端完成。
+- 优点：复用现有 `/api/answer/stream`、执行步骤展示和 bad case 反馈结构；后端改动少；每条问题都有实时中间状态；失败隔离清楚；答案回填和 bad case JSONL 生成可以完全在前端完成。
 - 缺点：刷新页面会丢失未完成批次；浏览器关闭后不能后台继续跑；首版结果只在当前浏览器端生成下载，不做后端保存、恢复或历史查询。
 
 未采用的方案：
@@ -53,7 +54,7 @@
 - 使用同一套 CSV 解析逻辑，支持逗号、双引号包裹字段和换行字段。
 - `.txt` 只是文件扩展名不同，内容仍必须是逗号分隔表。
 - 读取第一列作为待执行问题。
-- 第二列作为答案列；上传时可以为空，也可以已有人工答案。系统执行后会用模型回答回填第二列，同时在 JSONL 中保留上传时的原始答案值。
+- 第二列作为答案列；上传时可以为空，也可以已有人工答案。系统执行后会用模型回答回填第二列；如果该行后续被标记为 bad case，原始第二列值会作为 `input_answer` 附加到 bad case JSONL 中，方便人工对比。
 - 去掉首尾空白。
 - 空问题忽略。
 
@@ -91,7 +92,7 @@
 - 执行按钮：开始批量运行。
 - 清空批次按钮：清空当前批次结果。
 - 下载回填文件按钮：整批结束后生成与上传格式一致的逗号分隔内容，第二列为模型回答。
-- 下载 JSONL 按钮：整批结束后生成一行一条结果的 JSONL。
+- 下载 bad case JSONL 按钮：有非可用反馈后生成一行一条 bad case 记录的 JSONL。
 - 批量结果列表：每行展示序号、问题、原答案、状态、当前步骤摘要、模型回答预览和操作。
 
 结果项交互：
@@ -131,6 +132,7 @@ type BatchQuestion = {
   streaming_answer: string;
   response?: AnswerResponse;
   error?: string;
+  bad_case_payload?: BatchBadCaseJsonlRecord;
 };
 
 type BatchRunState = {
@@ -141,6 +143,12 @@ type BatchRunState = {
   questions: BatchQuestion[];
   running: boolean;
   active_question_id?: string;
+};
+
+type BatchBadCaseJsonlRecord = BadCaseRequest & {
+  batch_source_label: string;
+  row_index: number;
+  input_answer: string;
 };
 ```
 
@@ -155,7 +163,9 @@ type BatchRunState = {
 - 捕获异常时将当前条目标记为 `failed` 并保存 `error`。
 - 当前条结束后继续下一条；整批完成后 `running=false`。
 - 单条重试只重跑该条，不影响其他成功结果。
-- 成功条目的模型回答写入内存中的第二列输出值；原始第二列值保存在 `input_answer`，用于 JSONL 和对比查看。
+- 成功条目的模型回答写入内存中的第二列输出值；原始第二列值保存在 `input_answer`，用于 UI 对比和 bad case JSONL。
+- 用户提交非可用反馈时，前端同时把提交给 `/api/bad-cases` 的 payload 保存到当前条目的 `bad_case_payload`，并附加 `batch_source_label`、`row_index`、`input_answer` 三个批量上下文字段。
+- `可用` 反馈可以继续通过现有接口记录，但不进入下载的 bad case JSONL。
 
 首版不把 `BatchRunState` 写入 `localStorage`，避免把大量回答、引用和检索证据写入浏览器存储。
 
@@ -170,25 +180,39 @@ type BatchRunState = {
 - 输出使用 CSV 转义规则，即包含逗号、双引号或换行的字段会用双引号包裹，字段内部双引号写成两个双引号。
 - 如果上传的是 `.txt`，下载文件扩展名仍使用 `.txt`；如果上传的是 `.csv`，下载文件扩展名使用 `.csv`；粘贴输入默认下载 `.csv`。
 
-JSONL：
+bad case JSONL：
 
-- 一行对应输入中的一条问题。
-- 成功和失败都会写入，便于后续评测和问题排查。
+- JSONL 不是普通批量结果日志，而是 bad case 反馈记录。
+- 一行对应一次在批量结果中提交的 bad case 反馈。
+- 默认只导出已经提交非可用反馈的条目；未反馈的成功结果、失败结果和 `可用` 反馈不进入 bad case JSONL。
+- 每行兼容现有 `BadCaseRequest` 字段，并附加批量上下文，便于后续评测和问题排查。
+- `answer` 字段保存模型生成后回填到第二列的回答。
+- `expected_answer` / `expected_knowledge` 继续来自反馈表单中的“正确回答应包含什么”。
+- `input_answer` 保存上传文件第二列的原始值，不覆盖 `answer`。
 - 每行包含：
 
 ```json
 {
+  "batch_source_label": "questions.csv",
   "row_index": 2,
   "query": "客户说每年不能超过80万怎么办？",
-  "input_answer": "",
-  "generated_answer": "先承接预算，再讨论缴费期和保障缺口。",
-  "status": "succeeded",
-  "error": "",
+  "rewritten_query": "客户预算上限80万时如何回应",
+  "answer": "先承接预算，再讨论缴费期和保障缺口。",
   "top_n": 20,
   "top_k": 5,
-  "rewritten_query": "客户预算上限80万时如何回应",
+  "feedback_result": "incomplete",
+  "problem_tags": ["missing_talk_track"],
+  "problem_detail": "当前回答没有讲清楚保障缺口。",
+  "expected_answer": "应该包含保障缺口分析、预算承接和缴费期调整话术。",
+  "reference_note": "案例A 第3节",
+  "evidence_feedback": [],
+  "issue_types": ["incomplete", "missing_talk_track"],
+  "expected_knowledge": "应该包含保障缺口分析、预算承接和缴费期调整话术。",
+  "expected_source": "案例A 第3节",
+  "note": "当前回答没有讲清楚保障缺口。",
   "citations": [],
-  "retrieval_evidences": []
+  "retrieval_evidences": [],
+  "input_answer": ""
 }
 ```
 
@@ -204,7 +228,8 @@ JSONL：
 8. 成功结果显示回答、引用、检索证据和 bad case 反馈。
 9. 成功结果的模型回答写入该行第二列输出值。
 10. 用户可对单条失败问题重试，或对单条成功结果提交 bad case。
-11. 整批结束后，用户下载回填后的逗号分隔文件或 JSONL。
+11. 提交非可用反馈时，前端调用现有 `/api/bad-cases`，同时把同结构 payload 保存到该批次条目中。
+12. 整批结束后，用户下载回填后的逗号分隔文件；如果已经提交非可用反馈，用户也可以下载 bad case JSONL。
 
 ## 错误处理
 
@@ -241,9 +266,10 @@ JSONL：
 - 运行中展示每条问题的中间步骤和增量回答。
 - 单条失败后继续执行下一条。
 - 成功条目可提交 bad case，payload 包含该条 query、answer、citations 和 retrieval_evidences。
+- 批量条目提交非可用反馈后会调用 `/api/bad-cases`，并在当前条目保存 bad case JSONL 记录。
 - 失败条目可单独重试。
 - 整批完成后可生成回填后的逗号分隔内容，第二列为模型回答。
-- 整批完成后可生成 JSONL，且每行包含 query、input_answer、generated_answer、status、citations 和 retrieval_evidences。
+- 有非可用反馈后可生成 bad case JSONL，且每行兼容 `BadCaseRequest` 并包含 batch_source_label、row_index 和 input_answer。
 
 后端测试：
 
@@ -254,7 +280,7 @@ JSONL：
 
 - 用带 `问题,答案` 表头的逗号分隔 `.txt` 文件上传后能顺序跑完，并能下载回填后的 `.txt`。
 - 用带 `问题,答案` 表头的 `.csv` 上传后能顺序跑完，并能下载回填后的 `.csv`。
-- 下载 JSONL 后，每行都能被 `JSON.parse` 正确解析。
+- 下载 bad case JSONL 后，每行都能被 `JSON.parse` 正确解析，并包含本条 bad case 的反馈字段、引用和检索证据。
 - 运行中右侧索引状态不受影响。
 - 点击批量结果引用后右侧溯源详情正确切换。
 - 对批量结果提交 bad case 后 `.local/bad_cases/bad_cases.jsonl` 记录完整上下文。
@@ -263,11 +289,11 @@ JSONL：
 
 预计修改：
 
-- `web/src/types.ts`：增加批量状态类型和结果产物类型。
+- `web/src/types.ts`：增加批量状态类型和 bad case JSONL 记录类型。
 - `web/src/api.ts`：无需新增接口，继续复用 `answerQuestionStream` 和 `submitBadCase`。
-- `web/src/App.tsx`：新增工作模式切换、批量解析、串行执行、单条重试、批量结果展示、回填文件生成和 JSONL 生成。
+- `web/src/App.tsx`：新增工作模式切换、批量解析、串行执行、单条重试、批量结果展示、回填文件生成和 bad case JSONL 生成。
 - `web/src/styles.css`：新增分段控件、批量输入区、批量结果列表和状态徽标样式。
-- `web/src/App.test.tsx`：覆盖批量解析、执行状态、失败隔离、重试、bad case 反馈、回填文件生成和 JSONL 生成。
+- `web/src/App.test.tsx`：覆盖批量解析、执行状态、失败隔离、重试、bad case 反馈、回填文件生成和 bad case JSONL 生成。
 
 不修改：
 
