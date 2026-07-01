@@ -29,13 +29,14 @@ REQUIRED_CONFIG_KEYS = [
     "RERANK_MODEL_NAME",
     "RERANK_API_KEY",
 ]
+SAFE_CONFIG_PARSE_ERROR = "配置解析失败，请检查 .env 中的数值配置。"
 
 
 def get_status(*, project_root: Path | None = None) -> dict[str, Any]:
     root = project_root or project_root_from_module()
     try:
         config = RetrievalConfig.from_env()
-    except (ConfigError, ValueError) as exc:
+    except ConfigError as exc:
         return {
             "ok": False,
             "data_dir": str(root / "data"),
@@ -43,6 +44,15 @@ def get_status(*, project_root: Path | None = None) -> dict[str, Any]:
             "milvus_collection": "",
             "config": _missing_config_map(str(exc)),
             "errors": [str(exc)],
+        }
+    except ValueError:
+        return {
+            "ok": False,
+            "data_dir": str(root / "data"),
+            "milvus_lite_path": "",
+            "milvus_collection": "",
+            "config": _missing_config_map(SAFE_CONFIG_PARSE_ERROR),
+            "errors": [SAFE_CONFIG_PARSE_ERROR],
         }
 
     return {
@@ -67,36 +77,56 @@ def answer_question(
         raise ValueError("问题不能为空")
     _validate_limits(top_n=top_n, top_k=top_k)
 
-    config = RetrievalConfig.from_env()
-    result = answer_query(
-        query=stripped_query,
-        query_agent=QueryUnderstandingAgent(
+    try:
+        config = RetrievalConfig.from_env()
+    except ConfigError as exc:
+        raise ValueError(str(exc)) from exc
+    except ValueError as exc:
+        raise ValueError(SAFE_CONFIG_PARSE_ERROR) from exc
+
+    resources: list[object] = []
+    try:
+        query_agent = QueryUnderstandingAgent(
             base_url=config.base_url,
             api_key=config.api_key,
             model=config.model_name,
-        ),
-        embedding_client=EmbeddingClient(
+        )
+        resources.append(query_agent)
+        embedding_client = EmbeddingClient(
             base_url=config.embedding_base_url,
             api_key=config.embedding_api_key,
             model=config.embedding_model_name,
-        ),
-        store=MilvusLiteStore(
+        )
+        resources.append(embedding_client)
+        store = MilvusLiteStore(
             db_path=config.milvus_lite_path,
             collection_name=config.milvus_collection,
-        ),
-        reranker=RerankClient(
+        )
+        resources.append(store)
+        reranker = RerankClient(
             base_url=config.rerank_base_url,
             api_key=config.rerank_api_key,
             model=config.rerank_model_name,
-        ),
-        answer_agent=AnswerAgent(
+        )
+        resources.append(reranker)
+        answer_agent = AnswerAgent(
             base_url=config.base_url,
             api_key=config.api_key,
             model=config.model_name,
-        ),
-        top_n=top_n,
-        top_k=top_k,
-    )
+        )
+        resources.append(answer_agent)
+        result = answer_query(
+            query=stripped_query,
+            query_agent=query_agent,
+            embedding_client=embedding_client,
+            store=store,
+            reranker=reranker,
+            answer_agent=answer_agent,
+            top_n=top_n,
+            top_k=top_k,
+        )
+    finally:
+        _close_resources(resources)
 
     normalized = dict(result)
     normalized["citations"] = [
@@ -127,6 +157,26 @@ def _citation_for_ui(
         bool(source_path) and can_reveal_source(source_path, project_root=project_root)
     )
     return ui_citation
+
+
+def _close_resources(resources: list[object]) -> None:
+    closed: set[int] = set()
+    for resource in resources:
+        for target in (
+            getattr(resource, "http_client", None),
+            getattr(resource, "client", None),
+            resource,
+        ):
+            if target is None or id(target) in closed:
+                continue
+            close = getattr(target, "close", None)
+            if not callable(close):
+                continue
+            closed.add(id(target))
+            try:
+                close()
+            except Exception:
+                pass
 
 
 def _validate_limits(*, top_n: int, top_k: int) -> None:
