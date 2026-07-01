@@ -4,9 +4,13 @@ import pytest
 
 from xhbx_rag.web.source_paths import (
     SourcePathError,
+    can_reveal_source,
     citation_display_excerpt,
     display_location,
+    project_root_from_module,
+    reveal_in_finder,
     resolve_data_source_path,
+    strip_embedded_resource_suffix,
 )
 
 
@@ -83,3 +87,48 @@ def test_resolve_data_source_path_rejects_parent_traversal(tmp_path: Path) -> No
 def test_resolve_data_source_path_rejects_missing_file(tmp_path: Path) -> None:
     with pytest.raises(SourcePathError, match="文件不存在"):
         resolve_data_source_path("data/missing.txt", project_root=tmp_path)
+
+
+def test_strip_embedded_resource_suffix_returns_host_path() -> None:
+    assert (
+        strip_embedded_resource_suffix("data/a.docx::word/media/image1.png")
+        == "data/a.docx"
+    )
+
+
+def test_can_reveal_source_returns_true_for_existing_data_file_and_false_for_missing(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "data" / "a.txt"
+    source.parent.mkdir(parents=True)
+    source.write_text("hello", encoding="utf-8")
+
+    assert can_reveal_source("data/a.txt", project_root=tmp_path) is True
+    assert can_reveal_source("data/missing.txt", project_root=tmp_path) is False
+
+
+def test_reveal_in_finder_calls_open_reveal_and_returns_resolved_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "data" / "a.txt"
+    source.parent.mkdir(parents=True)
+    source.write_text("hello", encoding="utf-8")
+    calls: list[tuple[list[str], bool]] = []
+
+    def fake_run(args: list[str], *, check: bool) -> None:
+        calls.append((args, check))
+
+    monkeypatch.setattr("xhbx_rag.web.source_paths.subprocess.run", fake_run)
+
+    resolved = reveal_in_finder("data/a.txt", project_root=tmp_path)
+
+    assert calls == [(["open", "-R", str(source.resolve())], True)]
+    assert resolved == source.resolve()
+
+
+def test_project_root_from_module_points_to_repo_root() -> None:
+    project_root = project_root_from_module()
+
+    assert (project_root / "pyproject.toml").is_file()
+    assert (project_root / "src" / "xhbx_rag").is_dir()
