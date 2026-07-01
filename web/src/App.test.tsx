@@ -179,6 +179,56 @@ function installStorageStub() {
   return storage;
 }
 
+test("uses default retrieval and citation limits", async () => {
+  installStorageStub();
+  installFetchStub();
+
+  render(<App />);
+
+  expect(await screen.findByLabelText("召回数量")).toHaveValue(20);
+  expect(screen.getByLabelText("引用数量")).toHaveValue(5);
+});
+
+test("parses pasted comma-separated batch questions", async () => {
+  const user = userEvent.setup();
+  installFetchStub();
+  render(<App />);
+
+  await user.click(screen.getByRole("button", { name: "批量" }));
+  await user.type(
+    screen.getByLabelText("批量问题内容"),
+    "问题,答案\n客户说每年不能超过80万怎么办？,\n保单整理有什么作用？,人工答案"
+  );
+  await user.click(screen.getByRole("button", { name: "解析内容" }));
+
+  expect(screen.getByText("已解析 2 个问题")).toBeInTheDocument();
+  expect(screen.getByText("客户说每年不能超过80万怎么办？")).toBeInTheDocument();
+  expect(screen.getByText("保单整理有什么作用？")).toBeInTheDocument();
+  expect(screen.getByText("人工答案")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "开始批量运行" })).toBeEnabled();
+});
+
+test("clears parsed batch questions when pasted content changes", async () => {
+  const user = userEvent.setup();
+  installFetchStub();
+  render(<App />);
+
+  await user.click(screen.getByRole("button", { name: "批量" }));
+  await user.type(
+    screen.getByLabelText("批量问题内容"),
+    "问题,答案\n客户说每年不能超过80万怎么办？,\n保单整理有什么作用？,人工答案"
+  );
+  await user.click(screen.getByRole("button", { name: "解析内容" }));
+
+  expect(screen.getByText("已解析 2 个问题")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "开始批量运行" })).toBeEnabled();
+
+  await user.type(screen.getByLabelText("批量问题内容"), "\n新增问题,新增答案");
+
+  expect(screen.queryByText("已解析 2 个问题")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "开始批量运行" })).toBeDisabled();
+});
+
 beforeEach(() => {
   installStorageStub();
 });
@@ -402,7 +452,7 @@ test("loads status and submits a question", async () => {
   expect(screen.getByText("已完成证据重排")).toBeInTheDocument();
   expect(requests).toContainEqual({
     url: "/api/answer/stream",
-    body: { query: "客户说每年不能超过80万怎么办？", top_n: 20, top_k: 10 }
+    body: { query: "客户说每年不能超过80万怎么办？", top_n: 20, top_k: 5 }
   });
 });
 
@@ -420,7 +470,7 @@ test("submits the question when pressing Enter in the input", async () => {
   ).toBeInTheDocument();
   expect(requests).toContainEqual({
     url: "/api/answer/stream",
-    body: { query: "客户说每年不能超过80万怎么办？", top_n: 20, top_k: 10 }
+    body: { query: "客户说每年不能超过80万怎么办？", top_n: 20, top_k: 5 }
   });
 });
 
@@ -546,7 +596,7 @@ test("submits a bad case with retrieval context", async () => {
       rewritten_query: "客户预算上限80万时如何回应",
       answer: "先承接预算，再讨论缴费期和保障缺口。",
       top_n: 20,
-      top_k: 10,
+      top_k: 5,
       feedback_result: "incomplete",
       problem_tags: ["missing_talk_track"],
       problem_detail: "当前回答没有讲清楚保障缺口。",
@@ -588,7 +638,7 @@ test("records usable answer feedback without opening the bad case form", async (
       rewritten_query: "客户预算上限80万时如何回应",
       answer: "先承接预算，再讨论缴费期和保障缺口。",
       top_n: 20,
-      top_k: 10,
+      top_k: 5,
       feedback_result: "usable",
       problem_tags: [],
       problem_detail: "",

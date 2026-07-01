@@ -17,6 +17,7 @@ import {
   Trash2
 } from "lucide-react";
 import {
+  type ChangeEvent,
   type FormEvent,
   type KeyboardEvent,
   useEffect,
@@ -30,12 +31,15 @@ import {
   revealSource,
   submitBadCase
 } from "./api";
+import { parseBatchDelimitedInput } from "./batch";
 import type {
   AnswerResponse,
   AnswerProcessStep,
   BadCaseFeedbackResult,
   BadCaseIssueType,
   BadCaseProblemTag,
+  BatchRunState,
+  BatchSourceFormat,
   ChatSession,
   ChatTurn,
   Citation,
@@ -49,6 +53,8 @@ import type {
 const CHAT_SESSIONS_STORAGE_KEY = "xhbx-rag.chat-sessions.v1";
 const DEFAULT_SESSION_TITLE = "新会话";
 
+type WorkMode = "single" | "batch";
+
 const emptyStatus: StatusResponse = {
   ok: false,
   data_dir: "data",
@@ -61,11 +67,12 @@ const emptyStatus: StatusResponse = {
 };
 
 export function App() {
+  const [workMode, setWorkMode] = useState<WorkMode>("single");
   const [status, setStatus] = useState<StatusResponse>(emptyStatus);
   const [statusError, setStatusError] = useState("");
   const [query, setQuery] = useState("");
   const [topN, setTopN] = useState(20);
-  const [topK, setTopK] = useState(10);
+  const [topK, setTopK] = useState(5);
   const [sessionStore, setSessionStore] =
     useState<StoredChatSessions>(loadChatSessions);
   const [selectedCitation, setSelectedCitation] = useState<Citation | null>(null);
@@ -319,15 +326,41 @@ export function App() {
             <p className="eyebrow">xhbx-rag Web</p>
             <h1>销售知识库问答</h1>
           </div>
-          <button
-            className="ghost-button"
-            type="button"
-            onClick={clearTurns}
-            disabled={loading}
-          >
-            <Trash2 size={18} aria-hidden="true" />
-            清空
-          </button>
+          <div className="panel-header-actions">
+            <div className="mode-switch" role="group" aria-label="工作模式">
+              <button
+                className={
+                  workMode === "single" ? "mode-button active" : "mode-button"
+                }
+                type="button"
+                aria-pressed={workMode === "single"}
+                onClick={() => setWorkMode("single")}
+              >
+                单问
+              </button>
+              <button
+                className={
+                  workMode === "batch" ? "mode-button active" : "mode-button"
+                }
+                type="button"
+                aria-pressed={workMode === "batch"}
+                onClick={() => setWorkMode("batch")}
+              >
+                批量
+              </button>
+            </div>
+            {workMode === "single" && (
+              <button
+                className="ghost-button"
+                type="button"
+                onClick={clearTurns}
+                disabled={loading}
+              >
+                <Trash2 size={18} aria-hidden="true" />
+                清空
+              </button>
+            )}
+          </div>
         </header>
 
         {(statusError || status.errors.length > 0) && (
@@ -337,121 +370,127 @@ export function App() {
           </div>
         )}
 
-        <section className="turn-list" aria-live="polite">
-          {turns.length === 0 && (
-            <div className="empty-state">
-              <h2>暂无问答</h2>
-              <p>可以询问客户异议、销售策略或案例复盘问题。</p>
-            </div>
-          )}
-
-          {turns.map((turn) => (
-            <article className="turn" key={turn.id}>
-              <div className="message user-message">{turn.query}</div>
-
-              {turn.error && (
-                <div className="message answer-message error-message">
-                  <p>{turn.error}</p>
-                  <button
-                    className="inline-button"
-                    type="button"
-                    onClick={() => setQuery(turn.query)}
-                  >
-                    <RefreshCcw size={16} aria-hidden="true" />
-                    重新编辑
-                  </button>
+        {workMode === "single" ? (
+          <>
+            <section className="turn-list" aria-live="polite">
+              {turns.length === 0 && (
+                <div className="empty-state">
+                  <h2>暂无问答</h2>
+                  <p>可以询问客户异议、销售策略或案例复盘问题。</p>
                 </div>
               )}
 
-              {!turn.error &&
-                (turn.response ||
-                  turn.is_streaming ||
-                  turn.streaming_answer ||
-                  (turn.process_steps?.length ?? 0) > 0) && (
-                <div className="message answer-message">
-                  <ProcessTimeline
-                    active={Boolean(turn.is_streaming && !turn.response)}
-                    steps={turn.process_steps ?? []}
-                  />
-                  <p>
-                    {turn.response?.answer ||
+              {turns.map((turn) => (
+                <article className="turn" key={turn.id}>
+                  <div className="message user-message">{turn.query}</div>
+
+                  {turn.error && (
+                    <div className="message answer-message error-message">
+                      <p>{turn.error}</p>
+                      <button
+                        className="inline-button"
+                        type="button"
+                        onClick={() => setQuery(turn.query)}
+                      >
+                        <RefreshCcw size={16} aria-hidden="true" />
+                        重新编辑
+                      </button>
+                    </div>
+                  )}
+
+                  {!turn.error &&
+                    (turn.response ||
+                      turn.is_streaming ||
                       turn.streaming_answer ||
-                      "正在生成回答..."}
-                  </p>
-                  {turn.response?.rewritten_query && (
-                    <p className="meta-text">
-                      改写问题：{turn.response.rewritten_query}
-                    </p>
-                  )}
-                  {turn.response && (
-                    <>
-                      <CitationList
-                        citations={turn.response.citations}
-                        selectedCitation={selectedCitation}
-                        onSelect={(citation) => {
-                          setSelectedCitation(citation);
-                          setRevealMessage("");
-                        }}
+                      (turn.process_steps?.length ?? 0) > 0) && (
+                    <div className="message answer-message">
+                      <ProcessTimeline
+                        active={Boolean(turn.is_streaming && !turn.response)}
+                        steps={turn.process_steps ?? []}
                       />
-                      <BadCasePanel turn={turn} response={turn.response} />
-                    </>
+                      <p>
+                        {turn.response?.answer ||
+                          turn.streaming_answer ||
+                          "正在生成回答..."}
+                      </p>
+                      {turn.response?.rewritten_query && (
+                        <p className="meta-text">
+                          改写问题：{turn.response.rewritten_query}
+                        </p>
+                      )}
+                      {turn.response && (
+                        <>
+                          <CitationList
+                            citations={turn.response.citations}
+                            selectedCitation={selectedCitation}
+                            onSelect={(citation) => {
+                              setSelectedCitation(citation);
+                              setRevealMessage("");
+                            }}
+                          />
+                          <BadCasePanel turn={turn} response={turn.response} />
+                        </>
+                      )}
+                    </div>
                   )}
-                </div>
-              )}
-            </article>
-          ))}
-        </section>
+                </article>
+              ))}
+            </section>
 
-        <form className="question-form" onSubmit={handleSubmit}>
-          <label htmlFor="query">输入问题</label>
-          <textarea
-            id="query"
-            rows={3}
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            onKeyDown={handleQueryKeyDown}
-            placeholder="客户说每年不能超过80万怎么办？"
-          />
-          <div className="form-actions">
-            <label className="number-field">
-              <span>召回</span>
-              <input
-                aria-label="召回数量"
-                min={1}
-                max={100}
-                type="number"
-                value={topN}
-                onChange={(event) => {
-                  setTopN(Number(event.target.value));
-                  setFormError("");
-                }}
+            <form className="question-form" onSubmit={handleSubmit}>
+              <label htmlFor="query">输入问题</label>
+              <textarea
+                id="query"
+                rows={3}
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                onKeyDown={handleQueryKeyDown}
+                placeholder="客户说每年不能超过80万怎么办？"
               />
-            </label>
-            <label className="number-field">
-              <span>引用</span>
-              <input
-                aria-label="引用数量"
-                min={1}
-                max={20}
-                type="number"
-                value={topK}
-                onChange={(event) => {
-                  setTopK(Number(event.target.value));
-                  setFormError("");
-                }}
-              />
-            </label>
-            <button className="primary-button" type="submit" disabled={loading}>
-              {loading ? (
-                <LoaderCircle className="spin" size={18} aria-hidden="true" />
-              ) : (
-                <Send size={18} aria-hidden="true" />
-              )}
-              发送
-            </button>
-          </div>
-          {formError && <p className="form-error">{formError}</p>}
-        </form>
+              <div className="form-actions">
+                <label className="number-field">
+                  <span>召回</span>
+                  <input
+                    aria-label="召回数量"
+                    min={1}
+                    max={100}
+                    type="number"
+                    value={topN}
+                    onChange={(event) => {
+                      setTopN(Number(event.target.value));
+                      setFormError("");
+                    }}
+                  />
+                </label>
+                <label className="number-field">
+                  <span>引用</span>
+                  <input
+                    aria-label="引用数量"
+                    min={1}
+                    max={20}
+                    type="number"
+                    value={topK}
+                    onChange={(event) => {
+                      setTopK(Number(event.target.value));
+                      setFormError("");
+                    }}
+                  />
+                </label>
+                <button className="primary-button" type="submit" disabled={loading}>
+                  {loading ? (
+                    <LoaderCircle className="spin" size={18} aria-hidden="true" />
+                  ) : (
+                    <Send size={18} aria-hidden="true" />
+                  )}
+                  发送
+                </button>
+              </div>
+              {formError && <p className="form-error">{formError}</p>}
+            </form>
+          </>
+        ) : (
+          <BatchPanel />
+        )}
       </main>
 
       <aside className="source-panel" aria-label="索引和溯源">
@@ -538,6 +577,157 @@ export function App() {
       </aside>
     </div>
   );
+}
+
+function BatchPanel() {
+  const [batchText, setBatchText] = useState("");
+  const [batchState, setBatchState] = useState<BatchRunState | null>(null);
+  const [parseError, setParseError] = useState("");
+  const [sourceLabel, setSourceLabel] = useState("pasted");
+  const [sourceFormat, setSourceFormat] = useState<BatchSourceFormat>("pasted");
+  const running = batchState?.running ?? false;
+
+  function parseBatchText(
+    text: string,
+    nextSourceLabel: string,
+    nextSourceFormat: BatchSourceFormat
+  ) {
+    try {
+      setBatchState(
+        parseBatchDelimitedInput({
+          text,
+          sourceLabel: nextSourceLabel,
+          sourceFormat: nextSourceFormat
+        })
+      );
+      setParseError("");
+    } catch (error) {
+      setBatchState(null);
+      setParseError(error instanceof Error ? error.message : "解析失败");
+    }
+  }
+
+  function handleTextChange(event: ChangeEvent<HTMLTextAreaElement>) {
+    setBatchText(event.target.value);
+    setSourceLabel("pasted");
+    setSourceFormat("pasted");
+    setBatchState(null);
+    setParseError("");
+  }
+
+  function handleParseClick() {
+    parseBatchText(batchText, sourceLabel, sourceFormat);
+  }
+
+  async function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (!file) {
+      return;
+    }
+
+    const nextSourceFormat = batchSourceFormatForFile(file.name);
+    if (!nextSourceFormat) {
+      setBatchState(null);
+      setParseError("仅支持 txt 或 csv 文件");
+      return;
+    }
+
+    try {
+      const text = await file.text();
+      setBatchText(text);
+      setSourceLabel(file.name);
+      setSourceFormat(nextSourceFormat);
+      parseBatchText(text, file.name, nextSourceFormat);
+    } catch {
+      setBatchState(null);
+      setParseError("无法读取文件");
+    }
+  }
+
+  return (
+    <section className="batch-panel" aria-label="批量问题">
+      <div className="batch-inputs">
+        <label className="file-field">
+          <span>上传批量文件</span>
+          <input
+            type="file"
+            accept=".txt,.csv"
+            onChange={(event) => void handleFileChange(event)}
+          />
+        </label>
+        <label className="text-field batch-text-field" htmlFor="batch-content">
+          <span>批量问题内容</span>
+          <textarea
+            id="batch-content"
+            rows={8}
+            value={batchText}
+            onChange={handleTextChange}
+            placeholder="问题,答案&#10;客户说每年不能超过80万怎么办？,人工答案"
+          />
+        </label>
+      </div>
+
+      <div className="batch-actions">
+        <button className="secondary-button compact-button" type="button" onClick={handleParseClick}>
+          解析内容
+        </button>
+        {batchState && (
+          <span className="status-chip">已解析 {batchState.questions.length} 个问题</span>
+        )}
+      </div>
+
+      {parseError && (
+        <p className="form-error" role="alert">
+          {parseError}
+        </p>
+      )}
+
+      <div className="batch-results" aria-live="polite">
+        {!batchState ? (
+          <div className="batch-empty-state">
+            <h2>等待解析</h2>
+            <p>粘贴带表头的逗号分隔内容，或上传 txt/csv 文件。</p>
+          </div>
+        ) : (
+          <ol className="batch-result-list">
+            {batchState.questions.map((question, index) => (
+              <li key={question.id}>
+                <article className="batch-result-item">
+                  <div className="batch-result-heading">
+                    <strong>问题 {index + 1}</strong>
+                    <span className="status-chip muted">第 {question.row_index} 行</span>
+                  </div>
+                  <p>{question.query}</p>
+                  <div className="batch-original-answer">
+                    <span>原答案</span>
+                    <p>{question.input_answer.trim() || "未提供"}</p>
+                  </div>
+                </article>
+              </li>
+            ))}
+          </ol>
+        )}
+      </div>
+
+      <div className="batch-footer">
+        <button className="primary-button" type="button" disabled={!batchState || running}>
+          {running && <LoaderCircle className="spin" size={18} aria-hidden="true" />}
+          开始批量运行
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function batchSourceFormatForFile(fileName: string): BatchSourceFormat | null {
+  const normalized = fileName.toLowerCase();
+  if (normalized.endsWith(".csv")) {
+    return "csv";
+  }
+  if (normalized.endsWith(".txt")) {
+    return "txt";
+  }
+  return null;
 }
 
 function ProcessTimeline({
