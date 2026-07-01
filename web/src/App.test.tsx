@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { App } from "./App";
@@ -138,8 +138,180 @@ function deferredResponse() {
   return { promise, resolve };
 }
 
+function installStorageStub() {
+  const store = new Map<string, string>();
+  const storage = {
+    get length() {
+      return store.size;
+    },
+    clear: vi.fn(() => store.clear()),
+    getItem: vi.fn((key: string) => store.get(key) ?? null),
+    key: vi.fn((index: number) => [...store.keys()][index] ?? null),
+    removeItem: vi.fn((key: string) => {
+      store.delete(key);
+    }),
+    setItem: vi.fn((key: string, value: string) => {
+      store.set(key, String(value));
+    })
+  } satisfies Storage;
+
+  vi.stubGlobal("localStorage", storage);
+  Object.defineProperty(window, "localStorage", {
+    configurable: true,
+    value: storage
+  });
+  return storage;
+}
+
+beforeEach(() => {
+  installStorageStub();
+});
+
 afterEach(() => {
   vi.unstubAllGlobals();
+});
+
+test("restores persisted sessions after reload", async () => {
+  localStorage.setItem(
+    "xhbx-rag.chat-sessions.v1",
+    JSON.stringify({
+      version: 1,
+      active_session_id: "session-2",
+      sessions: [
+        {
+          id: "session-1",
+          title: "预算异议",
+          created_at: "2026-07-01T08:00:00.000Z",
+          updated_at: "2026-07-01T08:00:00.000Z",
+          turns: []
+        },
+        {
+          id: "session-2",
+          title: "保单整理",
+          created_at: "2026-07-01T08:01:00.000Z",
+          updated_at: "2026-07-01T08:02:00.000Z",
+          turns: [
+            {
+              id: "turn-1",
+              query: "保单整理有什么作用？",
+              top_n: 20,
+              top_k: 10,
+              response: answerPayload
+            }
+          ]
+        }
+      ]
+    })
+  );
+  installFetchStub();
+
+  render(<App />);
+
+  expect(
+    await screen.findByRole("button", { name: /保单整理.*1 轮/ })
+  ).toHaveAttribute("aria-pressed", "true");
+  expect(screen.getByText("保单整理有什么作用？")).toBeInTheDocument();
+  expect(screen.getByText("先承接预算，再讨论缴费期和保障缺口。")).toBeInTheDocument();
+});
+
+test("creates and switches sessions", async () => {
+  const user = userEvent.setup();
+  installFetchStub();
+  render(<App />);
+
+  await user.type(screen.getByLabelText("输入问题"), "客户说每年不能超过80万怎么办？");
+  await user.click(screen.getByRole("button", { name: "发送" }));
+  expect(
+    await screen.findByText("先承接预算，再讨论缴费期和保障缺口。")
+  ).toBeInTheDocument();
+
+  await user.click(screen.getByRole("button", { name: "新会话" }));
+
+  expect(screen.getByText("暂无问答")).toBeInTheDocument();
+  expect(
+    screen.queryByText("先承接预算，再讨论缴费期和保障缺口。")
+  ).not.toBeInTheDocument();
+
+  await user.click(screen.getByRole("button", { name: /1 轮/ }));
+
+  const qaPanel = screen.getByRole("main", { name: "RAG 问答" });
+  expect(
+    within(qaPanel).getByText("客户说每年不能超过80万怎么办？")
+  ).toBeInTheDocument();
+  expect(
+    within(qaPanel).getByText("先承接预算，再讨论缴费期和保障缺口。")
+  ).toBeInTheDocument();
+});
+
+test("deletes sessions from persistent storage and keeps an empty fallback", async () => {
+  const user = userEvent.setup();
+  localStorage.setItem(
+    "xhbx-rag.chat-sessions.v1",
+    JSON.stringify({
+      version: 1,
+      active_session_id: "session-2",
+      sessions: [
+        {
+          id: "session-1",
+          title: "预算异议",
+          created_at: "2026-07-01T08:00:00.000Z",
+          updated_at: "2026-07-01T08:00:00.000Z",
+          turns: []
+        },
+        {
+          id: "session-2",
+          title: "保单整理",
+          created_at: "2026-07-01T08:01:00.000Z",
+          updated_at: "2026-07-01T08:02:00.000Z",
+          turns: [
+            {
+              id: "turn-1",
+              query: "保单整理有什么作用？",
+              top_n: 20,
+              top_k: 10,
+              response: answerPayload
+            }
+          ]
+        }
+      ]
+    })
+  );
+  installFetchStub();
+  render(<App />);
+
+  await user.click(await screen.findByRole("button", { name: "删除会话 保单整理" }));
+
+  expect(screen.queryByText("保单整理有什么作用？")).not.toBeInTheDocument();
+  let stored = JSON.parse(localStorage.getItem("xhbx-rag.chat-sessions.v1") ?? "");
+  expect(stored.active_session_id).toBe("session-1");
+  expect(stored.sessions.map((session: { id: string }) => session.id)).toEqual([
+    "session-1"
+  ]);
+
+  await user.click(screen.getByRole("button", { name: "删除会话 预算异议" }));
+
+  expect(screen.getByText("暂无问答")).toBeInTheDocument();
+  stored = JSON.parse(localStorage.getItem("xhbx-rag.chat-sessions.v1") ?? "");
+  expect(stored.sessions).toHaveLength(1);
+  expect(stored.sessions[0]).toMatchObject({ title: "新会话", turns: [] });
+  expect(stored.active_session_id).toBe(stored.sessions[0].id);
+});
+
+test("titles a new session from the first submitted question and persists it", async () => {
+  const user = userEvent.setup();
+  installFetchStub();
+  render(<App />);
+
+  await user.type(screen.getByLabelText("输入问题"), "客户说每年不能超过80万怎么办？");
+  await user.click(screen.getByRole("button", { name: "发送" }));
+
+  expect(
+    await screen.findByRole("button", {
+      name: /客户说每年不能超过80万怎么办？.*1 轮/
+    })
+  ).toBeInTheDocument();
+  const stored = JSON.parse(localStorage.getItem("xhbx-rag.chat-sessions.v1") ?? "");
+  expect(stored.sessions[0].title).toBe("客户说每年不能超过80万怎么办？");
 });
 
 test("loads status and submits a question", async () => {

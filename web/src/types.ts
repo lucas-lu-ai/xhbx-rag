@@ -62,6 +62,20 @@ export type ChatTurn = {
   error?: string;
 };
 
+export type ChatSession = {
+  id: string;
+  title: string;
+  created_at: string;
+  updated_at: string;
+  turns: ChatTurn[];
+};
+
+export type StoredChatSessions = {
+  version: 1;
+  active_session_id: string;
+  sessions: ChatSession[];
+};
+
 export type AnswerRequest = {
   query: string;
   top_n?: number;

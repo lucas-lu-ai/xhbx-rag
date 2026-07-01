@@ -7,6 +7,7 @@ import {
   FileText,
   Flag,
   LoaderCircle,
+  Plus,
   RefreshCcw,
   Save,
   Search,
@@ -33,13 +34,18 @@ import type {
   BadCaseFeedbackResult,
   BadCaseIssueType,
   BadCaseProblemTag,
+  ChatSession,
   ChatTurn,
   Citation,
   EvidenceFeedback,
   EvidenceFeedbackJudgement,
   RetrievalEvidence,
+  StoredChatSessions,
   StatusResponse
 } from "./types";
+
+const CHAT_SESSIONS_STORAGE_KEY = "xhbx-rag.chat-sessions.v1";
+const DEFAULT_SESSION_TITLE = "新会话";
 
 const emptyStatus: StatusResponse = {
   ok: false,
@@ -58,11 +64,18 @@ export function App() {
   const [query, setQuery] = useState("");
   const [topN, setTopN] = useState(20);
   const [topK, setTopK] = useState(10);
-  const [turns, setTurns] = useState<ChatTurn[]>([]);
+  const [sessionStore, setSessionStore] =
+    useState<StoredChatSessions>(loadChatSessions);
   const [selectedCitation, setSelectedCitation] = useState<Citation | null>(null);
   const [loading, setLoading] = useState(false);
   const [formError, setFormError] = useState("");
   const [revealMessage, setRevealMessage] = useState("");
+  const activeSession = findActiveSession(sessionStore);
+  const turns = activeSession?.turns ?? [];
+
+  useEffect(() => {
+    persistChatSessions(sessionStore);
+  }, [sessionStore]);
 
   useEffect(() => {
     let active = true;
@@ -84,7 +97,7 @@ export function App() {
   }, []);
 
   const latestResponse = useMemo(
-    () => [...turns].reverse().find((turn) => turn.response)?.response,
+    () => latestResponseFromTurns(turns),
     [turns]
   );
   const latestEvidences = latestResponse?.retrieval_evidences ?? [];
@@ -106,18 +119,12 @@ export function App() {
     setRevealMessage("");
     setLoading(true);
     const id = makeTurnId();
-    setTurns((items) => [
-      ...items,
-      {
-        id,
-        query: trimmed,
-        top_n: topN,
-        top_k: topK,
-        process_steps: [],
-        streaming_answer: "",
-        is_streaming: true
-      }
-    ]);
+    const submittedSessionId = activeSession.id;
+    updateSessionTurns(
+      submittedSessionId,
+      (items) => [...items, makeStreamingTurn(id, trimmed, topN, topK)],
+      sessionTitleForQuestion(activeSession, trimmed)
+    );
     setQuery("");
 
     try {
@@ -130,73 +137,36 @@ export function App() {
         {
           onEvent: (event) => {
             if (event.type === "step") {
-              setTurns((items) =>
-                items.map((item) =>
-                  item.id === id
-                    ? {
-                        ...item,
-                        process_steps: [
-                          ...(item.process_steps ?? []),
-                          {
-                            step: event.step,
-                            message: event.message,
-                            payload: event.payload
-                          }
-                        ]
-                      }
-                    : item
-                )
+              updateSessionTurns(submittedSessionId, (items) =>
+                appendProcessStep(items, id, {
+                  step: event.step,
+                  message: event.message,
+                  payload: event.payload
+                })
               );
             }
             if (event.type === "answer_delta") {
-              setTurns((items) =>
-                items.map((item) =>
-                  item.id === id
-                    ? {
-                        ...item,
-                        streaming_answer: `${item.streaming_answer ?? ""}${event.text}`
-                      }
-                    : item
-                )
+              updateSessionTurns(submittedSessionId, (items) =>
+                appendAnswerDelta(items, id, event.text)
               );
             }
             if (event.type === "final") {
-              setTurns((items) =>
-                items.map((item) =>
-                  item.id === id
-                    ? {
-                        ...item,
-                        response: event.response,
-                        streaming_answer: event.response.answer,
-                        is_streaming: false
-                      }
-                    : item
-                )
+              updateSessionTurns(submittedSessionId, (items) =>
+                completeTurn(items, id, event.response)
               );
               setSelectedCitation(event.response.citations[0] ?? null);
             }
           }
         }
       );
-      setTurns((items) =>
-        items.map((item) =>
-          item.id === id
-            ? {
-                ...item,
-                response,
-                streaming_answer: response.answer,
-                is_streaming: false
-              }
-            : item
-        )
+      updateSessionTurns(submittedSessionId, (items) =>
+        completeTurn(items, id, response)
       );
       setSelectedCitation(response.citations[0] ?? null);
     } catch (error) {
       const message = error instanceof Error ? error.message : "问答失败";
-      setTurns((items) =>
-        items.map((item) =>
-          item.id === id ? { ...item, error: message, is_streaming: false } : item
-        )
+      updateSessionTurns(submittedSessionId, (items) =>
+        failTurn(items, id, message)
       );
     } finally {
       setLoading(false);
@@ -230,13 +200,117 @@ export function App() {
   }
 
   function clearTurns() {
-    setTurns([]);
+    updateSessionTurns(activeSession.id, () => []);
     setSelectedCitation(null);
     setRevealMessage("");
   }
 
+  function createSession() {
+    const session = createEmptySession();
+    setSessionStore((current) => ({
+      ...current,
+      active_session_id: session.id,
+      sessions: [session, ...current.sessions]
+    }));
+    setQuery("");
+    setFormError("");
+    setSelectedCitation(null);
+    setRevealMessage("");
+  }
+
+  function selectSession(sessionId: string) {
+    const session = sessionStore.sessions.find((item) => item.id === sessionId);
+    if (!session) {
+      return;
+    }
+
+    setSessionStore((current) => ({
+      ...current,
+      active_session_id: sessionId
+    }));
+    setSelectedCitation(
+      latestResponseFromTurns(session.turns)?.citations[0] ?? null
+    );
+    setRevealMessage("");
+  }
+
+  function deleteSession(sessionId: string) {
+    const nextStore = deleteSessionFromStore(sessionStore, sessionId);
+    const nextActiveSession = findActiveSession(nextStore);
+
+    setSessionStore(nextStore);
+    setSelectedCitation(
+      latestResponseFromTurns(nextActiveSession.turns)?.citations[0] ?? null
+    );
+    setRevealMessage("");
+  }
+
+  function updateSessionTurns(
+    sessionId: string,
+    updater: (items: ChatTurn[]) => ChatTurn[],
+    title?: string
+  ) {
+    setSessionStore((current) =>
+      updateSession(current, sessionId, (session) => ({
+        ...session,
+        title: title ?? session.title,
+        turns: updater(session.turns),
+        updated_at: new Date().toISOString()
+      }))
+    );
+  }
+
   return (
     <div className="app-shell">
+      <aside className="session-panel" aria-label="会话列表">
+        <header className="session-header">
+          <div>
+            <p className="eyebrow">会话</p>
+            <h2>问答会话</h2>
+          </div>
+          <button
+            className="ghost-button session-new-button"
+            type="button"
+            onClick={createSession}
+          >
+            <Plus size={16} aria-hidden="true" />
+            新会话
+          </button>
+        </header>
+        <nav className="session-list" aria-label="历史会话">
+          {sessionStore.sessions.map((session) => (
+            <div
+              className={
+                session.id === activeSession.id
+                  ? "session-row selected"
+                  : "session-row"
+              }
+              key={session.id}
+            >
+              <button
+                className="session-item"
+                type="button"
+                aria-pressed={session.id === activeSession.id}
+                onClick={() => selectSession(session.id)}
+              >
+                <span>{session.title}</span>
+                <small>
+                  {session.turns.length} 轮 · {formatSessionTime(session.updated_at)}
+                </small>
+              </button>
+              <button
+                className="session-delete-button"
+                type="button"
+                aria-label={`删除会话 ${session.title}`}
+                onClick={() => deleteSession(session.id)}
+              >
+                <Trash2 size={15} aria-hidden="true" />
+              </button>
+            </div>
+          ))}
+        </nav>
+      </aside>
+
       <main className="qa-panel" aria-label="RAG 问答">
         <header className="panel-header">
           <div>
@@ -934,6 +1008,258 @@ function EvidenceList({
   );
 }
 
+function loadChatSessions(): StoredChatSessions {
+  const fallback = createDefaultSessionStore();
+  const storage = getStorage();
+  if (!storage) {
+    return fallback;
+  }
+
+  try {
+    const raw = storage.getItem(CHAT_SESSIONS_STORAGE_KEY);
+    if (!raw) {
+      return fallback;
+    }
+    return normalizeStoredChatSessions(JSON.parse(raw)) ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function persistChatSessions(store: StoredChatSessions) {
+  const storage = getStorage();
+  if (!storage) {
+    return;
+  }
+
+  try {
+    storage.setItem(CHAT_SESSIONS_STORAGE_KEY, JSON.stringify(store));
+  } catch {
+    // Persistence is best-effort; the active chat should keep working in memory.
+  }
+}
+
+function normalizeStoredChatSessions(value: unknown): StoredChatSessions | null {
+  if (
+    !isObject(value) ||
+    value.version !== 1 ||
+    typeof value.active_session_id !== "string" ||
+    !Array.isArray(value.sessions)
+  ) {
+    return null;
+  }
+
+  const sessions = value.sessions.filter(isChatSession);
+  if (sessions.length === 0) {
+    return null;
+  }
+
+  const activeSessionId = sessions.some(
+    (session) => session.id === value.active_session_id
+  )
+    ? value.active_session_id
+    : sessions[0].id;
+
+  return {
+    version: 1,
+    active_session_id: activeSessionId,
+    sessions
+  };
+}
+
+function isChatSession(value: unknown): value is ChatSession {
+  return (
+    isObject(value) &&
+    typeof value.id === "string" &&
+    typeof value.title === "string" &&
+    typeof value.created_at === "string" &&
+    typeof value.updated_at === "string" &&
+    Array.isArray(value.turns)
+  );
+}
+
+function createDefaultSessionStore(): StoredChatSessions {
+  const session = createEmptySession();
+  return {
+    version: 1,
+    active_session_id: session.id,
+    sessions: [session]
+  };
+}
+
+function createEmptySession(): ChatSession {
+  const now = new Date().toISOString();
+  return {
+    id: makeTurnId(),
+    title: DEFAULT_SESSION_TITLE,
+    created_at: now,
+    updated_at: now,
+    turns: []
+  };
+}
+
+function findActiveSession(store: StoredChatSessions): ChatSession {
+  return (
+    store.sessions.find((session) => session.id === store.active_session_id) ??
+    store.sessions[0] ??
+    createEmptySession()
+  );
+}
+
+function updateSession(
+  store: StoredChatSessions,
+  sessionId: string,
+  updater: (session: ChatSession) => ChatSession
+): StoredChatSessions {
+  let found = false;
+  const sessions = store.sessions.map((session) => {
+    if (session.id !== sessionId) {
+      return session;
+    }
+    found = true;
+    return updater(session);
+  });
+
+  if (!found) {
+    return store;
+  }
+
+  return {
+    ...store,
+    sessions
+  };
+}
+
+function deleteSessionFromStore(
+  store: StoredChatSessions,
+  sessionId: string
+): StoredChatSessions {
+  const remaining = store.sessions.filter((session) => session.id !== sessionId);
+  if (remaining.length === 0) {
+    return createDefaultSessionStore();
+  }
+
+  const activeSessionId =
+    store.active_session_id === sessionId
+      ? mostRecentlyUpdatedSession(remaining).id
+      : store.active_session_id;
+
+  return {
+    ...store,
+    active_session_id: activeSessionId,
+    sessions: remaining
+  };
+}
+
+function mostRecentlyUpdatedSession(sessions: ChatSession[]): ChatSession {
+  return [...sessions].sort(
+    (left, right) =>
+      new Date(right.updated_at).getTime() - new Date(left.updated_at).getTime()
+  )[0];
+}
+
+function sessionTitleForQuestion(
+  session: ChatSession,
+  query: string
+): string | undefined {
+  if (session.title !== DEFAULT_SESSION_TITLE || session.turns.length > 0) {
+    return undefined;
+  }
+  return makeSessionTitle(query);
+}
+
+function makeSessionTitle(query: string): string {
+  const normalized = query.replace(/\s+/g, " ").trim();
+  if (normalized.length <= 32) {
+    return normalized || DEFAULT_SESSION_TITLE;
+  }
+  return `${normalized.slice(0, 32)}...`;
+}
+
+function makeStreamingTurn(
+  id: string,
+  query: string,
+  topN: number,
+  topK: number
+): ChatTurn {
+  return {
+    id,
+    query,
+    top_n: topN,
+    top_k: topK,
+    process_steps: [],
+    streaming_answer: "",
+    is_streaming: true
+  };
+}
+
+function appendProcessStep(
+  turns: ChatTurn[],
+  turnId: string,
+  step: AnswerProcessStep
+): ChatTurn[] {
+  return turns.map((turn) =>
+    turn.id === turnId
+      ? {
+          ...turn,
+          process_steps: [...(turn.process_steps ?? []), step]
+        }
+      : turn
+  );
+}
+
+function appendAnswerDelta(
+  turns: ChatTurn[],
+  turnId: string,
+  text: string
+): ChatTurn[] {
+  return turns.map((turn) =>
+    turn.id === turnId
+      ? {
+          ...turn,
+          streaming_answer: `${turn.streaming_answer ?? ""}${text}`
+        }
+      : turn
+  );
+}
+
+function completeTurn(
+  turns: ChatTurn[],
+  turnId: string,
+  response: AnswerResponse
+): ChatTurn[] {
+  return turns.map((turn) =>
+    turn.id === turnId
+      ? {
+          ...turn,
+          response,
+          streaming_answer: response.answer,
+          is_streaming: false
+        }
+      : turn
+  );
+}
+
+function failTurn(turns: ChatTurn[], turnId: string, message: string): ChatTurn[] {
+  return turns.map((turn) =>
+    turn.id === turnId ? { ...turn, error: message, is_streaming: false } : turn
+  );
+}
+
+function latestResponseFromTurns(turns: ChatTurn[]): AnswerResponse | undefined {
+  return [...turns].reverse().find((turn) => turn.response)?.response;
+}
+
+function getStorage(): Storage | null {
+  if (
+    typeof localStorage === "undefined" ||
+    typeof localStorage.getItem !== "function"
+  ) {
+    return null;
+  }
+  return localStorage;
+}
+
 function makeTurnId(): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
     return crypto.randomUUID();
@@ -978,8 +1304,25 @@ function formatScore(value: unknown): string {
     : "";
 }
 
+function formatSessionTime(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "刚刚";
+  }
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  }).format(date);
+}
+
 function stringValue(value: unknown): string {
   return typeof value === "string" ? value : "";
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 function formatProcessPayload(payload?: Record<string, unknown>): string {
