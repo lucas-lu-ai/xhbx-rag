@@ -32,7 +32,11 @@ def display_location(locator: Mapping[str, Any] | None) -> str:
 
     heading_path = locator.get("heading_path")
     if isinstance(heading_path, list) and heading_path:
-        parts.append(" / ".join(str(item) for item in heading_path if str(item).strip()))
+        cleaned_heading_path = [
+            str(item).strip() for item in heading_path if str(item).strip()
+        ]
+        if cleaned_heading_path:
+            parts.append(" / ".join(cleaned_heading_path))
     elif isinstance(heading_path, str) and heading_path.strip():
         parts.append(heading_path.strip())
 

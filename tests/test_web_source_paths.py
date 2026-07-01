@@ -37,6 +37,10 @@ def test_display_location_handles_missing_locator() -> None:
     assert display_location({}) == "未提供精确位置"
 
 
+def test_display_location_handles_blank_heading_path_items() -> None:
+    assert display_location({"heading_path": [" ", ""]}) == "未提供精确位置"
+
+
 def test_citation_display_excerpt_prefers_source_excerpt() -> None:
     citation = {"source_excerpt": "原文摘录", "quote": "模型引用"}
 
@@ -87,6 +91,37 @@ def test_resolve_data_source_path_rejects_parent_traversal(tmp_path: Path) -> No
 def test_resolve_data_source_path_rejects_missing_file(tmp_path: Path) -> None:
     with pytest.raises(SourcePathError, match="文件不存在"):
         resolve_data_source_path("data/missing.txt", project_root=tmp_path)
+
+
+def test_resolve_data_source_path_rejects_symlink_outside_data(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "secret.txt"
+    outside.write_text("secret", encoding="utf-8")
+    link = tmp_path / "data" / "secret-link.txt"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(outside)
+
+    with pytest.raises(SourcePathError, match="data 目录"):
+        resolve_data_source_path("data/secret-link.txt", project_root=tmp_path)
+
+
+def test_resolve_data_source_path_rejects_directory(tmp_path: Path) -> None:
+    source_dir = tmp_path / "data" / "dir"
+    source_dir.mkdir(parents=True)
+
+    with pytest.raises(SourcePathError, match="不是普通文件"):
+        resolve_data_source_path("data/dir", project_root=tmp_path)
+
+
+def test_resolve_data_source_path_rejects_absolute_path_outside_data(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "secret.txt"
+    outside.write_text("secret", encoding="utf-8")
+
+    with pytest.raises(SourcePathError, match="data 目录"):
+        resolve_data_source_path(str(outside), project_root=tmp_path)
 
 
 def test_strip_embedded_resource_suffix_returns_host_path() -> None:
