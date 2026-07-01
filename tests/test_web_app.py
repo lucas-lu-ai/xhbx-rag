@@ -228,7 +228,28 @@ def test_reveal_route_returns_safe_error(monkeypatch) -> None:
     response = client.post("/api/source/reveal", json={"source_path": "../secret.txt"})
 
     assert response.status_code == 400
-    assert response.json()["detail"] == "引用路径必须位于 data 目录内"
+    assert (
+        response.json()["detail"]
+        == "无法显示引用文件，请确认文件位于 data 目录内且仍然存在。"
+    )
+
+
+def test_reveal_route_hides_missing_source_path_detail() -> None:
+    client = TestClient(web_app.create_app())
+
+    response = client.post(
+        "/api/source/reveal",
+        json={"source_path": "data/__missing_task4_review__.txt"},
+    )
+
+    assert response.status_code == 400
+    assert (
+        response.json()["detail"]
+        == "无法显示引用文件，请确认文件位于 data 目录内且仍然存在。"
+    )
+    assert "/Users" not in response.text
+    assert "xhbx-rag" not in response.text
+    assert "__missing_task4_review__" not in response.text
 
 
 def test_reveal_route_hides_value_error_detail_and_logs(monkeypatch, caplog) -> None:

@@ -20,6 +20,10 @@ _SAFE_ANSWER_ERROR_MESSAGES = {
     "配置解析失败，请检查 .env 中的数值配置。",
 }
 
+SOURCE_REVEAL_CLIENT_ERROR_DETAIL = (
+    "无法显示引用文件，请确认文件位于 data 目录内且仍然存在。"
+)
+
 
 def _is_safe_answer_error(message: str) -> bool:
     return message in _SAFE_ANSWER_ERROR_MESSAGES or message.startswith(
@@ -87,7 +91,11 @@ def create_app() -> FastAPI:
         try:
             resolved_path = reveal_in_finder(request.source_path)
         except SourcePathError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            logger.exception("Source reveal rejected")
+            raise HTTPException(
+                status_code=400,
+                detail=SOURCE_REVEAL_CLIENT_ERROR_DETAIL,
+            ) from exc
         except Exception as exc:  # noqa: BLE001 - OS reveal failures are reported safely
             logger.exception("Reveal source route failed")
             raise HTTPException(status_code=500, detail="无法在 Finder 中显示文件") from exc
