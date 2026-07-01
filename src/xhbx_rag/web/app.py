@@ -7,7 +7,12 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .services import REQUIRED_CONFIG_KEYS, answer_question, get_status
+from .services import (
+    LOCAL_INDEX_UNAVAILABLE_ERROR,
+    REQUIRED_CONFIG_KEYS,
+    answer_question,
+    get_status,
+)
 from .source_paths import SourcePathError, reveal_in_finder
 
 logger = logging.getLogger(__name__)
@@ -89,6 +94,8 @@ def create_app() -> FastAPI:
             )
         except ValueError as exc:
             message = str(exc)
+            if message == LOCAL_INDEX_UNAVAILABLE_ERROR:
+                raise HTTPException(status_code=503, detail=message) from exc
             if _is_safe_answer_error(message):
                 raise HTTPException(status_code=400, detail=message) from exc
             logger.exception("Answer route failed")

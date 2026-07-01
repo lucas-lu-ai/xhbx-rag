@@ -189,6 +189,24 @@ def test_answer_route_hides_generic_exception_detail_and_logs(monkeypatch) -> No
     assert log_messages == ["Answer route failed"]
 
 
+def test_answer_route_reports_local_index_unavailable(monkeypatch) -> None:
+    detail = "本地 Milvus 索引暂时不可用，请关闭其他正在使用索引的进程后重试。"
+
+    def fail_answer_question(*, query: str, top_n: int, top_k: int):
+        raise ValueError(detail)
+
+    monkeypatch.setattr(web_app, "answer_question", fail_answer_question)
+    client = TestClient(web_app.create_app())
+
+    response = client.post(
+        "/api/answer",
+        json={"query": "保单整理有什么作用？", "top_n": 20, "top_k": 5},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == detail
+
+
 @pytest.mark.parametrize("top_n", [True, "20"])
 def test_answer_route_rejects_non_strict_top_n(monkeypatch, top_n) -> None:
     def fail_if_called(*, query: str, top_n: int, top_k: int):

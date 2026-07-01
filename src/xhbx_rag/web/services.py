@@ -30,6 +30,9 @@ REQUIRED_CONFIG_KEYS = [
     "RERANK_API_KEY",
 ]
 SAFE_CONFIG_PARSE_ERROR = "配置解析失败，请检查 .env 中的数值配置。"
+LOCAL_INDEX_UNAVAILABLE_ERROR = (
+    "本地 Milvus 索引暂时不可用，请关闭其他正在使用索引的进程后重试。"
+)
 
 
 def get_status(*, project_root: Path | None = None) -> dict[str, Any]:
@@ -98,10 +101,15 @@ def answer_question(
             model=config.embedding_model_name,
         )
         resources.append(embedding_client)
-        store = MilvusLiteStore(
-            db_path=config.milvus_lite_path,
-            collection_name=config.milvus_collection,
-        )
+        try:
+            store = MilvusLiteStore(
+                db_path=config.milvus_lite_path,
+                collection_name=config.milvus_collection,
+            )
+        except Exception as exc:
+            if _is_local_index_open_failure(exc):
+                raise ValueError(LOCAL_INDEX_UNAVAILABLE_ERROR) from exc
+            raise
         resources.append(store)
         reranker = RerankClient(
             base_url=config.rerank_base_url,
@@ -197,3 +205,19 @@ def _missing_config_map(error: str) -> dict[str, bool]:
             if key in config:
                 config[key] = False
     return config
+
+
+def _is_local_index_open_failure(exc: Exception) -> bool:
+    return any(
+        "Open local milvus failed" in str(item)
+        for item in _exception_chain(exc)
+    )
+
+
+def _exception_chain(exc: BaseException):
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__

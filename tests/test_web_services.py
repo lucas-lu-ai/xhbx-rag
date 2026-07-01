@@ -8,6 +8,7 @@ from xhbx_rag.config import ConfigError
 
 
 SAFE_CONFIG_ERROR = "配置解析失败，请检查 .env 中的数值配置。"
+LOCAL_INDEX_ERROR = "本地 Milvus 索引暂时不可用，请关闭其他正在使用索引的进程后重试。"
 
 
 def _fake_config() -> SimpleNamespace:
@@ -396,3 +397,36 @@ def test_answer_question_closes_resources_when_answer_query_fails(monkeypatch) -
 def test_answer_question_rejects_empty_query() -> None:
     with pytest.raises(ValueError, match="问题不能为空"):
         services.answer_question(query="  ", top_n=20, top_k=5)
+
+
+def test_answer_question_sanitizes_local_index_open_failure(monkeypatch) -> None:
+    monkeypatch.setattr(services.RetrievalConfig, "from_env", _fake_config)
+    monkeypatch.setattr(
+        services,
+        "QueryUnderstandingAgent",
+        lambda **kwargs: _FakeHttpComponent("query_agent", []),
+    )
+    monkeypatch.setattr(
+        services,
+        "EmbeddingClient",
+        lambda **kwargs: _FakeHttpComponent("embedding_client", []),
+    )
+
+    def fail_store(**kwargs):
+        raise RuntimeError(
+            "Open local milvus failed for "
+            "/Users/milan/xhbx-rag/.local/milvus/xhbx_rag.db secret-token"
+        )
+
+    monkeypatch.setattr(services, "MilvusLiteStore", fail_store)
+
+    with pytest.raises(ValueError) as exc_info:
+        services.answer_question(
+            query="保单整理有什么作用？",
+            top_n=20,
+            top_k=5,
+        )
+
+    assert str(exc_info.value) == LOCAL_INDEX_ERROR
+    assert "/Users/milan" not in str(exc_info.value)
+    assert "secret-token" not in str(exc_info.value)
