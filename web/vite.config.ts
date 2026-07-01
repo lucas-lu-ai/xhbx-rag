@@ -6,6 +6,8 @@ export default defineConfig({
   server: {
     host: "127.0.0.1",
     port: 5173,
+    // Allows random ngrok free subdomains without allowing every host.
+    allowedHosts: [".ngrok-free.app"],
     proxy: {
       "/api": "http://127.0.0.1:8000"
     }
