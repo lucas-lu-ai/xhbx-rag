@@ -103,6 +103,44 @@ def test_answer_route_maps_service_value_error_to_bad_request(monkeypatch) -> No
     assert response.json()["detail"] == "top_k 不能大于 top_n"
 
 
+def test_answer_route_allows_safe_missing_config_keys(monkeypatch) -> None:
+    def fail_answer_question(*, query: str, top_n: int, top_k: int):
+        raise ValueError("缺少必要环境变量: API_KEY, RERANK_API_KEY")
+
+    monkeypatch.setattr(web_app, "answer_question", fail_answer_question)
+    client = TestClient(web_app.create_app())
+
+    response = client.post(
+        "/api/answer",
+        json={"query": "保单整理有什么作用？", "top_n": 20, "top_k": 5},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "缺少必要环境变量: API_KEY, RERANK_API_KEY"
+
+
+def test_answer_route_hides_tampered_missing_config_error_and_logs(
+    monkeypatch, caplog
+) -> None:
+    def fail_answer_question(*, query: str, top_n: int, top_k: int):
+        raise ValueError("缺少必要环境变量: API_KEY at /Users/milan/.env secret-token")
+
+    monkeypatch.setattr(web_app, "answer_question", fail_answer_question)
+    caplog.set_level(logging.ERROR, logger=web_app.logger.name)
+    client = TestClient(web_app.create_app())
+
+    response = client.post(
+        "/api/answer",
+        json={"query": "保单整理有什么作用？", "top_n": 20, "top_k": 5},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "问答服务暂时不可用"
+    assert "secret-token" not in response.text
+    assert "/Users/milan" not in response.text
+    assert any(record.message == "Answer route failed" for record in caplog.records)
+
+
 def test_answer_route_hides_unknown_value_error_detail_and_logs(
     monkeypatch, caplog
 ) -> None:

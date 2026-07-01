@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from .services import answer_question, get_status
+from .services import REQUIRED_CONFIG_KEYS, answer_question, get_status
 from .source_paths import SourcePathError, reveal_in_finder
 
 logger = logging.getLogger(__name__)
@@ -23,12 +23,19 @@ _SAFE_ANSWER_ERROR_MESSAGES = {
 SOURCE_REVEAL_CLIENT_ERROR_DETAIL = (
     "无法显示引用文件，请确认文件位于 data 目录内且仍然存在。"
 )
+_MISSING_CONFIG_ERROR_PREFIX = "缺少必要环境变量:"
+_SAFE_CONFIG_KEYS = set(REQUIRED_CONFIG_KEYS)
 
 
 def _is_safe_answer_error(message: str) -> bool:
-    return message in _SAFE_ANSWER_ERROR_MESSAGES or message.startswith(
-        "缺少必要环境变量:"
-    )
+    if message in _SAFE_ANSWER_ERROR_MESSAGES:
+        return True
+    if not message.startswith(_MISSING_CONFIG_ERROR_PREFIX):
+        return False
+
+    raw_keys = message.removeprefix(_MISSING_CONFIG_ERROR_PREFIX)
+    keys = [item.strip() for item in raw_keys.split(",")]
+    return bool(keys) and all(key in _SAFE_CONFIG_KEYS for key in keys)
 
 
 class AnswerRequest(BaseModel):
