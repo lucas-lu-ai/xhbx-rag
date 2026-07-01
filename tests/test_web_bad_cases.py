@@ -42,6 +42,50 @@ def test_save_bad_case_appends_jsonl_record(tmp_path: Path) -> None:
     assert "created_at" in records[0]
 
 
+def test_save_bad_case_adds_chinese_labels_for_review_fields(tmp_path: Path) -> None:
+    bad_cases.save_bad_case(
+        {
+            **_bad_case_payload(),
+            "feedback_result": "incomplete",
+            "problem_tags": ["missing_talk_track", "compliance_risk"],
+            "issue_types": ["incomplete", "missing_talk_track", "compliance_risk"],
+            "evidence_feedback": [
+                {
+                    "chunk_id": "case-a-1",
+                    "judgement": "should_use",
+                    "label": "案例A · 需求分析",
+                    "text_preview": "客户需要先看清保障缺口。",
+                },
+                {
+                    "chunk_id": "case-b-2",
+                    "judgement": "should_not_use",
+                    "label": "案例B · 销售动作",
+                    "text_preview": "先介绍销售流程。",
+                },
+            ],
+        },
+        project_root=tmp_path,
+    )
+
+    path = tmp_path / ".local" / "bad_cases" / "bad_cases.jsonl"
+    record = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+
+    assert record["feedback_result"] == "incomplete"
+    assert record["feedback_result_label"] == "不完整"
+    assert record["problem_tags"] == ["missing_talk_track", "compliance_risk"]
+    assert record["problem_tag_labels"] == ["缺关键话术", "可能有合规风险"]
+    assert record["issue_types"] == [
+        "incomplete",
+        "missing_talk_track",
+        "compliance_risk",
+    ]
+    assert record["issue_type_labels"] == ["不完整", "缺关键话术", "可能有合规风险"]
+    assert record["evidence_feedback"][0]["judgement"] == "should_use"
+    assert record["evidence_feedback"][0]["judgement_label"] == "应该用"
+    assert record["evidence_feedback"][1]["judgement"] == "should_not_use"
+    assert record["evidence_feedback"][1]["judgement_label"] == "不该用"
+
+
 def test_save_bad_case_appends_multiple_records(tmp_path: Path) -> None:
     first = bad_cases.save_bad_case(_bad_case_payload(), project_root=tmp_path)
     second = bad_cases.save_bad_case(
