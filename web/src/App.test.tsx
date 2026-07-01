@@ -491,6 +491,64 @@ test("clears parsed batch questions when pasted content changes", async () => {
   expect(screen.getByRole("button", { name: "开始批量运行" })).toBeDisabled();
 });
 
+test("continues batch execution after one row fails and retries the failed row", async () => {
+  const user = userEvent.setup();
+  let firstQuestionAttempts = 0;
+  const streamQueries: string[] = [];
+  const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith("/api/status")) {
+      return jsonResponse(statusPayload);
+    }
+    if (url.endsWith("/api/answer/stream")) {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      streamQueries.push(body.query);
+      if (body.query === "失败问题" && firstQuestionAttempts === 0) {
+        firstQuestionAttempts += 1;
+        return sseResponse([
+          { event: "error", data: { type: "error", detail: "问答服务暂时不可用" } }
+        ]);
+      }
+      return sseResponse([
+        {
+          event: "final",
+          data: {
+            type: "final",
+            response: {
+              ...answerPayload,
+              answer: `${body.query} 成功答案`,
+              rewritten_query: `${body.query} 改写`
+            }
+          }
+        }
+      ]);
+    }
+    return jsonResponse({ detail: "not found" }, { status: 404 });
+  });
+  vi.stubGlobal("fetch", fetcher);
+  render(<App />);
+
+  await user.click(screen.getByRole("button", { name: "批量" }));
+  await user.type(screen.getByLabelText("批量问题内容"), "问题,答案\n失败问题,\n后续问题,");
+  await user.click(screen.getByRole("button", { name: "解析内容" }));
+  await user.click(await screen.findByRole("button", { name: "开始批量运行" }));
+
+  expect(await screen.findByText("问答服务暂时不可用")).toBeInTheDocument();
+  expect(screen.getByText("后续问题 成功答案")).toBeInTheDocument();
+  expect(streamQueries).toEqual(["失败问题", "后续问题"]);
+  expect(screen.getByRole("button", { name: "开始批量运行" })).toBeEnabled();
+  expect(screen.getByRole("button", { name: "单问" })).toBeEnabled();
+
+  await user.click(screen.getByRole("button", { name: "重试" }));
+
+  expect(await screen.findByText("失败问题 成功答案")).toBeInTheDocument();
+  expect(screen.getByText("后续问题 成功答案")).toBeInTheDocument();
+  expect(streamQueries).toEqual(["失败问题", "后续问题", "失败问题"]);
+  expect(firstQuestionAttempts).toBe(1);
+  expect(screen.getByRole("button", { name: "开始批量运行" })).toBeEnabled();
+  expect(screen.getByRole("button", { name: "单问" })).toBeEnabled();
+});
+
 beforeEach(() => {
   installStorageStub();
 });

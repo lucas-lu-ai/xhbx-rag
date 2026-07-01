@@ -672,6 +672,20 @@ function BatchPanel({
     });
   }
 
+  function setBatchRunning(nextRunning: boolean, activeQuestionId?: string) {
+    runningRef.current = nextRunning;
+    onRunningChange(nextRunning);
+    setBatchState((current) =>
+      current
+        ? {
+            ...current,
+            running: nextRunning,
+            active_question_id: nextRunning ? activeQuestionId : undefined
+          }
+        : current
+    );
+  }
+
   async function runBatchQuestion(question: BatchQuestion) {
     const topN = 20;
     const topK = 5;
@@ -747,27 +761,31 @@ function BatchPanel({
     }
   }
 
+  async function retryBatchQuestion(question: BatchQuestion) {
+    if (runningRef.current || question.status !== "failed") {
+      return;
+    }
+
+    setBatchRunning(true, question.id);
+    try {
+      await runBatchQuestion(question);
+    } finally {
+      setBatchRunning(false);
+    }
+  }
+
   async function runBatch() {
     if (!batchState || batchState.running || runningRef.current) {
       return;
     }
 
-    runningRef.current = true;
-    onRunningChange(true);
-    setBatchState((current) =>
-      current ? { ...current, running: true, active_question_id: undefined } : current
-    );
-
+    setBatchRunning(true);
     try {
       for (const question of batchState.questions) {
         await runBatchQuestion(question);
       }
     } finally {
-      runningRef.current = false;
-      onRunningChange(false);
-      setBatchState((current) =>
-        current ? { ...current, running: false, active_question_id: undefined } : current
-      );
+      setBatchRunning(false);
     }
   }
 
@@ -879,6 +897,17 @@ function BatchPanel({
                       >
                         {batchQuestionStatusLabel(question.status)}
                       </span>
+                      {question.status === "failed" && (
+                        <button
+                          className="secondary-button compact-button"
+                          type="button"
+                          disabled={running}
+                          onClick={() => void retryBatchQuestion(question)}
+                        >
+                          <RefreshCcw size={16} aria-hidden="true" />
+                          重试
+                        </button>
+                      )}
                     </div>
                   </div>
                   <p>{question.query}</p>
