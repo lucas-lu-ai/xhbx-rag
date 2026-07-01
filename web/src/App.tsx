@@ -22,6 +22,7 @@ import {
   type KeyboardEvent,
   useEffect,
   useMemo,
+  useRef,
   useState
 } from "react";
 
@@ -38,6 +39,7 @@ import type {
   BadCaseFeedbackResult,
   BadCaseIssueType,
   BadCaseProblemTag,
+  BatchQuestion,
   BatchRunState,
   BatchSourceFormat,
   ChatSession,
@@ -68,6 +70,7 @@ const emptyStatus: StatusResponse = {
 
 export function App() {
   const [workMode, setWorkMode] = useState<WorkMode>("single");
+  const [batchRunning, setBatchRunning] = useState(false);
   const [status, setStatus] = useState<StatusResponse>(emptyStatus);
   const [statusError, setStatusError] = useState("");
   const [query, setQuery] = useState("");
@@ -334,6 +337,7 @@ export function App() {
                 }
                 type="button"
                 aria-pressed={workMode === "single"}
+                disabled={batchRunning}
                 onClick={() => setWorkMode("single")}
               >
                 单问
@@ -344,6 +348,7 @@ export function App() {
                 }
                 type="button"
                 aria-pressed={workMode === "batch"}
+                disabled={batchRunning}
                 onClick={() => setWorkMode("batch")}
               >
                 批量
@@ -489,7 +494,14 @@ export function App() {
             </form>
           </>
         ) : (
-          <BatchPanel />
+          <BatchPanel
+            selectedCitation={selectedCitation}
+            onRunningChange={setBatchRunning}
+            onCitationSelect={(citation) => {
+              setSelectedCitation(citation);
+              setRevealMessage("");
+            }}
+          />
         )}
       </main>
 
@@ -579,13 +591,26 @@ export function App() {
   );
 }
 
-function BatchPanel() {
+function BatchPanel({
+  selectedCitation,
+  onRunningChange,
+  onCitationSelect
+}: {
+  selectedCitation: Citation | null;
+  onRunningChange: (running: boolean) => void;
+  onCitationSelect: (citation: Citation) => void;
+}) {
   const [batchText, setBatchText] = useState("");
   const [batchState, setBatchState] = useState<BatchRunState | null>(null);
   const [parseError, setParseError] = useState("");
   const [sourceLabel, setSourceLabel] = useState("pasted");
   const [sourceFormat, setSourceFormat] = useState<BatchSourceFormat>("pasted");
   const running = batchState?.running ?? false;
+  const runningRef = useRef(running);
+
+  useEffect(() => {
+    runningRef.current = running;
+  }, [running]);
 
   function parseBatchText(
     text: string,
@@ -608,6 +633,10 @@ function BatchPanel() {
   }
 
   function handleTextChange(event: ChangeEvent<HTMLTextAreaElement>) {
+    if (runningRef.current) {
+      return;
+    }
+
     setBatchText(event.target.value);
     setSourceLabel("pasted");
     setSourceFormat("pasted");
@@ -616,10 +645,137 @@ function BatchPanel() {
   }
 
   function handleParseClick() {
+    if (runningRef.current) {
+      return;
+    }
+
     parseBatchText(batchText, sourceLabel, sourceFormat);
   }
 
+  function updateBatchQuestion(
+    questionId: string,
+    updater: (question: BatchQuestion) => BatchQuestion,
+    patch: Partial<Omit<BatchRunState, "questions">> = {}
+  ) {
+    setBatchState((current) => {
+      if (!current) {
+        return current;
+      }
+
+      return {
+        ...current,
+        ...patch,
+        questions: current.questions.map((question) =>
+          question.id === questionId ? updater(question) : question
+        )
+      };
+    });
+  }
+
+  async function runBatchQuestion(question: BatchQuestion) {
+    const topN = 20;
+    const topK = 5;
+
+    updateBatchQuestion(
+      question.id,
+      (item) => ({
+        ...item,
+        top_n: topN,
+        top_k: topK,
+        status: "running",
+        process_steps: [],
+        streaming_answer: "",
+        response: undefined,
+        error: undefined
+      }),
+      { active_question_id: question.id }
+    );
+
+    try {
+      const response = await answerQuestionStream(
+        {
+          query: question.query,
+          top_n: topN,
+          top_k: topK
+        },
+        {
+          onEvent: (event) => {
+            if (event.type === "step") {
+              updateBatchQuestion(question.id, (item) => ({
+                ...item,
+                process_steps: [
+                  ...item.process_steps,
+                  {
+                    step: event.step,
+                    message: event.message,
+                    payload: event.payload
+                  }
+                ]
+              }));
+            }
+            if (event.type === "answer_delta") {
+              updateBatchQuestion(question.id, (item) => ({
+                ...item,
+                streaming_answer: `${item.streaming_answer}${event.text}`
+              }));
+            }
+            if (event.type === "final") {
+              updateBatchQuestion(question.id, (item) => ({
+                ...item,
+                status: "succeeded",
+                response: event.response,
+                streaming_answer: event.response.answer,
+                error: undefined
+              }));
+            }
+          }
+        }
+      );
+      updateBatchQuestion(question.id, (item) => ({
+        ...item,
+        status: "succeeded",
+        response,
+        streaming_answer: response.answer,
+        error: undefined
+      }));
+    } catch (error) {
+      updateBatchQuestion(question.id, (item) => ({
+        ...item,
+        status: "failed",
+        error: error instanceof Error ? error.message : "批量问题执行失败"
+      }));
+    }
+  }
+
+  async function runBatch() {
+    if (!batchState || batchState.running || runningRef.current) {
+      return;
+    }
+
+    runningRef.current = true;
+    onRunningChange(true);
+    setBatchState((current) =>
+      current ? { ...current, running: true, active_question_id: undefined } : current
+    );
+
+    try {
+      for (const question of batchState.questions) {
+        await runBatchQuestion(question);
+      }
+    } finally {
+      runningRef.current = false;
+      onRunningChange(false);
+      setBatchState((current) =>
+        current ? { ...current, running: false, active_question_id: undefined } : current
+      );
+    }
+  }
+
   async function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
+    if (runningRef.current) {
+      return;
+    }
+
     const file = event.target.files?.[0];
     if (!file) {
       return;
@@ -634,11 +790,19 @@ function BatchPanel() {
 
     try {
       const text = await file.text();
+      if (runningRef.current) {
+        return;
+      }
+
       setBatchText(text);
       setSourceLabel(file.name);
       setSourceFormat(nextSourceFormat);
       parseBatchText(text, file.name, nextSourceFormat);
     } catch {
+      if (runningRef.current) {
+        return;
+      }
+
       setBatchState(null);
       setParseError("无法读取文件");
     }
@@ -652,6 +816,7 @@ function BatchPanel() {
           <input
             type="file"
             accept=".txt,.csv"
+            disabled={running}
             onChange={(event) => void handleFileChange(event)}
           />
         </label>
@@ -661,6 +826,7 @@ function BatchPanel() {
             id="batch-content"
             rows={8}
             value={batchText}
+            disabled={running}
             onChange={handleTextChange}
             placeholder="问题,答案&#10;客户说每年不能超过80万怎么办？,人工答案"
           />
@@ -668,7 +834,12 @@ function BatchPanel() {
       </div>
 
       <div className="batch-actions">
-        <button className="secondary-button compact-button" type="button" onClick={handleParseClick}>
+        <button
+          className="secondary-button compact-button"
+          type="button"
+          disabled={running}
+          onClick={handleParseClick}
+        >
           解析内容
         </button>
         {batchState && (
@@ -695,13 +866,68 @@ function BatchPanel() {
                 <article className="batch-result-item">
                   <div className="batch-result-heading">
                     <strong>问题 {index + 1}</strong>
-                    <span className="status-chip muted">第 {question.row_index} 行</span>
+                    <div className="batch-actions">
+                      <span className="status-chip muted">
+                        第 {question.row_index} 行
+                      </span>
+                      <span
+                        className={
+                          question.status === "succeeded"
+                            ? "status-chip"
+                            : "status-chip muted"
+                        }
+                      >
+                        {batchQuestionStatusLabel(question.status)}
+                      </span>
+                    </div>
                   </div>
                   <p>{question.query}</p>
                   <div className="batch-original-answer">
                     <span>原答案</span>
                     <p>{question.input_answer.trim() || "未提供"}</p>
                   </div>
+                  {(question.status !== "pending" ||
+                    question.process_steps.length > 0 ||
+                    question.streaming_answer ||
+                    question.response ||
+                    question.error) && (
+                    <div className="batch-original-answer">
+                      <span>模型答案</span>
+                      <ProcessTimeline
+                        active={
+                          question.status === "running" && !question.response
+                        }
+                        steps={question.process_steps}
+                      />
+                      {question.error ? (
+                        <p className="form-error">{question.error}</p>
+                      ) : (
+                        <p>
+                          {question.response?.answer ||
+                            question.streaming_answer ||
+                            "正在生成回答..."}
+                        </p>
+                      )}
+                      {question.response?.rewritten_query && (
+                        <p className="meta-text">
+                          改写问题：{question.response.rewritten_query}
+                        </p>
+                      )}
+                      {question.response && (
+                        <>
+                          <CitationList
+                            citations={question.response.citations}
+                            selectedCitation={selectedCitation}
+                            onSelect={onCitationSelect}
+                          />
+                          <BadCasePanel
+                            turn={batchQuestionToChatTurn(question)}
+                            response={question.response}
+                          />
+                        </>
+                      )}
+                    </div>
+                  )}
                 </article>
               </li>
             ))}
@@ -710,13 +936,45 @@ function BatchPanel() {
       </div>
 
       <div className="batch-footer">
-        <button className="primary-button" type="button" disabled={!batchState || running}>
+        <button
+          className="primary-button"
+          type="button"
+          disabled={!batchState || running}
+          onClick={() => void runBatch()}
+        >
           {running && <LoaderCircle className="spin" size={18} aria-hidden="true" />}
           开始批量运行
         </button>
       </div>
     </section>
   );
+}
+
+function batchQuestionStatusLabel(status: BatchQuestion["status"]): string {
+  if (status === "running") {
+    return "运行中";
+  }
+  if (status === "succeeded") {
+    return "已完成";
+  }
+  if (status === "failed") {
+    return "失败";
+  }
+  return "待运行";
+}
+
+function batchQuestionToChatTurn(question: BatchQuestion): ChatTurn {
+  return {
+    id: question.id,
+    query: question.query,
+    top_n: question.top_n,
+    top_k: question.top_k,
+    process_steps: question.process_steps,
+    streaming_answer: question.streaming_answer,
+    response: question.response,
+    error: question.error,
+    is_streaming: question.status === "running"
+  };
 }
 
 function batchSourceFormatForFile(fileName: string): BatchSourceFormat | null {

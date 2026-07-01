@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { App } from "./App";
@@ -115,6 +115,28 @@ function answerStreamResponse() {
   ]);
 }
 
+function batchAnswerStreamResponse(query: string) {
+  const response = {
+    ...answerPayload,
+    answer: `${query} 的模型答案`,
+    rewritten_query: `${query} 改写`
+  };
+
+  return sseResponse([
+    {
+      event: "step",
+      data: {
+        type: "step",
+        step: "search.query_understood",
+        message: "已完成问题理解",
+        payload: { rewritten_query: response.rewritten_query }
+      }
+    },
+    { event: "answer_delta", data: { type: "answer_delta", text: response.answer } },
+    { event: "final", data: { type: "final", response } }
+  ]);
+}
+
 function installFetchStub() {
   const requests: Array<{ url: string; body?: unknown }> = [];
   const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -206,6 +228,246 @@ test("parses pasted comma-separated batch questions", async () => {
   expect(screen.getByText("保单整理有什么作用？")).toBeInTheDocument();
   expect(screen.getByText("人工答案")).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "开始批量运行" })).toBeEnabled();
+});
+
+test("runs batch questions sequentially and shows per-row process state", async () => {
+  const user = userEvent.setup();
+  const streamRequests: Array<{
+    body: { query: string; top_n: number; top_k: number };
+    resolve: () => void;
+  }> = [];
+  const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith("/api/status")) {
+      return jsonResponse(statusPayload);
+    }
+    if (url.endsWith("/api/answer/stream")) {
+      const body = JSON.parse(String(init?.body));
+      const deferred = deferredResponse();
+      streamRequests.push({
+        body,
+        resolve: () => deferred.resolve(batchAnswerStreamResponse(body.query))
+      });
+      return deferred.promise;
+    }
+    return jsonResponse({ detail: "not found" }, { status: 404 });
+  });
+  vi.stubGlobal("fetch", fetcher);
+  render(<App />);
+
+  await user.click(screen.getByRole("button", { name: "批量" }));
+  await user.click(screen.getByLabelText("批量问题内容"));
+  await user.paste(
+    "问题,答案\n客户说每年不能超过80万怎么办？,\n保单整理有什么作用？,"
+  );
+  await user.click(screen.getByRole("button", { name: "解析内容" }));
+  await user.click(screen.getByRole("button", { name: "开始批量运行" }));
+
+  await waitFor(() => {
+    expect(streamRequests).toHaveLength(1);
+  });
+  expect(streamRequests[0].body).toEqual({
+    query: "客户说每年不能超过80万怎么办？",
+    top_n: 20,
+    top_k: 5
+  });
+
+  streamRequests[0].resolve();
+  expect(
+    await screen.findByText("客户说每年不能超过80万怎么办？ 的模型答案")
+  ).toBeInTheDocument();
+
+  await waitFor(() => {
+    expect(streamRequests).toHaveLength(2);
+  });
+  expect(streamRequests.map((request) => request.body)).toEqual([
+    {
+      query: "客户说每年不能超过80万怎么办？",
+      top_n: 20,
+      top_k: 5
+    },
+    {
+      query: "保单整理有什么作用？",
+      top_n: 20,
+      top_k: 5
+    }
+  ]);
+
+  streamRequests[1].resolve();
+  expect(await screen.findByText("保单整理有什么作用？ 的模型答案")).toBeInTheDocument();
+  expect(screen.getAllByText("已完成问题理解")).toHaveLength(2);
+});
+
+test("keeps batch input locked while a batch run is active", async () => {
+  const user = userEvent.setup();
+  const streamRequests: Array<{
+    body: { query: string; top_n: number; top_k: number };
+    resolve: () => void;
+  }> = [];
+  const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith("/api/status")) {
+      return jsonResponse(statusPayload);
+    }
+    if (url.endsWith("/api/answer/stream")) {
+      const body = JSON.parse(String(init?.body));
+      const deferred = deferredResponse();
+      streamRequests.push({
+        body,
+        resolve: () => deferred.resolve(batchAnswerStreamResponse(body.query))
+      });
+      return deferred.promise;
+    }
+    return jsonResponse({ detail: "not found" }, { status: 404 });
+  });
+  vi.stubGlobal("fetch", fetcher);
+  render(<App />);
+
+  await user.click(screen.getByRole("button", { name: "批量" }));
+  await user.click(screen.getByLabelText("批量问题内容"));
+  await user.paste(
+    "问题,答案\n客户说每年不能超过80万怎么办？,\n保单整理有什么作用？,"
+  );
+  await user.click(screen.getByRole("button", { name: "解析内容" }));
+  await user.click(screen.getByRole("button", { name: "开始批量运行" }));
+
+  await waitFor(() => {
+    expect(streamRequests).toHaveLength(1);
+  });
+  expect(screen.getByLabelText("批量问题内容")).toBeDisabled();
+  expect(screen.getByLabelText("上传批量文件")).toBeDisabled();
+  expect(screen.getByRole("button", { name: "解析内容" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "开始批量运行" })).toBeDisabled();
+  expect(streamRequests).toHaveLength(1);
+
+  streamRequests[0].resolve();
+  await waitFor(() => {
+    expect(streamRequests).toHaveLength(2);
+  });
+
+  streamRequests[1].resolve();
+  expect(await screen.findByText("保单整理有什么作用？ 的模型答案")).toBeInTheDocument();
+});
+
+test("keeps work mode locked while a batch run is active", async () => {
+  const user = userEvent.setup();
+  const streamRequests: Array<{
+    body: { query: string; top_n: number; top_k: number };
+    resolve: () => void;
+  }> = [];
+  const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith("/api/status")) {
+      return jsonResponse(statusPayload);
+    }
+    if (url.endsWith("/api/answer/stream")) {
+      const body = JSON.parse(String(init?.body));
+      const deferred = deferredResponse();
+      streamRequests.push({
+        body,
+        resolve: () => deferred.resolve(batchAnswerStreamResponse(body.query))
+      });
+      return deferred.promise;
+    }
+    return jsonResponse({ detail: "not found" }, { status: 404 });
+  });
+  vi.stubGlobal("fetch", fetcher);
+  render(<App />);
+
+  await user.click(screen.getByRole("button", { name: "批量" }));
+  await user.click(screen.getByLabelText("批量问题内容"));
+  await user.paste(
+    "问题,答案\n客户说每年不能超过80万怎么办？,\n保单整理有什么作用？,"
+  );
+  await user.click(screen.getByRole("button", { name: "解析内容" }));
+  await user.click(screen.getByRole("button", { name: "开始批量运行" }));
+
+  await waitFor(() => {
+    expect(streamRequests).toHaveLength(1);
+  });
+  expect(screen.getByRole("button", { name: "单问" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "批量" })).toBeDisabled();
+
+  await user.click(screen.getByRole("button", { name: "单问" }));
+
+  expect(screen.getByLabelText("批量问题内容")).toBeInTheDocument();
+  expect(screen.queryByLabelText("输入问题")).not.toBeInTheDocument();
+
+  streamRequests[0].resolve();
+  await waitFor(() => {
+    expect(streamRequests).toHaveLength(2);
+  });
+});
+
+test("does not replace a running batch when a file read finishes late", async () => {
+  const user = userEvent.setup();
+  const streamRequests: Array<{
+    body: { query: string; top_n: number; top_k: number };
+    resolve: () => void;
+  }> = [];
+  const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith("/api/status")) {
+      return jsonResponse(statusPayload);
+    }
+    if (url.endsWith("/api/answer/stream")) {
+      const body = JSON.parse(String(init?.body));
+      const deferred = deferredResponse();
+      streamRequests.push({
+        body,
+        resolve: () => deferred.resolve(batchAnswerStreamResponse(body.query))
+      });
+      return deferred.promise;
+    }
+    return jsonResponse({ detail: "not found" }, { status: 404 });
+  });
+  let resolveFileText!: (text: string) => void;
+  const fileTextPromise = new Promise<string>((resolve) => {
+    resolveFileText = resolve;
+  });
+  const file = new File([""], "late.csv", { type: "text/csv" });
+  const fileText = vi.fn(() => fileTextPromise);
+  Object.defineProperty(file, "text", {
+    configurable: true,
+    value: fileText
+  });
+  vi.stubGlobal("fetch", fetcher);
+  render(<App />);
+
+  await user.click(screen.getByRole("button", { name: "批量" }));
+  await user.click(screen.getByLabelText("批量问题内容"));
+  await user.paste(
+    "问题,答案\n客户说每年不能超过80万怎么办？,\n保单整理有什么作用？,"
+  );
+  await user.click(screen.getByRole("button", { name: "解析内容" }));
+  await user.upload(screen.getByLabelText("上传批量文件"), file);
+  expect(fileText).toHaveBeenCalledTimes(1);
+
+  await user.click(screen.getByRole("button", { name: "开始批量运行" }));
+  await waitFor(() => {
+    expect(streamRequests).toHaveLength(1);
+  });
+
+  await act(async () => {
+    resolveFileText("问题,答案\n新文件问题,");
+    await fileTextPromise;
+  });
+
+  expect(screen.queryByText("新文件问题")).not.toBeInTheDocument();
+  expect(screen.getByText("客户说每年不能超过80万怎么办？")).toBeInTheDocument();
+  expect(screen.getByText("保单整理有什么作用？")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "开始批量运行" })).toBeDisabled();
+  expect(streamRequests.map((request) => request.body.query)).toEqual([
+    "客户说每年不能超过80万怎么办？"
+  ]);
+
+  streamRequests[0].resolve();
+  await waitFor(() => {
+    expect(streamRequests.map((request) => request.body.query)).toEqual([
+      "客户说每年不能超过80万怎么办？",
+      "保单整理有什么作用？"
+    ]);
+  });
 });
 
 test("clears parsed batch questions when pasted content changes", async () => {
