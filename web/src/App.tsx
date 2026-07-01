@@ -1,21 +1,51 @@
 import {
   AlertCircle,
+  Activity,
+  CheckCircle2,
   Database,
   ExternalLink,
   FileText,
+  Flag,
   LoaderCircle,
   RefreshCcw,
+  Save,
+  Search,
   Send,
   Trash2
 } from "lucide-react";
-import { type FormEvent, useEffect, useMemo, useState } from "react";
+import {
+  type FormEvent,
+  type KeyboardEvent,
+  useEffect,
+  useMemo,
+  useState
+} from "react";
 
-import { answerQuestion, getStatus, revealSource } from "./api";
-import type { ChatTurn, Citation, StatusResponse } from "./types";
+import {
+  answerQuestionStream,
+  getStatus,
+  revealSource,
+  submitBadCase
+} from "./api";
+import type {
+  AnswerResponse,
+  AnswerProcessStep,
+  BadCaseFeedbackResult,
+  BadCaseIssueType,
+  BadCaseProblemTag,
+  ChatTurn,
+  Citation,
+  EvidenceFeedback,
+  EvidenceFeedbackJudgement,
+  RetrievalEvidence,
+  StatusResponse
+} from "./types";
 
 const emptyStatus: StatusResponse = {
   ok: false,
   data_dir: "data",
+  milvus_mode: "",
+  milvus_target: "",
   milvus_lite_path: "",
   milvus_collection: "",
   config: {},
@@ -27,7 +57,7 @@ export function App() {
   const [statusError, setStatusError] = useState("");
   const [query, setQuery] = useState("");
   const [topN, setTopN] = useState(20);
-  const [topK, setTopK] = useState(5);
+  const [topK, setTopK] = useState(10);
   const [turns, setTurns] = useState<ChatTurn[]>([]);
   const [selectedCitation, setSelectedCitation] = useState<Citation | null>(null);
   const [loading, setLoading] = useState(false);
@@ -57,6 +87,7 @@ export function App() {
     () => [...turns].reverse().find((turn) => turn.response)?.response,
     [turns]
   );
+  const latestEvidences = latestResponse?.retrieval_evidences ?? [];
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -75,27 +106,114 @@ export function App() {
     setRevealMessage("");
     setLoading(true);
     const id = makeTurnId();
-    setTurns((items) => [...items, { id, query: trimmed }]);
+    setTurns((items) => [
+      ...items,
+      {
+        id,
+        query: trimmed,
+        top_n: topN,
+        top_k: topK,
+        process_steps: [],
+        streaming_answer: "",
+        is_streaming: true
+      }
+    ]);
     setQuery("");
 
     try {
-      const response = await answerQuestion({
-        query: trimmed,
-        top_n: topN,
-        top_k: topK
-      });
+      const response = await answerQuestionStream(
+        {
+          query: trimmed,
+          top_n: topN,
+          top_k: topK
+        },
+        {
+          onEvent: (event) => {
+            if (event.type === "step") {
+              setTurns((items) =>
+                items.map((item) =>
+                  item.id === id
+                    ? {
+                        ...item,
+                        process_steps: [
+                          ...(item.process_steps ?? []),
+                          {
+                            step: event.step,
+                            message: event.message,
+                            payload: event.payload
+                          }
+                        ]
+                      }
+                    : item
+                )
+              );
+            }
+            if (event.type === "answer_delta") {
+              setTurns((items) =>
+                items.map((item) =>
+                  item.id === id
+                    ? {
+                        ...item,
+                        streaming_answer: `${item.streaming_answer ?? ""}${event.text}`
+                      }
+                    : item
+                )
+              );
+            }
+            if (event.type === "final") {
+              setTurns((items) =>
+                items.map((item) =>
+                  item.id === id
+                    ? {
+                        ...item,
+                        response: event.response,
+                        streaming_answer: event.response.answer,
+                        is_streaming: false
+                      }
+                    : item
+                )
+              );
+              setSelectedCitation(event.response.citations[0] ?? null);
+            }
+          }
+        }
+      );
       setTurns((items) =>
-        items.map((item) => (item.id === id ? { ...item, response } : item))
+        items.map((item) =>
+          item.id === id
+            ? {
+                ...item,
+                response,
+                streaming_answer: response.answer,
+                is_streaming: false
+              }
+            : item
+        )
       );
       setSelectedCitation(response.citations[0] ?? null);
     } catch (error) {
       const message = error instanceof Error ? error.message : "问答失败";
       setTurns((items) =>
-        items.map((item) => (item.id === id ? { ...item, error: message } : item))
+        items.map((item) =>
+          item.id === id ? { ...item, error: message, is_streaming: false } : item
+        )
       );
     } finally {
       setLoading(false);
     }
+  }
+
+  function handleQueryKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) {
+      return;
+    }
+
+    event.preventDefault();
+    if (loading) {
+      return;
+    }
+
+    event.currentTarget.form?.requestSubmit();
   }
 
   async function handleReveal() {
@@ -169,50 +287,60 @@ export function App() {
                 </div>
               )}
 
-              {turn.response && (
+              {!turn.error &&
+                (turn.response ||
+                  turn.is_streaming ||
+                  turn.streaming_answer ||
+                  (turn.process_steps?.length ?? 0) > 0) && (
                 <div className="message answer-message">
-                  <p>{turn.response.answer}</p>
-                  {turn.response.rewritten_query && (
+                  <ProcessTimeline
+                    active={Boolean(turn.is_streaming && !turn.response)}
+                    steps={turn.process_steps ?? []}
+                  />
+                  <p>
+                    {turn.response?.answer ||
+                      turn.streaming_answer ||
+                      "正在生成回答..."}
+                  </p>
+                  {turn.response?.rewritten_query && (
                     <p className="meta-text">
                       改写问题：{turn.response.rewritten_query}
                     </p>
                   )}
-                  <div className="citation-list" aria-label="引用列表">
-                    {turn.response.citations.length === 0 ? (
-                      <span className="meta-text">没有可展示引用。</span>
-                    ) : (
-                      turn.response.citations.map((citation, index) => (
-                        <button
-                          className={
-                            citation === selectedCitation
-                              ? "citation-chip selected"
-                              : "citation-chip"
-                          }
-                          key={`${citation.source_path ?? citation.filename ?? "citation"}-${index}`}
-                          type="button"
-                          aria-pressed={citation === selectedCitation}
-                          onClick={() => {
-                            setSelectedCitation(citation);
-                            setRevealMessage("");
-                          }}
-                        >
-                          引用 {index + 1} · {citation.filename || "未知文件"} ·{" "}
-                          {citation.display_location || "未提供精确位置"}
-                        </button>
-                      ))
-                    )}
-                  </div>
+                  {turn.response && (
+                    <>
+                      <div className="citation-list" aria-label="引用列表">
+                        {turn.response.citations.length === 0 ? (
+                          <span className="meta-text">没有可展示引用。</span>
+                        ) : (
+                          turn.response.citations.map((citation, index) => (
+                            <button
+                              className={
+                                citation === selectedCitation
+                                  ? "citation-chip selected"
+                                  : "citation-chip"
+                              }
+                              key={`${citation.source_path ?? citation.filename ?? "citation"}-${index}`}
+                              type="button"
+                              aria-pressed={citation === selectedCitation}
+                              onClick={() => {
+                                setSelectedCitation(citation);
+                                setRevealMessage("");
+                              }}
+                            >
+                              引用 {index + 1} · {citation.filename || "未知文件"} ·{" "}
+                              {citation.display_location || "未提供精确位置"}
+                            </button>
+                          ))
+                        )}
+                      </div>
+                      <BadCasePanel turn={turn} response={turn.response} />
+                    </>
+                  )}
                 </div>
               )}
             </article>
           ))}
-
-          {loading && (
-            <div className="message answer-message loading-message">
-              <LoaderCircle className="spin" size={18} aria-hidden="true" />
-              正在检索并生成回答...
-            </div>
-          )}
         </section>
 
         <form className="question-form" onSubmit={handleSubmit}>
@@ -222,6 +350,7 @@ export function App() {
             rows={3}
             value={query}
             onChange={(event) => setQuery(event.target.value)}
+            onKeyDown={handleQueryKeyDown}
             placeholder="客户说每年不能超过80万怎么办？"
           />
           <div className="form-actions">
@@ -345,8 +474,462 @@ export function App() {
               {revealMessage && <p className="meta-text">{revealMessage}</p>}
             </div>
           )}
+          <EvidenceList response={latestResponse} evidences={latestEvidences} />
         </section>
       </aside>
+    </div>
+  );
+}
+
+function ProcessTimeline({
+  active,
+  steps
+}: {
+  active: boolean;
+  steps: AnswerProcessStep[];
+}) {
+  if (steps.length === 0 && !active) {
+    return null;
+  }
+
+  return (
+    <section className="process-panel" aria-label="处理过程">
+      <div className="process-heading">
+        <Activity size={16} aria-hidden="true" />
+        <strong>处理过程</strong>
+        {active && <span>运行中</span>}
+      </div>
+      {steps.length === 0 ? (
+        <p className="meta-text">正在连接问答服务...</p>
+      ) : (
+        <ol className="process-list">
+          {steps.map((step, index) => (
+            <li key={`${step.step}-${index}`}>
+              <CheckCircle2 size={15} aria-hidden="true" />
+              <div>
+                <span>{step.message}</span>
+                {formatProcessPayload(step.payload) && (
+                  <small>{formatProcessPayload(step.payload)}</small>
+                )}
+              </div>
+            </li>
+          ))}
+        </ol>
+      )}
+    </section>
+  );
+}
+
+const feedbackResultOptions: Array<{
+  value: BadCaseFeedbackResult;
+  label: string;
+  tone: "positive" | "negative";
+}> = [
+  { value: "usable", label: "可用", tone: "positive" },
+  { value: "inaccurate", label: "不准确", tone: "negative" },
+  { value: "incomplete", label: "不完整", tone: "negative" },
+  { value: "citation_issue", label: "引用有问题", tone: "negative" },
+  { value: "customer_mismatch", label: "不适合当前客户", tone: "negative" }
+];
+
+const problemTagOptions: Array<{ value: BadCaseProblemTag; label: string }> = [
+  { value: "off_topic", label: "答非所问" },
+  { value: "missing_talk_track", label: "缺关键话术" },
+  { value: "case_mismatch", label: "案例不匹配" },
+  { value: "citation_mismatch", label: "引用/原文对不上" },
+  { value: "not_customer_ready", label: "表达不能直接给客户用" },
+  { value: "compliance_risk", label: "可能有合规风险" },
+  { value: "other", label: "其他" }
+];
+
+function BadCasePanel({
+  turn,
+  response
+}: {
+  turn: ChatTurn;
+  response: AnswerResponse;
+}) {
+  const [selectedResult, setSelectedResult] =
+    useState<BadCaseFeedbackResult | null>(null);
+  const [problemTags, setProblemTags] = useState<BadCaseProblemTag[]>([]);
+  const [problemDetail, setProblemDetail] = useState("");
+  const [expectedAnswer, setExpectedAnswer] = useState("");
+  const [referenceNote, setReferenceNote] = useState("");
+  const [evidenceFeedback, setEvidenceFeedback] = useState<
+    Record<string, EvidenceFeedback>
+  >({});
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  const [submitted, setSubmitted] = useState(false);
+  const evidences = response.retrieval_evidences ?? [];
+  const showForm = selectedResult !== null && selectedResult !== "usable";
+
+  function toggleProblemTag(value: BadCaseProblemTag) {
+    setProblemTags((items) =>
+      items.includes(value)
+        ? items.filter((item) => item !== value)
+        : [...items, value]
+    );
+    setError("");
+    setMessage("");
+  }
+
+  function toggleEvidenceFeedback(
+    index: number,
+    evidence: RetrievalEvidence,
+    judgement: EvidenceFeedbackJudgement
+  ) {
+    const key = evidenceFeedbackKey(index, evidence);
+    setEvidenceFeedback((items) => {
+      if (items[key]?.judgement === judgement) {
+        const { [key]: _removed, ...rest } = items;
+        return rest;
+      }
+      return {
+        ...items,
+        [key]: {
+          chunk_id: evidence.chunk_id,
+          judgement,
+          label: evidenceFeedbackLabel(index, evidence),
+          text_preview: evidenceFeedbackPreview(evidence)
+        }
+      };
+    });
+    setError("");
+    setMessage("");
+  }
+
+  async function saveFeedback(
+    feedbackResult: BadCaseFeedbackResult,
+    draft = {
+      problemTags,
+      problemDetail: problemDetail.trim(),
+      expectedAnswer: expectedAnswer.trim(),
+      referenceNote: referenceNote.trim(),
+      evidenceFeedback: Object.values(evidenceFeedback)
+    }
+  ) {
+    setSaving(true);
+    setError("");
+    setMessage("");
+    try {
+      const issueTypes = Array.from(
+        new Set<BadCaseIssueType>([feedbackResult, ...draft.problemTags])
+      );
+      await submitBadCase({
+        query: turn.query,
+        rewritten_query: response.rewritten_query ?? "",
+        answer: response.answer,
+        top_n: turn.top_n,
+        top_k: turn.top_k,
+        feedback_result: feedbackResult,
+        problem_tags: draft.problemTags,
+        problem_detail: draft.problemDetail,
+        expected_answer: draft.expectedAnswer,
+        reference_note: draft.referenceNote,
+        evidence_feedback: draft.evidenceFeedback,
+        issue_types: issueTypes,
+        expected_knowledge: draft.expectedAnswer,
+        expected_source: draft.referenceNote,
+        note: draft.problemDetail,
+        citations: response.citations,
+        retrieval_evidences: evidences
+      });
+      setMessage(
+        feedbackResult === "usable" ? "已记录可用反馈。" : "反馈已保存。"
+      );
+      setSubmitted(true);
+    } catch (submitError) {
+      setError(
+        submitError instanceof Error ? submitError.message : "无法保存反馈。"
+      );
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleFeedbackResultClick(result: BadCaseFeedbackResult) {
+    setSelectedResult(result);
+    setError("");
+    setMessage("");
+    if (result === "usable") {
+      setProblemTags([]);
+      setProblemDetail("");
+      setExpectedAnswer("");
+      setReferenceNote("");
+      setEvidenceFeedback({});
+      await saveFeedback("usable", {
+        problemTags: [],
+        problemDetail: "",
+        expectedAnswer: "",
+        referenceNote: "",
+        evidenceFeedback: []
+      });
+    }
+  }
+
+  async function handleBadCaseSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!selectedResult || selectedResult === "usable") {
+      return;
+    }
+    await saveFeedback(selectedResult);
+  }
+
+  if (submitted) {
+    return (
+      <section className="bad-case-panel" aria-label="回答反馈">
+        {message && <p className="success-text">{message}</p>}
+      </section>
+    );
+  }
+
+  return (
+    <section className="bad-case-panel" aria-label="回答反馈">
+      <div className="answer-feedback">
+        <span>这个回答可用吗？</span>
+        <div className="answer-feedback-actions">
+          {feedbackResultOptions.map((option) => (
+            <button
+              className={
+                selectedResult === option.value
+                  ? `feedback-option ${option.tone} selected`
+                  : `feedback-option ${option.tone}`
+              }
+              key={option.value}
+              type="button"
+              aria-pressed={selectedResult === option.value}
+              disabled={saving}
+              onClick={() => void handleFeedbackResultClick(option.value)}
+            >
+              {option.value === "usable" ? (
+                <CheckCircle2 size={15} aria-hidden="true" />
+              ) : (
+                <Flag size={15} aria-hidden="true" />
+              )}
+              {option.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {showForm && (
+        <form className="bad-case-form" onSubmit={handleBadCaseSubmit}>
+          <div className="bad-case-form-heading">
+            <strong>反馈这次回答</strong>
+            <span>问题、答案、引用和检索证据会自动随反馈保存。</span>
+          </div>
+
+          <fieldset className="bad-case-fieldset">
+            <legend>问题点</legend>
+            <div className="bad-case-option-list">
+              {problemTagOptions.map((option) => (
+                <label className="bad-case-option" key={option.value}>
+                  <input
+                    type="checkbox"
+                    checked={problemTags.includes(option.value)}
+                    onChange={() => toggleProblemTag(option.value)}
+                  />
+                  <span>{option.label}</span>
+                </label>
+              ))}
+            </div>
+          </fieldset>
+
+          <div className="bad-case-grid">
+            <label className="text-field">
+              <span>哪里不对</span>
+              <textarea
+                rows={3}
+                value={problemDetail}
+                onChange={(event) => {
+                  setProblemDetail(event.target.value);
+                  setMessage("");
+                }}
+                placeholder="例如：回答没有讲清客户为什么要先看保障缺口。"
+              />
+            </label>
+            <label className="text-field">
+              <span>正确回答应包含什么</span>
+              <textarea
+                rows={3}
+                value={expectedAnswer}
+                onChange={(event) => {
+                  setExpectedAnswer(event.target.value);
+                  setMessage("");
+                }}
+                placeholder="例如：应该包含保障缺口分析、预算承接和缴费期调整话术。"
+              />
+            </label>
+          </div>
+
+          <label className="text-field">
+            <span>相关案例/章节/文件名</span>
+            <input
+              type="text"
+              value={referenceNote}
+              onChange={(event) => {
+                setReferenceNote(event.target.value);
+                setMessage("");
+              }}
+              placeholder="例如：案例A 第3节，或客户预算异议处理案例。"
+            />
+          </label>
+
+          {evidences.length > 0 && (
+            <fieldset className="bad-case-fieldset">
+              <legend>本次检索证据</legend>
+              <div className="bad-case-evidence-list">
+                {evidences.map((evidence, index) => {
+                  const key = evidenceFeedbackKey(index, evidence);
+                  const selectedJudgement = evidenceFeedback[key]?.judgement;
+                  return (
+                    <article className="bad-case-evidence-item" key={key}>
+                      <div>
+                        <strong>{evidenceFeedbackLabel(index, evidence)}</strong>
+                        <p>{evidenceFeedbackPreview(evidence)}</p>
+                      </div>
+                      <div className="bad-case-evidence-actions">
+                        <label>
+                          <input
+                            type="checkbox"
+                            aria-label={`证据 ${index + 1} 应该用`}
+                            checked={selectedJudgement === "should_use"}
+                            onChange={() =>
+                              toggleEvidenceFeedback(index, evidence, "should_use")
+                            }
+                          />
+                          <span>应该用</span>
+                        </label>
+                        <label>
+                          <input
+                            type="checkbox"
+                            aria-label={`证据 ${index + 1} 不该用`}
+                            checked={selectedJudgement === "should_not_use"}
+                            onChange={() =>
+                              toggleEvidenceFeedback(
+                                index,
+                                evidence,
+                                "should_not_use"
+                              )
+                            }
+                          />
+                          <span>不该用</span>
+                        </label>
+                      </div>
+                    </article>
+                  );
+                })}
+              </div>
+            </fieldset>
+          )}
+
+          <div className="bad-case-actions">
+            <button className="secondary-button compact-button" type="submit" disabled={saving}>
+              {saving ? (
+                <LoaderCircle className="spin" size={16} aria-hidden="true" />
+              ) : (
+                <Save size={16} aria-hidden="true" />
+              )}
+              保存反馈
+            </button>
+            <span className="bad-case-context">
+              已自动包含 {evidences.length} 条检索证据
+            </span>
+          </div>
+          {error && <p className="form-error">{error}</p>}
+          {message && <p className="success-text">{message}</p>}
+        </form>
+      )}
+      {!showForm && error && <p className="form-error">{error}</p>}
+      {!showForm && message && <p className="success-text">{message}</p>}
+    </section>
+  );
+}
+
+function evidenceFeedbackKey(index: number, evidence: RetrievalEvidence): string {
+  return evidence.chunk_id || `evidence-${index}`;
+}
+
+function evidenceFeedbackLabel(index: number, evidence: RetrievalEvidence): string {
+  return formatEvidenceMeta(evidence.metadata) || `证据 ${index + 1}`;
+}
+
+function evidenceFeedbackPreview(evidence: RetrievalEvidence): string {
+  const text = evidence.text_preview || evidence.text || "没有正文内容。";
+  return text.length > 80 ? `${text.slice(0, 80)}...` : text;
+}
+
+function EvidenceList({
+  response,
+  evidences
+}: {
+  response?: AnswerResponse;
+  evidences: RetrievalEvidence[];
+}) {
+  return (
+    <div className="evidence-section" aria-label="检索证据">
+      <div className="pane-heading compact-heading">
+        <Search size={20} aria-hidden="true" />
+        <h2>检索证据</h2>
+        {response && (
+          <span className="evidence-count">
+            {evidences.length}/{response.evidence_count}
+          </span>
+        )}
+      </div>
+      {!response ? (
+        <p className="empty-source">暂无检索证据。</p>
+      ) : evidences.length === 0 ? (
+        <p className="empty-source">本次回答没有可展示检索证据。</p>
+      ) : (
+        <div
+          className="evidence-scroll"
+          role="region"
+          aria-label="检索证据列表"
+          tabIndex={0}
+        >
+          <div className="evidence-list">
+            {evidences.map((evidence, index) => {
+              const meta = formatEvidenceMeta(evidence.metadata);
+              const score = formatScore(evidence.rerank_score);
+              const text =
+                evidence.text || evidence.text_preview || "没有正文内容。";
+              const citations = evidence.citations ?? [];
+              return (
+                <article
+                  className="evidence-item"
+                  key={`${evidence.chunk_id ?? "evidence"}-${index}`}
+                >
+                  <div className="evidence-header">
+                    <strong>
+                      证据 {index + 1} · {evidence.chunk_type || "未知类型"}
+                    </strong>
+                    {score && <span>重排 {score}</span>}
+                  </div>
+                  {meta && <p className="meta-text">{meta}</p>}
+                  <p className="evidence-text">{text}</p>
+                  {citations.length > 0 && (
+                    <div className="evidence-source-list" aria-label="证据来源">
+                      {citations.map((citation, sourceIndex) => (
+                        <span
+                          className="evidence-source"
+                          key={`${
+                            citation.source_path ?? citation.filename ?? "source"
+                          }-${sourceIndex}`}
+                        >
+                          {formatEvidenceSource(citation)}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </article>
+              );
+            })}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -369,4 +952,62 @@ function validateLimits(topN: number, topK: number): string {
     return "引用数量不能大于召回数量。";
   }
   return "";
+}
+
+function formatEvidenceMeta(metadata?: Record<string, unknown>): string {
+  if (!metadata) {
+    return "";
+  }
+  return [stringValue(metadata.case_name), stringValue(metadata.stage)]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+function formatEvidenceSource(citation: Citation): string {
+  const file = citation.filename || citation.source_path || "未知文件";
+  const location =
+    citation.display_location && citation.display_location !== "未提供精确位置"
+      ? citation.display_location
+      : "";
+  return [file, location].filter(Boolean).join(" · ");
+}
+
+function formatScore(value: unknown): string {
+  return typeof value === "number" && Number.isFinite(value)
+    ? value.toFixed(2)
+    : "";
+}
+
+function stringValue(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function formatProcessPayload(payload?: Record<string, unknown>): string {
+  if (!payload) {
+    return "";
+  }
+  const rewrittenQuery = stringValue(payload.rewritten_query);
+  if (rewrittenQuery) {
+    return `改写为：${rewrittenQuery}`;
+  }
+  const candidateCount = numberValue(payload.candidate_count);
+  if (candidateCount !== "") {
+    return `候选 ${candidateCount} 条`;
+  }
+  const resultCount = numberValue(payload.result_count);
+  if (resultCount !== "") {
+    return `结果 ${resultCount} 条`;
+  }
+  const evidenceCount = numberValue(payload.evidence_count);
+  const citationCount = numberValue(payload.citation_count);
+  if (evidenceCount !== "" || citationCount !== "") {
+    return [`证据 ${evidenceCount || 0} 条`, `引用 ${citationCount || 0} 条`].join(
+      " · "
+    );
+  }
+  return "";
+}
+
+function numberValue(value: unknown): string {
+  return typeof value === "number" && Number.isFinite(value) ? String(value) : "";
 }

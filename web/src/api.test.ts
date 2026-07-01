@@ -1,4 +1,12 @@
-import { answerQuestion, getStatus, revealSource } from "./api";
+import {
+  answerQuestion,
+  answerQuestionStream,
+  getStatus,
+  revealSource,
+  submitBadCase
+} from "./api";
+import type { AnswerStreamEvent } from "./types";
+import type { BadCaseRequest } from "./types";
 
 function jsonResponse(body: unknown, init: ResponseInit = {}): Response {
   return new Response(JSON.stringify(body), {
@@ -8,12 +16,24 @@ function jsonResponse(body: unknown, init: ResponseInit = {}): Response {
   });
 }
 
+function sseResponse(events: Array<{ event: string; data: unknown }>): Response {
+  const text = events
+    .map((event) => `event: ${event.event}\ndata: ${JSON.stringify(event.data)}\n\n`)
+    .join("");
+  return new Response(text, {
+    status: 200,
+    headers: { "Content-Type": "text/event-stream" }
+  });
+}
+
 test("getStatus calls status endpoint", async () => {
   const fetcher = vi.fn(async (input: RequestInfo | URL) => {
     expect(input).toBe("/api/status");
     return jsonResponse({
       ok: true,
       data_dir: "data",
+      milvus_mode: "lite",
+      milvus_target: ".local/milvus/xhbx_rag.db",
       milvus_lite_path: ".local/milvus/xhbx_rag.db",
       milvus_collection: "xhbx_sales_chunks",
       config: { API_KEY: true },
@@ -50,6 +70,70 @@ test("answerQuestion posts typed payload", async () => {
   expect(result.answer).toContain("保障缺口");
 });
 
+test("answerQuestionStream parses ordered server sent events", async () => {
+  const events: AnswerStreamEvent[] = [];
+  const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    expect(input).toBe("/api/answer/stream");
+    expect(init?.method).toBe("POST");
+    expect(init?.body).toBe(
+      JSON.stringify({ query: "保单整理有什么作用？", top_n: 20, top_k: 5 })
+    );
+    return sseResponse([
+      {
+        event: "step",
+        data: {
+          type: "step",
+          step: "search.query_understood",
+          message: "已完成问题理解",
+          payload: { rewritten_query: "保单整理客户价值" }
+        }
+      },
+      { event: "answer_delta", data: { type: "answer_delta", text: "保单整理能" } },
+      { event: "answer_delta", data: { type: "answer_delta", text: "看清保障缺口。" } },
+      {
+        event: "final",
+        data: {
+          type: "final",
+          response: {
+            answer: "保单整理能看清保障缺口。",
+            citations: [],
+            evidence_count: 0,
+            retrieval_evidences: []
+          }
+        }
+      }
+    ]);
+  });
+
+  const result = await answerQuestionStream(
+    { query: "保单整理有什么作用？", top_n: 20, top_k: 5 },
+    {
+      onEvent: (event) => events.push(event)
+    },
+    { fetcher }
+  );
+
+  expect(events.map((event) => event.type)).toEqual([
+    "step",
+    "answer_delta",
+    "answer_delta",
+    "final"
+  ]);
+  expect(result.answer).toBe("保单整理能看清保障缺口。");
+});
+
+test("answerQuestionStream surfaces streamed errors", async () => {
+  const fetcher = vi.fn(async () =>
+    sseResponse([
+      { event: "error", data: { type: "error", detail: "问答服务暂时不可用" } }
+    ])
+  );
+
+  await expect(
+    answerQuestionStream({ query: "x" }, {}, { fetcher })
+  ).rejects.toThrow("问答服务暂时不可用");
+});
+
 test("revealSource returns resolved path", async () => {
   const fetcher = vi.fn(async () =>
     jsonResponse({ ok: true, resolved_path: "/tmp/data/a.txt" })
@@ -58,6 +142,46 @@ test("revealSource returns resolved path", async () => {
   const result = await revealSource({ source_path: "data/a.txt" }, { fetcher });
 
   expect(result.resolved_path).toBe("/tmp/data/a.txt");
+});
+
+test("submitBadCase posts typed payload", async () => {
+  const request: BadCaseRequest = {
+    query: "保单整理有什么作用？",
+    rewritten_query: "保单整理客户价值",
+    answer: "保单整理能帮助客户看清保障缺口。",
+    top_n: 20,
+    top_k: 5,
+    feedback_result: "incomplete",
+    problem_tags: ["missing_talk_track"],
+    problem_detail: "当前回答偏销售动作。",
+    expected_answer: "应该命中客户保障缺口。",
+    reference_note: "案例A 第3节",
+    evidence_feedback: [
+      {
+        chunk_id: "case-a-1",
+        judgement: "should_use",
+        label: "案例A · 需求分析",
+        text_preview: "客户需要先看清保障缺口。"
+      }
+    ],
+    issue_types: ["incomplete", "missing_talk_track"],
+    expected_knowledge: "应该命中客户保障缺口。",
+    expected_source: "案例A 第3节",
+    note: "当前回答偏销售动作。",
+    citations: [],
+    retrieval_evidences: []
+  };
+  const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    expect(input).toBe("/api/bad-cases");
+    expect(init?.method).toBe("POST");
+    expect(init?.body).toBe(JSON.stringify(request));
+    expect(new Headers(init?.headers).get("Content-Type")).toBe("application/json");
+    return jsonResponse({ ok: true, bad_case_id: "bad-case-1" });
+  });
+
+  const result = await submitBadCase(request, { fetcher });
+
+  expect(result.bad_case_id).toBe("bad-case-1");
 });
 
 test("api errors expose safe detail", async () => {

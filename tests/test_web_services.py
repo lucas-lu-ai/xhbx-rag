@@ -22,7 +22,10 @@ def _fake_config() -> SimpleNamespace:
         rerank_base_url="https://api.siliconflow.com/v1",
         rerank_api_key="rerank-key",
         rerank_model_name="rerank-model",
+        milvus_mode="lite",
         milvus_lite_path=Path(".local/milvus/xhbx_rag.db"),
+        milvus_uri="http://localhost:19530",
+        milvus_token="",
         milvus_collection="xhbx_sales_chunks",
     )
 
@@ -68,11 +71,11 @@ def _install_rag_stubs(monkeypatch, citations=None):
         "EmbeddingClient",
         component_factory("embedding_client", "embedding"),
     )
-    monkeypatch.setattr(
-        services,
-        "MilvusLiteStore",
-        component_factory("store", "store"),
-    )
+    def store_factory(config):
+        constructor_calls["store"] = config
+        return "store"
+
+    monkeypatch.setattr(services, "create_milvus_store", store_factory)
     monkeypatch.setattr(
         services,
         "RerankClient",
@@ -109,13 +112,13 @@ def _install_closeable_rag_stubs(monkeypatch, error=None) -> list[str]:
 
         return factory
 
-    def store_factory(**kwargs):
+    def store_factory(config):
         return _FakeStoreComponent("store", close_calls)
 
     monkeypatch.setattr(services.RetrievalConfig, "from_env", _fake_config)
     monkeypatch.setattr(services, "QueryUnderstandingAgent", http_factory("query_agent"))
     monkeypatch.setattr(services, "EmbeddingClient", http_factory("embedding_client"))
-    monkeypatch.setattr(services, "MilvusLiteStore", store_factory)
+    monkeypatch.setattr(services, "create_milvus_store", store_factory)
     monkeypatch.setattr(services, "RerankClient", http_factory("reranker"))
     monkeypatch.setattr(services, "AnswerAgent", http_factory("answer_agent"))
 
@@ -136,42 +139,58 @@ def _install_closeable_rag_stubs(monkeypatch, error=None) -> list[str]:
     return close_calls
 
 
-def test_get_status_reports_config_success(monkeypatch, tmp_path: Path) -> None:
+def test_get_status_reports_config_success(monkeypatch) -> None:
     monkeypatch.setattr(services.RetrievalConfig, "from_env", _fake_config)
 
-    status = services.get_status(project_root=tmp_path)
+    status = services.get_status()
 
     assert status["ok"] is True
-    assert status["data_dir"] == str(tmp_path / "data")
+    assert status["data_dir"] == "data"
+    assert status["milvus_mode"] == "lite"
+    assert status["milvus_target"] == ".local/milvus/xhbx_rag.db"
     assert status["milvus_collection"] == "xhbx_sales_chunks"
     assert status["config"]["API_KEY"] is True
     assert status["config"]["EMBEDDING_API_KEY"] is True
     assert status["errors"] == []
 
 
-def test_get_status_reports_config_error(monkeypatch, tmp_path: Path) -> None:
+def test_get_status_reports_docker_milvus_target(monkeypatch) -> None:
+    def docker_config():
+        config = _fake_config()
+        config.milvus_mode = "docker"
+        config.milvus_uri = "http://127.0.0.1:19530"
+        config.milvus_token = "root:Milvus"
+        return config
+
+    monkeypatch.setattr(services.RetrievalConfig, "from_env", docker_config)
+
+    status = services.get_status()
+
+    assert status["milvus_mode"] == "docker"
+    assert status["milvus_target"] == "http://127.0.0.1:19530"
+    assert "root:Milvus" not in str(status)
+
+
+def test_get_status_reports_config_error(monkeypatch) -> None:
     def fail_from_env():
         raise ConfigError("缺少必要环境变量: API_KEY")
 
     monkeypatch.setattr(services.RetrievalConfig, "from_env", fail_from_env)
 
-    status = services.get_status(project_root=tmp_path)
+    status = services.get_status()
 
     assert status["ok"] is False
     assert status["config"]["API_KEY"] is False
     assert status["errors"] == ["缺少必要环境变量: API_KEY"]
 
 
-def test_get_status_sanitizes_non_config_value_error(
-    monkeypatch,
-    tmp_path: Path,
-) -> None:
+def test_get_status_sanitizes_non_config_value_error(monkeypatch) -> None:
     def fail_from_env():
         raise ValueError("invalid literal for int() with base 10: 'sk-secret-value'")
 
     monkeypatch.setattr(services.RetrievalConfig, "from_env", fail_from_env)
 
-    status = services.get_status(project_root=tmp_path)
+    status = services.get_status()
 
     assert status["ok"] is False
     assert status["errors"] == [SAFE_CONFIG_ERROR]
@@ -179,16 +198,13 @@ def test_get_status_sanitizes_non_config_value_error(
     assert status["config"]["API_KEY"] is True
 
 
-def test_get_status_marks_multiple_missing_config_keys(
-    monkeypatch,
-    tmp_path: Path,
-) -> None:
+def test_get_status_marks_multiple_missing_config_keys(monkeypatch) -> None:
     def fail_from_env():
         raise ConfigError("缺少必要环境变量: API_KEY, RERANK_API_KEY")
 
     monkeypatch.setattr(services.RetrievalConfig, "from_env", fail_from_env)
 
-    status = services.get_status(project_root=tmp_path)
+    status = services.get_status()
 
     assert status["ok"] is False
     assert status["config"]["API_KEY"] is False
@@ -235,10 +251,9 @@ def test_answer_question_uses_existing_rag_components(
         "api_key": "embedding-key",
         "model": "embedding-model",
     }
-    assert constructors["store"] == {
-        "db_path": Path(".local/milvus/xhbx_rag.db"),
-        "collection_name": "xhbx_sales_chunks",
-    }
+    assert constructors["store"].milvus_mode == "lite"
+    assert constructors["store"].milvus_lite_path == Path(".local/milvus/xhbx_rag.db")
+    assert constructors["store"].milvus_collection == "xhbx_sales_chunks"
     assert constructors["reranker"] == {
         "base_url": "https://api.siliconflow.com/v1",
         "api_key": "rerank-key",
@@ -254,13 +269,293 @@ def test_answer_question_uses_existing_rag_components(
     assert calls["embedding_client"] == "embedding"
     assert calls["store"] == "store"
     assert calls["reranker"] == "reranker"
-    assert calls["answer_agent"] == "answer-agent"
+    assert calls["answer_agent"].agent == "answer-agent"
     assert calls["top_n"] == 20
     assert calls["top_k"] == 5
     assert result["answer"] == "先承接预算，再讨论缴费期和保障缺口。"
     assert result["citations"][0]["display_location"] == "L2"
     assert result["citations"][0]["display_excerpt"] == "客户说每年保费预算不能超过80万"
     assert result["citations"][0]["can_reveal"] is True
+
+
+def test_answer_question_returns_retrieval_evidences_from_answer_context(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "data" / "案例A" / "第2节.track-0.txt"
+    source.parent.mkdir(parents=True)
+    source.write_text("客户担心预算，可以先承接预算，再对齐保障缺口。", encoding="utf-8")
+
+    monkeypatch.setattr(services.RetrievalConfig, "from_env", _fake_config)
+    monkeypatch.setattr(services, "QueryUnderstandingAgent", lambda **kwargs: "query")
+    monkeypatch.setattr(services, "EmbeddingClient", lambda **kwargs: "embedding")
+    monkeypatch.setattr(services, "create_milvus_store", lambda config: "store")
+    monkeypatch.setattr(services, "RerankClient", lambda **kwargs: "reranker")
+
+    class FakeAnswerAgent:
+        def generate(self, search_result: dict):
+            return object()
+
+    monkeypatch.setattr(services, "AnswerAgent", lambda **kwargs: FakeAnswerAgent())
+
+    def fake_answer_query(**kwargs):
+        search_result = {
+            "results": [
+                {
+                    "chunk_id": "case-a-2",
+                    "chunk_type": "objection_handling",
+                    "text": "客户担心预算，可以先承接预算，再对齐保障缺口。",
+                    "score": 0.82,
+                    "rerank_score": 0.91,
+                    "metadata": {"case_name": "案例A", "stage": "需求分析"},
+                    "citations": [
+                        {
+                            "filename": "第2节.track-0.txt",
+                            "source_type": "txt",
+                            "source_path": "data/案例A/第2节.track-0.txt",
+                            "locator": {"line_start": 1, "line_end": 1},
+                            "locator_confidence": "validated_span",
+                            "source_excerpt": (
+                                "客户担心预算，可以先承接预算，再对齐保障缺口。"
+                            ),
+                        }
+                    ],
+                }
+            ]
+        }
+        kwargs["answer_agent"].generate(search_result)
+        return {
+            "original_query": kwargs["query"],
+            "rewritten_query": "客户预算异议处理",
+            "intent": "objection_handling",
+            "filters": {},
+            "answer": "先承接预算，再对齐保障缺口。",
+            "citations": [],
+            "evidence_count": 1,
+        }
+
+    monkeypatch.setattr(services, "answer_query", fake_answer_query)
+
+    result = services.answer_question(
+        query="客户说预算有限怎么办？",
+        top_n=20,
+        top_k=5,
+        project_root=tmp_path,
+    )
+
+    assert result["retrieval_evidences"] == [
+        {
+            "chunk_id": "case-a-2",
+            "chunk_type": "objection_handling",
+            "text": "客户担心预算，可以先承接预算，再对齐保障缺口。",
+            "score": 0.82,
+            "rerank_score": 0.91,
+            "metadata": {"case_name": "案例A", "stage": "需求分析"},
+            "citations": [
+                {
+                    "filename": "第2节.track-0.txt",
+                    "source_type": "txt",
+                    "source_path": "data/案例A/第2节.track-0.txt",
+                    "locator": {"line_start": 1, "line_end": 1},
+                    "locator_confidence": "validated_span",
+                    "source_excerpt": "客户担心预算，可以先承接预算，再对齐保障缺口。",
+                    "display_location": "L1",
+                    "display_excerpt": "客户担心预算，可以先承接预算，再对齐保障缺口。",
+                    "can_reveal": True,
+                }
+            ],
+        }
+    ]
+
+
+def test_answer_question_passes_trace_to_rag_chain(monkeypatch, tmp_path: Path) -> None:
+    constructors, calls = _install_rag_stubs(monkeypatch)
+    trace = object()
+
+    result = services.answer_question(
+        query="客户说每年不能超过80万怎么办？",
+        top_n=20,
+        top_k=5,
+        project_root=tmp_path,
+        trace=trace,
+    )
+
+    assert result["answer"] == "先承接预算，再讨论缴费期和保障缺口。"
+    assert constructors["store"].milvus_mode == "lite"
+    assert calls["trace"] is trace
+
+
+def test_answer_question_stream_events_emit_steps_deltas_and_final(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    def fake_answer_question(*, query, top_n, top_k, project_root=None, trace=None):
+        trace.emit("search.query_understood", {"rewritten_query": "预算不超过80万"})
+        trace.emit("search.reranked", {"result_count": 2})
+        return {
+            "original_query": query,
+            "rewritten_query": "预算不超过80万",
+            "intent": "objection_handling",
+            "filters": {},
+            "answer": "先承接预算，再讨论缴费期和保障缺口。",
+            "citations": [],
+            "evidence_count": 2,
+            "retrieval_evidences": [],
+        }
+
+    monkeypatch.setattr(services, "answer_question", fake_answer_question)
+
+    events = list(
+        services.answer_question_stream_events(
+            query="客户说每年不能超过80万怎么办？",
+            top_n=20,
+            top_k=5,
+            project_root=tmp_path,
+        )
+    )
+
+    assert events[0]["type"] == "step"
+    assert events[0]["step"] == "search.query_understood"
+    assert events[0]["message"] == "已完成问题理解"
+    assert events[0]["payload"] == {"rewritten_query": "预算不超过80万"}
+    assert events[1]["step"] == "search.reranked"
+    assert "".join(
+        event["text"] for event in events if event["type"] == "answer_delta"
+    ) == "先承接预算，再讨论缴费期和保障缺口。"
+    assert events[-1]["type"] == "final"
+    assert events[-1]["response"]["evidence_count"] == 2
+
+
+def test_answer_question_stream_events_sends_trace_to_studio_when_enabled(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    class FakeStudioTrace:
+        def __init__(self) -> None:
+            self.events = []
+            self.closed = False
+
+        def emit(self, step, payload):
+            self.events.append((step, dict(payload)))
+
+        def close(self):
+            self.closed = True
+
+    created = {}
+
+    def fake_create_studio_trace_sink(*, endpoint, root_name):
+        trace = FakeStudioTrace()
+        created["endpoint"] = endpoint
+        created["root_name"] = root_name
+        created["trace"] = trace
+        return trace
+
+    def fake_answer_question(*, query, top_n, top_k, project_root=None, trace=None):
+        trace.emit("search.query_understood", {"rewritten_query": "预算不超过80万"})
+        trace.emit("answer.generated", {"citation_count": 0})
+        return {
+            "original_query": query,
+            "rewritten_query": "预算不超过80万",
+            "intent": "objection_handling",
+            "filters": {},
+            "answer": "先承接预算。",
+            "citations": [],
+            "evidence_count": 0,
+            "retrieval_evidences": [],
+        }
+
+    monkeypatch.setenv("WEB_STUDIO_TRACE", "true")
+    monkeypatch.setenv("WEB_STUDIO_ENDPOINT", "studio.example:4317")
+    monkeypatch.setattr(
+        services,
+        "create_studio_trace_sink",
+        fake_create_studio_trace_sink,
+        raising=False,
+    )
+    monkeypatch.setattr(services, "answer_question", fake_answer_question)
+
+    events = list(
+        services.answer_question_stream_events(
+            query="客户说每年不能超过80万怎么办？",
+            top_n=20,
+            top_k=5,
+            project_root=tmp_path,
+        )
+    )
+
+    assert created["endpoint"] == "studio.example:4317"
+    assert created["root_name"] == "xhbx-rag.web.answer"
+    assert created["trace"].events == [
+        ("search.query_understood", {"rewritten_query": "预算不超过80万"}),
+        ("answer.generated", {"citation_count": 0}),
+    ]
+    assert created["trace"].closed is True
+    assert [event["step"] for event in events if event["type"] == "step"] == [
+        "search.query_understood",
+        "answer.generated",
+    ]
+
+
+def test_answer_question_stream_events_closes_studio_trace_on_exception(
+    monkeypatch,
+) -> None:
+    class FakeStudioTrace:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def emit(self, step, payload):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    created = {}
+
+    def fake_create_studio_trace_sink(*, endpoint, root_name):
+        trace = FakeStudioTrace()
+        created["trace"] = trace
+        return trace
+
+    def fail_answer_question(*, query, top_n, top_k, project_root=None, trace=None):
+        raise RuntimeError("secret-token leaked")
+
+    monkeypatch.setenv("WEB_STUDIO_TRACE", "1")
+    monkeypatch.setattr(
+        services,
+        "create_studio_trace_sink",
+        fake_create_studio_trace_sink,
+        raising=False,
+    )
+    monkeypatch.setattr(services, "answer_question", fail_answer_question)
+
+    events = list(
+        services.answer_question_stream_events(
+            query="客户说每年不能超过80万怎么办？",
+            top_n=20,
+            top_k=5,
+        )
+    )
+
+    assert events[0]["type"] == "_exception"
+    assert created["trace"].closed is True
+
+
+def test_answer_question_stream_events_emit_internal_exception(monkeypatch) -> None:
+    def fail_answer_question(*, query, top_n, top_k, project_root=None, trace=None):
+        raise RuntimeError("secret-token leaked")
+
+    monkeypatch.setattr(services, "answer_question", fail_answer_question)
+
+    events = list(
+        services.answer_question_stream_events(
+            query="客户说每年不能超过80万怎么办？",
+            top_n=20,
+            top_k=5,
+        )
+    )
+
+    assert events[0]["type"] == "_exception"
+    assert isinstance(events[0]["exception"], RuntimeError)
 
 
 def test_answer_question_strips_query_before_rag_call(monkeypatch) -> None:
@@ -412,13 +707,13 @@ def test_answer_question_sanitizes_local_index_open_failure(monkeypatch) -> None
         lambda **kwargs: _FakeHttpComponent("embedding_client", []),
     )
 
-    def fail_store(**kwargs):
+    def fail_store(config):
         raise RuntimeError(
             "Open local milvus failed for "
             "/Users/milan/xhbx-rag/.local/milvus/xhbx_rag.db secret-token"
         )
 
-    monkeypatch.setattr(services, "MilvusLiteStore", fail_store)
+    monkeypatch.setattr(services, "create_milvus_store", fail_store)
 
     with pytest.raises(ValueError) as exc_info:
         services.answer_question(

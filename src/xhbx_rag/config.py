@@ -22,7 +22,10 @@ class RetrievalConfig:
     rerank_base_url: str
     rerank_model_name: str
     rerank_api_key: str
+    milvus_mode: str
     milvus_lite_path: Path
+    milvus_uri: str
+    milvus_token: str
     milvus_collection: str
     milvus_vector_dim: int | None = None
 
@@ -32,10 +35,7 @@ class RetrievalConfig:
         env: Mapping[str, str] | None = None,
         env_file: Path | None = Path(".env"),
     ) -> "RetrievalConfig":
-        values: dict[str, str] = {}
-        if env_file is not None and env_file.exists():
-            values.update(_read_env_file(env_file))
-        values.update(os.environ if env is None else env)
+        values = load_env_values(env=env, env_file=env_file)
 
         required = [
             "API_KEY",
@@ -53,6 +53,9 @@ class RetrievalConfig:
             raise ConfigError(f"缺少必要环境变量: {', '.join(missing)}")
 
         vector_dim = values.get("MILVUS_VECTOR_DIM", "").strip()
+        milvus_mode = values.get("MILVUS_MODE", "lite").strip().lower() or "lite"
+        if milvus_mode not in {"lite", "docker"}:
+            raise ConfigError("MILVUS_MODE 仅支持 lite 或 docker")
         return cls(
             api_key=values["API_KEY"].strip(),
             base_url=values["BASE_URL"].strip(),
@@ -64,9 +67,13 @@ class RetrievalConfig:
             rerank_base_url=values["RERANK_BASE_URL"].strip(),
             rerank_model_name=values["RERANK_MODEL_NAME"].strip(),
             rerank_api_key=values["RERANK_API_KEY"].strip(),
+            milvus_mode=milvus_mode,
             milvus_lite_path=Path(
                 values.get("MILVUS_LITE_PATH", ".local/milvus/xhbx_rag.db").strip()
             ),
+            milvus_uri=values.get("MILVUS_URI", "http://localhost:19530").strip()
+            or "http://localhost:19530",
+            milvus_token=values.get("MILVUS_TOKEN", "").strip(),
             milvus_collection=values.get(
                 "MILVUS_COLLECTION",
                 "xhbx_sales_chunks",
@@ -85,7 +92,9 @@ class RetrievalConfig:
             f"embedding_model_name={self.embedding_model_name}, "
             f"rerank_base_url={self.rerank_base_url}, "
             f"rerank_model_name={self.rerank_model_name}, "
+            f"milvus_mode={self.milvus_mode}, "
             f"milvus_lite_path={self.milvus_lite_path}, "
+            f"milvus_uri={self.milvus_uri}, "
             f"milvus_collection={self.milvus_collection}, "
             f"milvus_vector_dim={self.milvus_vector_dim})"
         )
@@ -99,6 +108,18 @@ def _read_env_file(path: Path) -> dict[str, str]:
             continue
         key, value = line.split("=", 1)
         values[key.strip()] = _strip_quotes(value.strip())
+    return values
+
+
+def load_env_values(
+    *,
+    env: Mapping[str, str] | None = None,
+    env_file: Path | None = Path(".env"),
+) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if env_file is not None and env_file.exists():
+        values.update(_read_env_file(env_file))
+    values.update(os.environ if env is None else env)
     return values
 
 

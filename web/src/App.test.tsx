@@ -6,6 +6,8 @@ import { App } from "./App";
 const statusPayload = {
   ok: true,
   data_dir: "data",
+  milvus_mode: "lite",
+  milvus_target: ".local/milvus/xhbx_rag.db",
   milvus_lite_path: ".local/milvus/xhbx_rag.db",
   milvus_collection: "xhbx_sales_chunks",
   config: { API_KEY: true },
@@ -26,7 +28,26 @@ const answerPayload = {
     }
   ],
   evidence_count: 1,
-  rewritten_query: "客户预算上限80万时如何回应"
+  rewritten_query: "客户预算上限80万时如何回应",
+  retrieval_evidences: [
+    {
+      chunk_id: "case-a-2",
+      chunk_type: "objection_handling",
+      text: "客户担心预算，可以先承接预算，再对齐保障缺口。",
+      rerank_score: 0.91,
+      metadata: { case_name: "案例A", stage: "需求分析" },
+      citations: [
+        {
+          filename: "第2节.track-0.txt",
+          source_type: "txt",
+          source_path: "data/案例A/第2节.track-0.txt",
+          display_location: "L1",
+          display_excerpt: "客户担心预算，可以先承接预算，再对齐保障缺口。",
+          can_reveal: true
+        }
+      ]
+    }
+  ]
 };
 
 function jsonResponse(body: unknown, init: ResponseInit = {}): Response {
@@ -35,6 +56,47 @@ function jsonResponse(body: unknown, init: ResponseInit = {}): Response {
     headers: { "Content-Type": "application/json" },
     ...init
   });
+}
+
+function sseResponse(events: Array<{ event: string; data: unknown }>): Response {
+  return new Response(
+    events
+      .map((event) => `event: ${event.event}\ndata: ${JSON.stringify(event.data)}\n\n`)
+      .join(""),
+    {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" }
+    }
+  );
+}
+
+function answerStreamResponse() {
+  return sseResponse([
+    {
+      event: "step",
+      data: {
+        type: "step",
+        step: "search.query_understood",
+        message: "已完成问题理解",
+        payload: { rewritten_query: answerPayload.rewritten_query }
+      }
+    },
+    {
+      event: "step",
+      data: {
+        type: "step",
+        step: "search.reranked",
+        message: "已完成证据重排",
+        payload: { result_count: answerPayload.evidence_count }
+      }
+    },
+    { event: "answer_delta", data: { type: "answer_delta", text: "先承接预算，" } },
+    {
+      event: "answer_delta",
+      data: { type: "answer_delta", text: "再讨论缴费期和保障缺口。" }
+    },
+    { event: "final", data: { type: "final", response: answerPayload } }
+  ]);
 }
 
 function installFetchStub() {
@@ -49,11 +111,17 @@ function installFetchStub() {
     if (url.endsWith("/api/status")) {
       return jsonResponse(statusPayload);
     }
+    if (url.endsWith("/api/answer/stream")) {
+      return answerStreamResponse();
+    }
     if (url.endsWith("/api/answer")) {
       return jsonResponse(answerPayload);
     }
     if (url.endsWith("/api/source/reveal")) {
       return jsonResponse({ ok: true, resolved_path: "/tmp/data/a.txt" });
+    }
+    if (url.endsWith("/api/bad-cases")) {
+      return jsonResponse({ ok: true, bad_case_id: "bad-case-1" });
     }
     return jsonResponse({ detail: "not found" }, { status: 404 });
   });
@@ -88,10 +156,79 @@ test("loads status and submits a question", async () => {
     await screen.findByText("先承接预算，再讨论缴费期和保障缺口。")
   ).toBeInTheDocument();
   expect(screen.getByRole("button", { name: /引用 1/ })).toBeInTheDocument();
+  expect(screen.getByText("处理过程")).toBeInTheDocument();
+  expect(screen.getByText("已完成问题理解")).toBeInTheDocument();
+  expect(screen.getByText("已完成证据重排")).toBeInTheDocument();
   expect(requests).toContainEqual({
-    url: "/api/answer",
-    body: { query: "客户说每年不能超过80万怎么办？", top_n: 20, top_k: 5 }
+    url: "/api/answer/stream",
+    body: { query: "客户说每年不能超过80万怎么办？", top_n: 20, top_k: 10 }
   });
+});
+
+test("submits the question when pressing Enter in the input", async () => {
+  const user = userEvent.setup();
+  const { requests } = installFetchStub();
+  render(<App />);
+
+  const input = screen.getByLabelText("输入问题");
+  await user.type(input, "客户说每年不能超过80万怎么办？");
+  await user.keyboard("{Enter}");
+
+  expect(
+    await screen.findByText("先承接预算，再讨论缴费期和保障缺口。")
+  ).toBeInTheDocument();
+  expect(requests).toContainEqual({
+    url: "/api/answer/stream",
+    body: { query: "客户说每年不能超过80万怎么办？", top_n: 20, top_k: 10 }
+  });
+});
+
+test("keeps a newline when pressing Shift Enter in the input", async () => {
+  const user = userEvent.setup();
+  const { fetcher } = installFetchStub();
+  render(<App />);
+
+  const input = screen.getByLabelText("输入问题");
+  await user.type(input, "第一行");
+  await user.keyboard("{Shift>}{Enter}{/Shift}");
+  await user.type(input, "第二行");
+
+  expect(input).toHaveValue("第一行\n第二行");
+  await waitFor(() => {
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+});
+
+test("streams answer text before final metadata arrives", async () => {
+  const user = userEvent.setup();
+  let answerResolve!: (response: Response) => void;
+  const answerPromise = new Promise<Response>((resolve) => {
+    answerResolve = resolve;
+  });
+  const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.endsWith("/api/status")) {
+      return jsonResponse(statusPayload);
+    }
+    if (url.endsWith("/api/answer/stream")) {
+      return answerPromise;
+    }
+    return jsonResponse({ detail: "not found" }, { status: 404 });
+  });
+  vi.stubGlobal("fetch", fetcher);
+  render(<App />);
+
+  await user.type(screen.getByLabelText("输入问题"), "客户说每年不能超过80万怎么办？");
+  await user.click(screen.getByRole("button", { name: "发送" }));
+
+  expect(screen.getByText("正在生成回答...")).toBeInTheDocument();
+
+  answerResolve(answerStreamResponse());
+
+  expect(
+    await screen.findByText("先承接预算，再讨论缴费期和保障缺口。")
+  ).toBeInTheDocument();
+  expect(screen.getByText("处理过程")).toBeInTheDocument();
 });
 
 test("selects a citation and reveals the source file", async () => {
@@ -112,6 +249,118 @@ test("selects a citation and reveals the source file", async () => {
   expect(requests).toContainEqual({
     url: "/api/source/reveal",
     body: { source_path: "data/案例A/第1节.track-0.txt" }
+  });
+});
+
+test("shows retrieval evidence used by the answer model", async () => {
+  const user = userEvent.setup();
+  installFetchStub();
+  render(<App />);
+
+  await user.type(screen.getByLabelText("输入问题"), "客户说每年不能超过80万怎么办？");
+  await user.click(screen.getByRole("button", { name: "发送" }));
+
+  expect(await screen.findByText("检索证据")).toBeInTheDocument();
+  expect(
+    screen.getByRole("region", { name: "检索证据列表" })
+  ).toBeInTheDocument();
+  expect(screen.getByText("证据 1 · objection_handling")).toBeInTheDocument();
+  expect(
+    screen.getByText("客户担心预算，可以先承接预算，再对齐保障缺口。")
+  ).toBeInTheDocument();
+  expect(screen.getByText("案例A · 需求分析")).toBeInTheDocument();
+  expect(screen.getByText("第2节.track-0.txt · L1")).toBeInTheDocument();
+});
+
+test("submits a bad case with retrieval context", async () => {
+  const user = userEvent.setup();
+  const { requests } = installFetchStub();
+  render(<App />);
+
+  await user.type(screen.getByLabelText("输入问题"), "客户说每年不能超过80万怎么办？");
+  await user.click(screen.getByRole("button", { name: "发送" }));
+  await user.click(await screen.findByRole("button", { name: "不完整" }));
+  await user.click(screen.getByLabelText("缺关键话术"));
+  await user.type(
+    screen.getByLabelText("哪里不对"),
+    "当前回答没有讲清楚保障缺口。"
+  );
+  await user.type(
+    screen.getByLabelText("正确回答应包含什么"),
+    "应该命中保障缺口分析，而不是只命中销售动作。"
+  );
+  await user.type(screen.getByLabelText("相关案例/章节/文件名"), "案例A 第3节");
+  await user.click(screen.getByLabelText("证据 1 应该用"));
+  await user.click(screen.getByRole("button", { name: "保存反馈" }));
+
+  expect(await screen.findByText("反馈已保存。")).toBeInTheDocument();
+  expect(screen.queryByText("这个回答可用吗？")).not.toBeInTheDocument();
+  expect(screen.queryByText("反馈这次回答")).not.toBeInTheDocument();
+  expect(screen.queryByLabelText("哪里不对")).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "保存反馈" })).not.toBeInTheDocument();
+  expect(requests).toContainEqual({
+    url: "/api/bad-cases",
+    body: {
+      query: "客户说每年不能超过80万怎么办？",
+      rewritten_query: "客户预算上限80万时如何回应",
+      answer: "先承接预算，再讨论缴费期和保障缺口。",
+      top_n: 20,
+      top_k: 10,
+      feedback_result: "incomplete",
+      problem_tags: ["missing_talk_track"],
+      problem_detail: "当前回答没有讲清楚保障缺口。",
+      expected_answer: "应该命中保障缺口分析，而不是只命中销售动作。",
+      reference_note: "案例A 第3节",
+      evidence_feedback: [
+        {
+          chunk_id: "case-a-2",
+          judgement: "should_use",
+          label: "案例A · 需求分析",
+          text_preview: "客户担心预算，可以先承接预算，再对齐保障缺口。"
+        }
+      ],
+      issue_types: ["incomplete", "missing_talk_track"],
+      expected_knowledge: "应该命中保障缺口分析，而不是只命中销售动作。",
+      expected_source: "案例A 第3节",
+      note: "当前回答没有讲清楚保障缺口。",
+      citations: answerPayload.citations,
+      retrieval_evidences: answerPayload.retrieval_evidences
+    }
+  });
+});
+
+test("records usable answer feedback without opening the bad case form", async () => {
+  const user = userEvent.setup();
+  const { requests } = installFetchStub();
+  render(<App />);
+
+  await user.type(screen.getByLabelText("输入问题"), "客户说每年不能超过80万怎么办？");
+  await user.click(screen.getByRole("button", { name: "发送" }));
+  await user.click(await screen.findByRole("button", { name: "可用" }));
+
+  expect(await screen.findByText("已记录可用反馈。")).toBeInTheDocument();
+  expect(screen.queryByText("反馈这次回答")).not.toBeInTheDocument();
+  expect(requests).toContainEqual({
+    url: "/api/bad-cases",
+    body: {
+      query: "客户说每年不能超过80万怎么办？",
+      rewritten_query: "客户预算上限80万时如何回应",
+      answer: "先承接预算，再讨论缴费期和保障缺口。",
+      top_n: 20,
+      top_k: 10,
+      feedback_result: "usable",
+      problem_tags: [],
+      problem_detail: "",
+      expected_answer: "",
+      reference_note: "",
+      evidence_feedback: [],
+      issue_types: ["usable"],
+      expected_knowledge: "",
+      expected_source: "",
+      note: "",
+      citations: answerPayload.citations,
+      retrieval_evidences: answerPayload.retrieval_evidences
+    }
   });
 });
 
@@ -152,7 +401,7 @@ test("disables clear while an answer is loading", async () => {
     if (url.endsWith("/api/status")) {
       return jsonResponse(statusPayload);
     }
-    if (url.endsWith("/api/answer")) {
+    if (url.endsWith("/api/answer/stream")) {
       return answer.promise;
     }
     return jsonResponse({ detail: "not found" }, { status: 404 });
@@ -165,7 +414,7 @@ test("disables clear while an answer is loading", async () => {
 
   expect(screen.getByRole("button", { name: "清空" })).toBeDisabled();
 
-  answer.resolve(jsonResponse(answerPayload));
+  answer.resolve(answerStreamResponse());
   expect(await screen.findByText("先承接预算，再讨论缴费期和保障缺口。")).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "清空" })).toBeEnabled();
 });

@@ -15,9 +15,26 @@ def _fake_config() -> SimpleNamespace:
         rerank_base_url="https://api.siliconflow.com/v1",
         rerank_api_key="rerank-key",
         rerank_model_name="rerank-model",
+        milvus_mode="lite",
         milvus_lite_path="local.db",
+        milvus_uri="http://localhost:19530",
+        milvus_token="",
         milvus_collection="chunks",
     )
+
+
+def test_cli_milvus_store_uses_shared_factory(monkeypatch) -> None:
+    config = _fake_config()
+    calls = {}
+
+    def fake_create_milvus_store(received_config):
+        calls["config"] = received_config
+        return "store"
+
+    monkeypatch.setattr(cli, "create_milvus_store", fake_create_milvus_store)
+
+    assert cli._milvus_store(config) == "store"
+    assert calls["config"] is config
 
 
 def test_cli_index_uses_retrieval_components(monkeypatch, tmp_path) -> None:
@@ -27,7 +44,7 @@ def test_cli_index_uses_retrieval_components(monkeypatch, tmp_path) -> None:
 
     monkeypatch.setattr(cli.RetrievalConfig, "from_env", _fake_config)
     monkeypatch.setattr(cli, "EmbeddingClient", lambda **kwargs: "embedding")
-    monkeypatch.setattr(cli, "MilvusLiteStore", lambda **kwargs: "store")
+    monkeypatch.setattr(cli, "create_milvus_store", lambda config: "store")
 
     def fake_index_chunks(chunks_path, embedding_client, store, trace=None, mode="incremental"):
         calls["chunks_path"] = chunks_path
@@ -58,7 +75,7 @@ def test_cli_index_passes_rebuild_mode(monkeypatch, tmp_path) -> None:
 
     monkeypatch.setattr(cli.RetrievalConfig, "from_env", _fake_config)
     monkeypatch.setattr(cli, "EmbeddingClient", lambda **kwargs: "embedding")
-    monkeypatch.setattr(cli, "MilvusLiteStore", lambda **kwargs: "store")
+    monkeypatch.setattr(cli, "create_milvus_store", lambda config: "store")
 
     def fake_index_chunks(chunks_path, embedding_client, store, trace=None, mode="incremental"):
         calls["chunks_path"] = chunks_path
@@ -86,7 +103,7 @@ def test_cli_search_prints_json_result(monkeypatch, capsys) -> None:
     monkeypatch.setattr(cli.RetrievalConfig, "from_env", _fake_config)
     monkeypatch.setattr(cli, "QueryUnderstandingAgent", lambda **kwargs: "agent")
     monkeypatch.setattr(cli, "EmbeddingClient", lambda **kwargs: "embedding")
-    monkeypatch.setattr(cli, "MilvusLiteStore", lambda **kwargs: "store")
+    monkeypatch.setattr(cli, "create_milvus_store", lambda config: "store")
     monkeypatch.setattr(cli, "RerankClient", lambda **kwargs: "reranker")
     monkeypatch.setattr(
         cli,
@@ -122,7 +139,7 @@ def test_cli_answer_prints_json_result(monkeypatch, capsys) -> None:
     monkeypatch.setattr(cli.RetrievalConfig, "from_env", _fake_config)
     monkeypatch.setattr(cli, "QueryUnderstandingAgent", lambda **kwargs: "agent")
     monkeypatch.setattr(cli, "EmbeddingClient", lambda **kwargs: "embedding")
-    monkeypatch.setattr(cli, "MilvusLiteStore", lambda **kwargs: "store")
+    monkeypatch.setattr(cli, "create_milvus_store", lambda config: "store")
     monkeypatch.setattr(cli, "RerankClient", lambda **kwargs: "reranker")
     monkeypatch.setattr(cli, "AnswerAgent", lambda **kwargs: "answer-agent")
 
@@ -169,7 +186,7 @@ def test_cli_search_trace_writes_step_events_to_stderr(monkeypatch, capsys) -> N
     monkeypatch.setattr(cli.RetrievalConfig, "from_env", _fake_config)
     monkeypatch.setattr(cli, "QueryUnderstandingAgent", lambda **kwargs: "agent")
     monkeypatch.setattr(cli, "EmbeddingClient", lambda **kwargs: "embedding")
-    monkeypatch.setattr(cli, "MilvusLiteStore", lambda **kwargs: "store")
+    monkeypatch.setattr(cli, "create_milvus_store", lambda config: "store")
     monkeypatch.setattr(cli, "RerankClient", lambda **kwargs: "reranker")
 
     def fake_search_evidence(**kwargs):
@@ -205,7 +222,7 @@ def test_cli_search_studio_uses_studio_trace_sink(monkeypatch, capsys) -> None:
     monkeypatch.setattr(cli.RetrievalConfig, "from_env", _fake_config)
     monkeypatch.setattr(cli, "QueryUnderstandingAgent", lambda **kwargs: "agent")
     monkeypatch.setattr(cli, "EmbeddingClient", lambda **kwargs: "embedding")
-    monkeypatch.setattr(cli, "MilvusLiteStore", lambda **kwargs: "store")
+    monkeypatch.setattr(cli, "create_milvus_store", lambda config: "store")
     monkeypatch.setattr(cli, "RerankClient", lambda **kwargs: "reranker")
     calls = {}
 

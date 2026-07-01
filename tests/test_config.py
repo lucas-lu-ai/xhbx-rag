@@ -5,6 +5,22 @@ import pytest
 from xhbx_rag.config import ConfigError, RetrievalConfig
 
 
+def _required_env(**overrides: str) -> dict[str, str]:
+    values = {
+        "API_KEY": "chat",
+        "BASE_URL": "https://api.example.com/v1",
+        "MODEL_NAME": "chat-model",
+        "EMBEDDING_BASE_URL": "https://api.siliconflow.com/v1",
+        "EMBEDDING_MODEL_NAME": "embed",
+        "EMBEDDING_API_KEY": "embedding-key",
+        "RERANK_BASE_URL": "https://api.siliconflow.com/v1",
+        "RERANK_MODEL_NAME": "rerank",
+        "RERANK_API_KEY": "rerank-key",
+    }
+    values.update(overrides)
+    return values
+
+
 def test_retrieval_config_reads_env_file_without_exposing_secrets(tmp_path) -> None:
     env_file = tmp_path / ".env"
     env_file.write_text(
@@ -33,6 +49,39 @@ def test_retrieval_config_reads_env_file_without_exposing_secrets(tmp_path) -> N
     assert config.milvus_vector_dim is None
     assert config.vision_model_name == ""
     assert "secret" not in config.safe_summary()
+
+
+def test_retrieval_config_defaults_to_milvus_lite_mode() -> None:
+    config = RetrievalConfig.from_env(env=_required_env(), env_file=None)
+
+    assert config.milvus_mode == "lite"
+    assert config.milvus_lite_path == Path(".local/milvus/xhbx_rag.db")
+    assert config.milvus_uri == "http://localhost:19530"
+    assert config.milvus_token == ""
+
+
+def test_retrieval_config_reads_docker_milvus_settings_without_exposing_token() -> None:
+    config = RetrievalConfig.from_env(
+        env=_required_env(
+            MILVUS_MODE="docker",
+            MILVUS_URI="http://127.0.0.1:19530",
+            MILVUS_TOKEN="root:Milvus",
+        ),
+        env_file=None,
+    )
+
+    assert config.milvus_mode == "docker"
+    assert config.milvus_uri == "http://127.0.0.1:19530"
+    assert config.milvus_token == "root:Milvus"
+    assert "root:Milvus" not in config.safe_summary()
+
+
+def test_retrieval_config_rejects_unknown_milvus_mode() -> None:
+    with pytest.raises(ConfigError, match="MILVUS_MODE"):
+        RetrievalConfig.from_env(
+            env=_required_env(MILVUS_MODE="remote"),
+            env_file=None,
+        )
 
 
 def test_retrieval_config_reads_optional_vision_model_name() -> None:

@@ -12,7 +12,7 @@ from .chunk_builder import build_chunks
 from .config import RetrievalConfig
 from .embedding import EmbeddingClient
 from .indexer import index_chunks
-from .milvus_store import MilvusLiteStore
+from .milvus_store import MilvusStore, create_milvus_store
 from .normalizer import normalize_case
 from .observability import (
     CompositeTraceSink,
@@ -254,11 +254,8 @@ def _embedding_client(config: RetrievalConfig) -> EmbeddingClient:
     )
 
 
-def _milvus_store(config: RetrievalConfig) -> MilvusLiteStore:
-    return MilvusLiteStore(
-        db_path=config.milvus_lite_path,
-        collection_name=config.milvus_collection,
-    )
+def _milvus_store(config: RetrievalConfig) -> MilvusStore:
+    return create_milvus_store(config)
 
 
 def _trace_sink(args: argparse.Namespace, root_name: str) -> TraceSink | None:

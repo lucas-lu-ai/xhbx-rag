@@ -53,12 +53,12 @@ class MilvusSearchHit:
     score: float
 
 
-class MilvusLiteStore:
-    def __init__(self, db_path: Path, collection_name: str) -> None:
-        self.db_path = db_path
+class MilvusStore:
+    def __init__(self, uri: str, collection_name: str, token: str = "") -> None:
+        self.uri = uri
         self.collection_name = collection_name
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.client = MilvusClient(str(self.db_path))
+        kwargs = {"token": token} if token else {}
+        self.client = MilvusClient(uri, **kwargs)
 
     def ensure_collection(self, vector_dim: int) -> None:
         if self.client.has_collection(self.collection_name):
@@ -189,6 +189,26 @@ class MilvusLiteStore:
                 dim = field.get("params", {}).get("dim")
                 return int(dim)
         raise MilvusStoreError("Milvus collection 缺少 vector 字段")
+
+
+class MilvusLiteStore(MilvusStore):
+    def __init__(self, db_path: Path, collection_name: str) -> None:
+        self.db_path = db_path
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        super().__init__(str(self.db_path), collection_name)
+
+
+def create_milvus_store(config: Any) -> MilvusStore:
+    if config.milvus_mode == "lite":
+        return MilvusLiteStore(
+            db_path=config.milvus_lite_path,
+            collection_name=config.milvus_collection,
+        )
+    return MilvusStore(
+        uri=config.milvus_uri,
+        collection_name=config.milvus_collection,
+        token=config.milvus_token,
+    )
 
 
 def _build_filter_expr(filters: dict[str, Any]) -> str:

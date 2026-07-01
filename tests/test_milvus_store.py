@@ -1,3 +1,7 @@
+from pathlib import Path
+from types import SimpleNamespace
+
+import xhbx_rag.milvus_store as milvus_store
 from xhbx_rag.milvus_store import MilvusChunkRecord, MilvusLiteStore
 from xhbx_rag.models import EvidenceRef, RagChunk
 
@@ -27,6 +31,52 @@ def test_milvus_chunk_record_flattens_metadata_and_json_fields() -> None:
     assert row["stage"] == "售前"
     assert '"strategy_names"' in row["metadata_json"]
     assert '"section_name"' in row["citations_json"]
+
+
+def test_create_milvus_store_uses_lite_path(monkeypatch) -> None:
+    calls = []
+
+    class FakeMilvusClient:
+        def __init__(self, uri, **kwargs):
+            calls.append({"uri": uri, "kwargs": kwargs})
+
+    monkeypatch.setattr(milvus_store, "MilvusClient", FakeMilvusClient)
+
+    store = milvus_store.create_milvus_store(
+        SimpleNamespace(
+            milvus_mode="lite",
+            milvus_lite_path=Path(".local/milvus/xhbx_rag.db"),
+            milvus_uri="http://127.0.0.1:19530",
+            milvus_token="root:Milvus",
+            milvus_collection="chunks",
+        )
+    )
+
+    assert store.collection_name == "chunks"
+    assert calls == [{"uri": ".local/milvus/xhbx_rag.db", "kwargs": {}}]
+
+
+def test_create_milvus_store_uses_docker_uri_and_token(monkeypatch) -> None:
+    calls = []
+
+    class FakeMilvusClient:
+        def __init__(self, uri, **kwargs):
+            calls.append({"uri": uri, "kwargs": kwargs})
+
+    monkeypatch.setattr(milvus_store, "MilvusClient", FakeMilvusClient)
+
+    store = milvus_store.create_milvus_store(
+        SimpleNamespace(
+            milvus_mode="docker",
+            milvus_lite_path=Path(".local/milvus/xhbx_rag.db"),
+            milvus_uri="http://127.0.0.1:19530",
+            milvus_token="root:Milvus",
+            milvus_collection="chunks",
+        )
+    )
+
+    assert store.collection_name == "chunks"
+    assert calls == [{"uri": "http://127.0.0.1:19530", "kwargs": {"token": "root:Milvus"}}]
 
 
 def test_milvus_lite_store_round_trips_records(tmp_path) -> None:

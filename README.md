@@ -271,7 +271,16 @@ npm run dev
 
 打开 `http://localhost:5173`。
 
-原始数据文件应放在项目 `data/` 目录下。点击引用时，页面会展示 `source_path`、来源类型、locator、原文摘录和定位置信心。点击“在 Finder 中显示文件”只会打开 `data/` 目录内的本地文件；第一版不会尝试把 Word/PPT/PDF 精确跳转到段落或页内锚点。
+原始数据文件应放在项目 `data/` 目录下。点击引用时，页面会展示 `source_path`、来源类型、locator、原文摘录和定位置信心。右侧“检索证据”会展示本次进入回答模型的 evidence chunks，方便对照回答是否被完整证据支撑。点击“在 Finder 中显示文件”只会打开 `data/` 目录内的本地文件；第一版不会尝试把 Word/PPT/PDF 精确跳转到段落或页内锚点。
+
+Web 问答默认会把处理过程通过 SSE 推到前端。如果还要在 AgentScope Studio 里观测同一轮消息，先启动 Studio，然后在 `.env` 中打开 Web trace：
+
+```env
+WEB_STUDIO_TRACE=true
+WEB_STUDIO_ENDPOINT=localhost:4317
+```
+
+`WEB_STUDIO_TRACE` 默认为关闭；打开后，每次 Web 发送消息都会创建一条 `xhbx-rag.web.answer` root trace，同时保留前端页面里的实时处理过程。
 
 ## 环境变量
 
@@ -301,12 +310,34 @@ RERANK_API_KEY=
 
 外部 HTTP 调用默认会对临时网络错误重试 3 次，覆盖模型、embedding 和 rerank 请求。当前会重试连接断开、TLS/连接错误、读取超时，以及 429/5xx 响应。
 
-Milvus Lite：
+Milvus：
 
 ```env
+MILVUS_MODE=lite
 MILVUS_LITE_PATH=.local/milvus/xhbx_rag.db
+MILVUS_URI=http://localhost:19530
+MILVUS_TOKEN=
 MILVUS_COLLECTION=xhbx_sales_chunks
 MILVUS_VECTOR_DIM=
 ```
+
+Web AgentScope Studio trace：
+
+```env
+WEB_STUDIO_TRACE=false
+WEB_STUDIO_ENDPOINT=localhost:4317
+```
+
+`MILVUS_MODE` 默认为 `lite`，继续使用 `MILVUS_LITE_PATH` 指向的 Milvus Lite 本地文件。
+
+如需连接本机 Docker Milvus：
+
+```env
+MILVUS_MODE=docker
+MILVUS_URI=http://localhost:19530
+MILVUS_TOKEN=
+```
+
+如果 Docker Milvus 启用了鉴权，把 `MILVUS_TOKEN` 设置为对应 token；未启用鉴权时留空。本项目只根据配置选择连接方式，不负责启动 Docker 服务。
 
 `MILVUS_VECTOR_DIM` 可以留空。首次入库时会根据 embedding 返回向量长度自动创建 collection。

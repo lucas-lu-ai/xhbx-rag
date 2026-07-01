@@ -15,6 +15,8 @@ def test_status_route_returns_status(monkeypatch) -> None:
         lambda: {
             "ok": True,
             "data_dir": "data",
+            "milvus_mode": "lite",
+            "milvus_target": ".local/milvus/xhbx_rag.db",
             "milvus_lite_path": ".local/milvus/xhbx_rag.db",
             "milvus_collection": "xhbx_sales_chunks",
             "config": {"API_KEY": True},
@@ -75,7 +77,7 @@ def test_answer_route_uses_default_limits(monkeypatch) -> None:
     assert calls == {
         "query": "保单整理有什么作用？",
         "top_n": 20,
-        "top_k": 5,
+        "top_k": 10,
     }
 
 
@@ -205,6 +207,94 @@ def test_answer_route_reports_local_index_unavailable(monkeypatch) -> None:
 
     assert response.status_code == 503
     assert response.json()["detail"] == detail
+
+
+def test_answer_stream_route_streams_sse_events(monkeypatch) -> None:
+    calls = {}
+
+    def fake_answer_question_stream_events(*, query, top_n, top_k):
+        calls["query"] = query
+        calls["top_n"] = top_n
+        calls["top_k"] = top_k
+        yield {
+            "type": "step",
+            "step": "search.query_understood",
+            "message": "已完成问题理解",
+            "payload": {"rewritten_query": "客户预算上限80万时如何回应"},
+        }
+        yield {"type": "answer_delta", "text": "先承接预算。"}
+        yield {
+            "type": "final",
+            "response": {
+                "answer": "先承接预算。",
+                "citations": [],
+                "evidence_count": 0,
+                "retrieval_evidences": [],
+            },
+        }
+
+    monkeypatch.setattr(
+        web_app,
+        "answer_question_stream_events",
+        fake_answer_question_stream_events,
+    )
+    client = TestClient(web_app.create_app())
+
+    with client.stream(
+        "POST",
+        "/api/answer/stream",
+        json={"query": "客户说每年不能超过80万怎么办？", "top_n": 20, "top_k": 5},
+    ) as response:
+        body = response.read().decode("utf-8")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert calls == {
+        "query": "客户说每年不能超过80万怎么办？",
+        "top_n": 20,
+        "top_k": 5,
+    }
+    assert "event: step" in body
+    assert '"message": "已完成问题理解"' in body
+    assert "event: answer_delta" in body
+    assert '"text": "先承接预算。"' in body
+    assert "event: final" in body
+
+
+def test_answer_stream_route_hides_internal_error_detail_and_logs(monkeypatch) -> None:
+    log_messages = []
+
+    class FakeLogger:
+        def exception(self, message: str) -> None:
+            log_messages.append(message)
+
+    def fake_answer_question_stream_events(*, query, top_n, top_k):
+        yield {
+            "type": "_exception",
+            "exception": RuntimeError("secret-token leaked from /Users/milan/.env"),
+        }
+
+    monkeypatch.setattr(web_app, "logger", FakeLogger(), raising=False)
+    monkeypatch.setattr(
+        web_app,
+        "answer_question_stream_events",
+        fake_answer_question_stream_events,
+    )
+    client = TestClient(web_app.create_app())
+
+    with client.stream(
+        "POST",
+        "/api/answer/stream",
+        json={"query": "客户说每年不能超过80万怎么办？"},
+    ) as response:
+        body = response.read().decode("utf-8")
+
+    assert response.status_code == 200
+    assert "event: error" in body
+    assert "问答服务暂时不可用" in body
+    assert "secret-token" not in body
+    assert "/Users/milan" not in body
+    assert log_messages == ["Answer stream route failed"]
 
 
 @pytest.mark.parametrize("top_n", [True, "20"])
@@ -383,6 +473,114 @@ def test_reveal_route_hides_generic_exception_detail_and_logs(monkeypatch) -> No
     assert "secret-token" not in response.text
     assert "/Users/milan/private.txt" not in response.text
     assert log_messages == ["Reveal source route failed"]
+
+
+def test_bad_case_route_saves_payload(monkeypatch) -> None:
+    calls = {}
+
+    def fake_save_bad_case(payload: dict):
+        calls["payload"] = payload
+        return {"ok": True, "bad_case_id": "bad-case-1", "path": ".local/x.jsonl"}
+
+    monkeypatch.setattr(web_app, "save_bad_case", fake_save_bad_case)
+    client = TestClient(web_app.create_app())
+
+    response = client.post(
+        "/api/bad-cases",
+        json={
+            "query": "保单整理对客户有什么作用？",
+            "rewritten_query": "保单整理客户价值",
+            "answer": "保单整理能帮助客户看清保障缺口。",
+            "top_n": 20,
+            "top_k": 5,
+            "feedback_result": "incomplete",
+            "problem_tags": ["missing_talk_track"],
+            "problem_detail": "当前回答没有讲清楚保障缺口。",
+            "expected_answer": "应该命中保障缺口分析的案例片段。",
+            "reference_note": "案例A 第3节",
+            "evidence_feedback": [
+                {
+                    "chunk_id": "case-a-1",
+                    "judgement": "should_use",
+                    "label": "案例A · 需求分析",
+                    "text_preview": "先做保单整理。",
+                }
+            ],
+            "issue_types": ["incomplete", "missing_talk_track"],
+            "expected_knowledge": "应该命中保障缺口分析的案例片段。",
+            "expected_source": "案例A 第3节",
+            "note": "当前回答没有讲清楚保障缺口。",
+            "citations": [{"filename": "第1节.track-0.txt"}],
+            "retrieval_evidences": [{"chunk_id": "case-a-1"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "bad_case_id": "bad-case-1"}
+    assert calls["payload"]["query"] == "保单整理对客户有什么作用？"
+    assert calls["payload"]["top_n"] == 20
+    assert calls["payload"]["feedback_result"] == "incomplete"
+    assert calls["payload"]["problem_tags"] == ["missing_talk_track"]
+    assert calls["payload"]["issue_types"] == ["incomplete", "missing_talk_track"]
+    assert calls["payload"]["evidence_feedback"][0]["judgement"] == "should_use"
+    assert calls["payload"]["retrieval_evidences"] == [{"chunk_id": "case-a-1"}]
+
+
+def test_bad_case_route_rejects_unknown_issue_type(monkeypatch) -> None:
+    def fail_if_called(payload: dict):
+        raise AssertionError("save_bad_case should not be called")
+
+    monkeypatch.setattr(web_app, "save_bad_case", fail_if_called)
+    client = TestClient(web_app.create_app())
+
+    response = client.post(
+        "/api/bad-cases",
+        json={
+            "query": "保单整理对客户有什么作用？",
+            "answer": "answer",
+            "top_n": 20,
+            "top_k": 5,
+            "issue_types": ["not_allowed"],
+            "citations": [],
+            "retrieval_evidences": [],
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_bad_case_route_hides_storage_error_detail_and_logs(monkeypatch) -> None:
+    log_messages = []
+
+    class FakeLogger:
+        def exception(self, message: str) -> None:
+            log_messages.append(message)
+
+    def fail_save_bad_case(payload: dict):
+        raise RuntimeError("failed writing /Users/milan/private.txt secret-token")
+
+    monkeypatch.setattr(web_app, "logger", FakeLogger(), raising=False)
+    monkeypatch.setattr(web_app, "save_bad_case", fail_save_bad_case)
+    client = TestClient(web_app.create_app())
+
+    response = client.post(
+        "/api/bad-cases",
+        json={
+            "query": "保单整理对客户有什么作用？",
+            "answer": "answer",
+            "top_n": 20,
+            "top_k": 5,
+            "issue_types": ["other"],
+            "citations": [],
+            "retrieval_evidences": [],
+        },
+    )
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == "无法保存 bad case"
+    assert "secret-token" not in response.text
+    assert "/Users/milan" not in response.text
+    assert log_messages == ["Bad case route failed"]
 
 
 def test_cors_preflight_allows_localhost_vite_origin() -> None:
