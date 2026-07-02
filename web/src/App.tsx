@@ -25,6 +25,8 @@ import {
   useRef,
   useState
 } from "react";
+import { readSheet } from "read-excel-file/universal";
+import writeExcelFile from "write-excel-file/universal";
 
 import {
   answerQuestionStream,
@@ -35,9 +37,11 @@ import {
 import {
   backfilledDownloadName,
   badCaseJsonlDownloadName,
+  buildBackfilledTable,
   buildBackfilledDelimitedText,
   buildBadCaseJsonl,
-  parseBatchDelimitedInput
+  parseBatchDelimitedInput,
+  parseBatchTableInput
 } from "./batch";
 import type {
   AnswerResponse,
@@ -67,6 +71,10 @@ type WorkMode = "single" | "batch";
 
 function downloadTextFile(filename: string, text: string) {
   const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+  downloadBlobFile(filename, blob);
+}
+
+function downloadBlobFile(filename: string, blob: Blob) {
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
@@ -813,17 +821,28 @@ function BatchPanel({
     }
   }
 
-  function downloadBackfilledFile() {
+  async function downloadBackfilledFile() {
     if (!batchState) {
       return;
     }
 
-    const text = buildBackfilledDelimitedText({
+    const backfilledTable = buildBackfilledTable({
       headers: batchState.headers,
       rows: batchState.rows,
       questions: batchState.questions
     });
-    downloadTextFile(backfilledDownloadName(batchState.source_label), text);
+    const fileName = backfilledDownloadName(batchState.source_label);
+    if (batchState.source_format === "xlsx") {
+      const blob = await writeExcelFile(backfilledTable).toBlob();
+      downloadBlobFile(fileName, blob);
+      return;
+    }
+
+    downloadTextFile(fileName, buildBackfilledDelimitedText({
+      headers: batchState.headers,
+      rows: batchState.rows,
+      questions: batchState.questions
+    }));
   }
 
   function batchBadCaseSourceLabel(
@@ -908,11 +927,30 @@ function BatchPanel({
     const nextSourceFormat = batchSourceFormatForFile(file.name);
     if (!nextSourceFormat) {
       setBatchState(null);
-      setParseError("仅支持 txt 或 csv 文件");
+      setParseError("仅支持 txt、csv 或 xlsx 文件");
       return;
     }
 
     try {
+      if (nextSourceFormat === "xlsx") {
+        const tableRows = await readSheet(file);
+        if (runningRef.current) {
+          return;
+        }
+
+        const parsed = parseBatchTableInput({
+          rows: tableRows,
+          sourceLabel: file.name,
+          sourceFormat: nextSourceFormat
+        });
+        setBatchText(buildBackfilledDelimitedText(parsed));
+        setSourceLabel(file.name);
+        setSourceFormat(nextSourceFormat);
+        setBatchState(parsed);
+        setParseError("");
+        return;
+      }
+
       const text = await file.text();
       if (runningRef.current) {
         return;
@@ -939,7 +977,7 @@ function BatchPanel({
           <span>上传批量文件</span>
           <input
             type="file"
-            accept=".txt,.csv"
+            accept=".txt,.csv,.xlsx"
             disabled={running}
             onChange={(event) => void handleFileChange(event)}
           />
@@ -981,7 +1019,7 @@ function BatchPanel({
         {!batchState ? (
           <div className="batch-empty-state">
             <h2>等待解析</h2>
-            <p>粘贴带表头的逗号分隔内容，或上传 txt/csv 文件。</p>
+            <p>粘贴带表头的逗号分隔内容，或上传 txt/csv/xlsx 文件。</p>
           </div>
         ) : (
           <ol className="batch-result-list">
@@ -1091,7 +1129,7 @@ function BatchPanel({
             !batchState ||
             !batchState.questions.some((question) => question.status === "succeeded")
           }
-          onClick={downloadBackfilledFile}
+          onClick={() => void downloadBackfilledFile()}
         >
           下载回填文件
         </button>
@@ -1139,6 +1177,9 @@ function batchSourceFormatForFile(fileName: string): BatchSourceFormat | null {
   const normalized = fileName.toLowerCase();
   if (normalized.endsWith(".csv")) {
     return "csv";
+  }
+  if (normalized.endsWith(".xlsx")) {
+    return "xlsx";
   }
   if (normalized.endsWith(".txt")) {
     return "txt";

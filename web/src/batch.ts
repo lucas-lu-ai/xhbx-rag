@@ -11,6 +11,12 @@ type ParseBatchDelimitedInputArgs = {
   sourceFormat: BatchSourceFormat;
 };
 
+type ParseBatchTableInputArgs = {
+  rows: unknown[][];
+  sourceLabel: string;
+  sourceFormat: BatchSourceFormat;
+};
+
 type BuildBackfilledDelimitedTextArgs = {
   headers: string[];
   rows: string[][];
@@ -26,7 +32,19 @@ export function parseBatchDelimitedInput({
   sourceLabel,
   sourceFormat
 }: ParseBatchDelimitedInputArgs): BatchRunState {
-  const parsedRows = parseCommaDelimited(text);
+  return parseBatchTableInput({
+    rows: parseCommaDelimited(text),
+    sourceLabel,
+    sourceFormat
+  });
+}
+
+export function parseBatchTableInput({
+  rows: rawRows,
+  sourceLabel,
+  sourceFormat
+}: ParseBatchTableInputArgs): BatchRunState {
+  const parsedRows = rawRows.map((row) => row.map(cellToString));
   const headers = parsedRows[0] ?? [];
   if (headers.length < 2) {
     throw new Error("文件必须包含问题和答案两列");
@@ -77,6 +95,14 @@ export function buildBackfilledDelimitedText({
   rows,
   questions
 }: BuildBackfilledDelimitedTextArgs): string {
+  return serializeCommaDelimited(buildBackfilledTable({ headers, rows, questions }));
+}
+
+export function buildBackfilledTable({
+  headers,
+  rows,
+  questions
+}: BuildBackfilledDelimitedTextArgs): string[][] {
   const succeededAnswers = new Map<number, string>();
   for (const question of questions) {
     if (question.status === "succeeded" && question.response) {
@@ -96,7 +122,7 @@ export function buildBackfilledDelimitedText({
     return nextRow;
   });
 
-  return serializeCommaDelimited([headers, ...backfilledRows]);
+  return [headers, ...backfilledRows];
 }
 
 export function buildBadCaseJsonl(records: BatchBadCaseJsonlRecord[]): string {
@@ -206,6 +232,16 @@ function serializeCell(value: string): string {
     return value;
   }
   return `"${value.replaceAll("\"", "\"\"")}"`;
+}
+
+function cellToString(value: unknown): string {
+  if (value === null || value === undefined) {
+    return "";
+  }
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+  return String(value);
 }
 
 function downloadBaseName(sourceLabel: string): string {

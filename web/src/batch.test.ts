@@ -2,6 +2,8 @@ import {
   backfilledDownloadName,
   badCaseJsonlDownloadName,
   buildBackfilledDelimitedText,
+  buildBackfilledTable,
+  parseBatchTableInput,
   buildBadCaseJsonl,
   parseBatchDelimitedInput
 } from "./batch";
@@ -112,6 +114,32 @@ test("parseBatchDelimitedInput 保留未包裹字段中的普通双引号", () =
   expect(state.questions[0].query).toBe('客户说"太贵了"怎么办？');
 });
 
+test("parseBatchTableInput 解析 xlsx 第一张 sheet 的问题和原始答案", () => {
+  const state = parseBatchTableInput({
+    rows: [
+      ["问题", "答案", "标签"],
+      ["客户说预算有限怎么办？", undefined, "预算"],
+      ["保单整理有什么作用？", "人工答案", "整理"],
+      ["", "空问题应忽略", "跳过"]
+    ],
+    sourceLabel: "测试问题.xlsx",
+    sourceFormat: "xlsx"
+  });
+
+  expect(state.source_label).toBe("测试问题.xlsx");
+  expect(state.source_format).toBe("xlsx");
+  expect(state.headers).toEqual(["问题", "答案", "标签"]);
+  expect(state.rows).toEqual([
+    ["客户说预算有限怎么办？", "", "预算"],
+    ["保单整理有什么作用？", "人工答案", "整理"],
+    ["", "空问题应忽略", "跳过"]
+  ]);
+  expect(state.questions).toEqual([
+    makeQuestion({ row_index: 2, query: "客户说预算有限怎么办？", input_answer: "" }),
+    makeQuestion({ row_index: 3, query: "保单整理有什么作用？", input_answer: "人工答案" })
+  ]);
+});
+
 test("parseBatchDelimitedInput 未闭合引号时报错", () => {
   expect(() =>
     parseBatchDelimitedInput({
@@ -203,6 +231,42 @@ test("buildBackfilledDelimitedText 保留表头、行顺序和额外列并只回
       "引用怎么说？,\"带逗号, 和 \"\"引用\"\"\n第二行\",备注"
     ].join("\n")
   );
+});
+
+test("buildBackfilledTable 返回可用于 xlsx 导出的回填二维表", () => {
+  const output = buildBackfilledTable({
+    headers: ["问题", "答案", "标签"],
+    rows: [
+      ["保单整理有什么作用？", "原答案", "基础"],
+      ["失败问题", "保留原答案", "失败"]
+    ],
+    questions: [
+      makeQuestion({
+        row_index: 2,
+        query: "保单整理有什么作用？",
+        input_answer: "原答案",
+        status: "succeeded",
+        response: {
+          answer: "模型答案",
+          citations: [],
+          evidence_count: 0
+        }
+      }),
+      makeQuestion({
+        row_index: 3,
+        query: "失败问题",
+        input_answer: "保留原答案",
+        status: "failed",
+        error: "服务异常"
+      })
+    ]
+  });
+
+  expect(output).toEqual([
+    ["问题", "答案", "标签"],
+    ["保单整理有什么作用？", "模型答案", "基础"],
+    ["失败问题", "保留原答案", "失败"]
+  ]);
 });
 
 test("buildBadCaseJsonl 只序列化非 usable bad case records 且末尾带换行", () => {

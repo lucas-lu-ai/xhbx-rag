@@ -1,5 +1,7 @@
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { readSheet } from "read-excel-file/universal";
+import writeExcelFile from "write-excel-file/node";
 
 import { App } from "./App";
 
@@ -205,10 +207,12 @@ function installStorageStub() {
 
 function installDownloadStub() {
   const textParts: string[] = [];
+  const blobs: Blob[] = [];
   const originalCreateElement = document.createElement.bind(document);
   const click = vi.fn();
   const createObjectUrlSpy = vi.spyOn(URL, "createObjectURL").mockImplementation((blob) => {
     if (blob instanceof Blob) {
+      blobs.push(blob);
       void blob.text().then((text) => textParts.push(text));
     }
     return "blob:batch-download";
@@ -234,9 +238,26 @@ function installDownloadStub() {
   cleanupCallbacks.push(restore);
 
   return {
+    blobs,
     textParts,
     restore
   };
+}
+
+type TestSheetCell = string | number | boolean | Date | null;
+
+async function makeXlsxFile(
+  rows: TestSheetCell[][],
+  name = "测试问题.xlsx"
+): Promise<File> {
+  const buffer = await writeExcelFile(rows).toBuffer();
+  return new File([buffer], name, {
+    type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+  });
+}
+
+async function readXlsxBlob(blob: Blob): Promise<unknown[][]> {
+  return readSheet(blob);
 }
 
 test("uses default retrieval and citation limits", async () => {
@@ -263,6 +284,26 @@ test("parses pasted comma-separated batch questions", async () => {
 
   expect(screen.getByText("已解析 2 个问题")).toBeInTheDocument();
   expect(screen.getByText("客户说每年不能超过80万怎么办？")).toBeInTheDocument();
+  expect(screen.getByText("保单整理有什么作用？")).toBeInTheDocument();
+  expect(screen.getByText("人工答案")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "开始批量运行" })).toBeEnabled();
+});
+
+test("parses uploaded xlsx batch questions from the first sheet", async () => {
+  const user = userEvent.setup();
+  const file = await makeXlsxFile([
+    ["问题", "答案", "标签"],
+    ["客户说预算有限怎么办？", "", "预算"],
+    ["保单整理有什么作用？", "人工答案", "整理"]
+  ]);
+  installFetchStub();
+  render(<App />);
+
+  await user.click(screen.getByRole("button", { name: "批量" }));
+  await user.upload(screen.getByLabelText("上传批量文件"), file);
+
+  expect(await screen.findByText("已解析 2 个问题")).toBeInTheDocument();
+  expect(screen.getByText("客户说预算有限怎么办？")).toBeInTheDocument();
   expect(screen.getByText("保单整理有什么作用？")).toBeInTheDocument();
   expect(screen.getByText("人工答案")).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "开始批量运行" })).toBeEnabled();
@@ -610,6 +651,34 @@ test("downloads a backfilled comma-separated answer file", async () => {
       "客户说每年不能超过80万怎么办？,先承接预算，再讨论缴费期和保障缺口。,预算"
     );
   });
+  restore();
+});
+
+test("downloads a backfilled xlsx answer file", async () => {
+  const user = userEvent.setup();
+  const file = await makeXlsxFile([
+    ["问题", "答案", "标签"],
+    ["客户说每年不能超过80万怎么办？", "", "预算"]
+  ]);
+  const { blobs, restore } = installDownloadStub();
+  installFetchStub();
+  render(<App />);
+
+  await user.click(screen.getByRole("button", { name: "批量" }));
+  await user.upload(screen.getByLabelText("上传批量文件"), file);
+  await user.click(await screen.findByRole("button", { name: "开始批量运行" }));
+  expect(await screen.findByText("先承接预算，再讨论缴费期和保障缺口。")).toBeInTheDocument();
+
+  await user.click(screen.getByRole("button", { name: "下载回填文件" }));
+
+  await waitFor(() => {
+    expect(blobs).toHaveLength(1);
+  });
+  const rows = await readXlsxBlob(blobs[0]);
+  expect(rows).toEqual([
+    ["问题", "答案", "标签"],
+    ["客户说每年不能超过80万怎么办？", "先承接预算，再讨论缴费期和保障缺口。", "预算"]
+  ]);
   restore();
 });
 

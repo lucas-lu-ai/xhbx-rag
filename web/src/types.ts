@@ -193,7 +193,7 @@ export type BadCaseResponse = {
   bad_case_id: string;
 };
 
-export type BatchSourceFormat = "txt" | "csv" | "pasted";
+export type BatchSourceFormat = "txt" | "csv" | "xlsx" | "pasted";
 
 export type BatchQuestionStatus = "pending" | "running" | "succeeded" | "failed";
 
