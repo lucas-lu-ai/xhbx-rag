@@ -7,6 +7,7 @@ export type StatusResponse = {
   milvus_target: string;
   milvus_lite_path: string;
   milvus_collection: string;
+  batch_concurrency: number;
   config: ConfigStatus;
   errors: string[];
 };

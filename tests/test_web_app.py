@@ -77,7 +77,7 @@ def test_answer_route_uses_default_limits(monkeypatch) -> None:
     assert calls == {
         "query": "保单整理有什么作用？",
         "top_n": 20,
-        "top_k": 10,
+        "top_k": 5,
     }
 
 

@@ -35,13 +35,17 @@ import {
   submitBadCase
 } from "./api";
 import {
+  BATCH_TEMPLATE_FILE_NAME,
+  BATCH_TEMPLATE_TABLE,
   backfilledDownloadName,
   badCaseJsonlDownloadName,
   buildBackfilledTable,
   buildBackfilledDelimitedText,
   buildBadCaseJsonl,
+  normalizeBatchConcurrency,
   parseBatchDelimitedInput,
-  parseBatchTableInput
+  parseBatchTableInput,
+  runWithConcurrency
 } from "./batch";
 import type {
   AnswerResponse,
@@ -95,6 +99,7 @@ const emptyStatus: StatusResponse = {
   milvus_target: "",
   milvus_lite_path: "",
   milvus_collection: "",
+  batch_concurrency: 1,
   config: {},
   errors: []
 };
@@ -110,6 +115,9 @@ export function App() {
   const [sessionStore, setSessionStore] =
     useState<StoredChatSessions>(loadChatSessions);
   const [selectedCitation, setSelectedCitation] = useState<Citation | null>(null);
+  // 批量模式下证据面板跟随所点引用所属问题的回答，而不是单问会话的最新回答。
+  const [batchCitationResponse, setBatchCitationResponse] =
+    useState<AnswerResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [formError, setFormError] = useState("");
   const [revealMessage, setRevealMessage] = useState("");
@@ -143,7 +151,9 @@ export function App() {
     () => latestResponseFromTurns(turns),
     [turns]
   );
-  const latestEvidences = latestResponse?.retrieval_evidences ?? [];
+  const evidenceResponse =
+    workMode === "batch" ? batchCitationResponse ?? undefined : latestResponse;
+  const latestEvidences = evidenceResponse?.retrieval_evidences ?? [];
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -526,10 +536,12 @@ export function App() {
           </>
         ) : (
           <BatchPanel
+            batchConcurrency={status.batch_concurrency}
             selectedCitation={selectedCitation}
             onRunningChange={setBatchRunning}
-            onCitationSelect={(citation) => {
+            onCitationSelect={(citation, response) => {
               setSelectedCitation(citation);
+              setBatchCitationResponse(response);
               setRevealMessage("");
             }}
           />
@@ -615,7 +627,7 @@ export function App() {
               {revealMessage && <p className="meta-text">{revealMessage}</p>}
             </div>
           )}
-          <EvidenceList response={latestResponse} evidences={latestEvidences} />
+          <EvidenceList response={evidenceResponse} evidences={latestEvidences} />
         </section>
       </aside>
     </div>
@@ -623,13 +635,15 @@ export function App() {
 }
 
 function BatchPanel({
+  batchConcurrency,
   selectedCitation,
   onRunningChange,
   onCitationSelect
 }: {
+  batchConcurrency: number;
   selectedCitation: Citation | null;
   onRunningChange: (running: boolean) => void;
-  onCitationSelect: (citation: Citation) => void;
+  onCitationSelect: (citation: Citation, response: AnswerResponse) => void;
 }) {
   const [batchText, setBatchText] = useState("");
   const [batchState, setBatchState] = useState<BatchRunState | null>(null);
@@ -813,12 +827,19 @@ function BatchPanel({
 
     setBatchRunning(true);
     try {
-      for (const question of batchState.questions) {
-        await runBatchQuestion(question);
-      }
+      await runWithConcurrency(
+        batchState.questions,
+        normalizeBatchConcurrency(batchConcurrency),
+        (question) => runBatchQuestion(question)
+      );
     } finally {
       setBatchRunning(false);
     }
+  }
+
+  async function downloadBatchTemplate() {
+    const blob = await writeExcelFile([...BATCH_TEMPLATE_TABLE]).toBlob();
+    downloadBlobFile(BATCH_TEMPLATE_FILE_NAME, blob);
   }
 
   async function downloadBackfilledFile() {
@@ -973,15 +994,26 @@ function BatchPanel({
   return (
     <section className="batch-panel" aria-label="批量问题">
       <div className="batch-inputs">
-        <label className="file-field">
-          <span>上传批量文件</span>
+        <div className="file-field">
+          <div className="file-field-heading">
+            <label htmlFor="batch-file-input">上传批量文件</label>
+            <button
+              className="inline-button compact-button"
+              type="button"
+              disabled={running}
+              onClick={() => void downloadBatchTemplate()}
+            >
+              下载 xlsx 模板
+            </button>
+          </div>
           <input
+            id="batch-file-input"
             type="file"
             accept=".txt,.csv,.xlsx"
             disabled={running}
             onChange={(event) => void handleFileChange(event)}
           />
-        </label>
+        </div>
         <label className="text-field batch-text-field" htmlFor="batch-content">
           <span>批量问题内容</span>
           <textarea
@@ -1091,7 +1123,11 @@ function BatchPanel({
                           <CitationList
                             citations={question.response.citations}
                             selectedCitation={selectedCitation}
-                            onSelect={onCitationSelect}
+                            onSelect={(citation) => {
+                              if (question.response) {
+                                onCitationSelect(citation, question.response);
+                              }
+                            }}
                           />
                           <BadCasePanel
                             turn={batchQuestionToChatTurn(question)}

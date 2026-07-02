@@ -171,6 +171,98 @@ def test_get_status_reports_docker_milvus_target(monkeypatch) -> None:
     assert "root:Milvus" not in str(status)
 
 
+def test_get_status_reports_serial_batch_concurrency_for_lite(monkeypatch) -> None:
+    monkeypatch.setattr(services.RetrievalConfig, "from_env", _fake_config)
+    monkeypatch.setattr(services, "load_env_values", lambda: {})
+
+    status = services.get_status()
+
+    assert status["batch_concurrency"] == 1
+
+
+def test_get_status_reports_default_batch_concurrency_for_docker(monkeypatch) -> None:
+    def docker_config():
+        config = _fake_config()
+        config.milvus_mode = "docker"
+        return config
+
+    monkeypatch.setattr(services.RetrievalConfig, "from_env", docker_config)
+    monkeypatch.setattr(services, "load_env_values", lambda: {})
+
+    status = services.get_status()
+
+    assert status["batch_concurrency"] == 3
+
+
+def test_get_status_reads_batch_concurrency_from_env_for_docker(monkeypatch) -> None:
+    def docker_config():
+        config = _fake_config()
+        config.milvus_mode = "docker"
+        return config
+
+    monkeypatch.setattr(services.RetrievalConfig, "from_env", docker_config)
+    monkeypatch.setattr(
+        services, "load_env_values", lambda: {"WEB_BATCH_CONCURRENCY": "5"}
+    )
+
+    status = services.get_status()
+
+    assert status["batch_concurrency"] == 5
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [
+        ("abc", 3),
+        ("", 3),
+        ("0", 1),
+        ("-2", 1),
+        ("999", 10),
+        ("2.5", 3),
+    ],
+)
+def test_get_status_sanitizes_invalid_batch_concurrency(
+    monkeypatch, raw_value: str, expected: int
+) -> None:
+    def docker_config():
+        config = _fake_config()
+        config.milvus_mode = "docker"
+        return config
+
+    monkeypatch.setattr(services.RetrievalConfig, "from_env", docker_config)
+    monkeypatch.setattr(
+        services, "load_env_values", lambda: {"WEB_BATCH_CONCURRENCY": raw_value}
+    )
+
+    status = services.get_status()
+
+    assert status["batch_concurrency"] == expected
+
+
+def test_get_status_ignores_batch_concurrency_env_for_lite(monkeypatch) -> None:
+    monkeypatch.setattr(services.RetrievalConfig, "from_env", _fake_config)
+    monkeypatch.setattr(
+        services, "load_env_values", lambda: {"WEB_BATCH_CONCURRENCY": "5"}
+    )
+
+    status = services.get_status()
+
+    assert status["batch_concurrency"] == 1
+
+
+def test_get_status_reports_serial_batch_concurrency_on_config_error(
+    monkeypatch,
+) -> None:
+    def fail_from_env():
+        raise ConfigError("缺少必要环境变量: API_KEY")
+
+    monkeypatch.setattr(services.RetrievalConfig, "from_env", fail_from_env)
+
+    status = services.get_status()
+
+    assert status["batch_concurrency"] == 1
+
+
 def test_get_status_reports_config_error(monkeypatch) -> None:
     def fail_from_env():
         raise ConfigError("缺少必要环境变量: API_KEY")

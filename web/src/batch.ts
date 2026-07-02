@@ -26,6 +26,45 @@ type BuildBackfilledDelimitedTextArgs = {
 const MAX_BATCH_QUESTIONS = 100;
 const DEFAULT_TOP_N = 20;
 const DEFAULT_TOP_K = 5;
+// 与解析约定保持一致：第一列问题、第二列答案。
+export const BATCH_TEMPLATE_TABLE: readonly string[][] = [["问题", "答案"]];
+export const BATCH_TEMPLATE_FILE_NAME = "批量问题模板.xlsx";
+// 并发数由后端 /api/status 的 batch_concurrency 下发（WEB_BATCH_CONCURRENCY，
+// 仅 MILVUS_MODE=docker 时 >1）；这里只做防御性归一，非法或缺失时回退串行。
+const SERIAL_BATCH_CONCURRENCY = 1;
+const MAX_BATCH_CONCURRENCY = 10;
+
+export function normalizeBatchConcurrency(value: unknown): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+    return SERIAL_BATCH_CONCURRENCY;
+  }
+  return Math.min(value, MAX_BATCH_CONCURRENCY);
+}
+
+export async function runWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  if (!Number.isInteger(limit) || limit < 1) {
+    throw new Error("并发数必须是不小于 1 的整数");
+  }
+
+  const results: R[] = new Array(items.length);
+  let nextIndex = 0;
+
+  async function runLane(): Promise<void> {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await worker(items[index], index);
+    }
+  }
+
+  const laneCount = Math.min(limit, items.length);
+  await Promise.all(Array.from({ length: laneCount }, () => runLane()));
+  return results;
+}
 
 export function parseBatchDelimitedInput({
   text,
@@ -57,7 +96,8 @@ export function parseBatchTableInput({
       return [];
     }
 
-    const rowIndex = index + 2;
+    // row_index 是数据行号（不含表头），从 1 开始，与界面“第 N 行”展示一致。
+    const rowIndex = index + 1;
     return [
       {
         id: `row-${rowIndex}`,
@@ -111,7 +151,7 @@ export function buildBackfilledTable({
   }
 
   const backfilledRows = rows.map((row, index) => {
-    const rowIndex = index + 2;
+    const rowIndex = index + 1;
     const answer = succeededAnswers.get(rowIndex);
     if (answer === undefined) {
       return row;

@@ -42,6 +42,10 @@ LOCAL_INDEX_UNAVAILABLE_ERROR = (
 )
 WEB_STUDIO_TRACE_ROOT_NAME = "xhbx-rag.web.answer"
 WEB_STUDIO_TRACE_TRUTHY = {"1", "true", "yes", "on"}
+# 批量执行并发数：Milvus Lite 是本地文件、并发打开会失败，仅 docker 模式允许 >1。
+SERIAL_BATCH_CONCURRENCY = 1
+DEFAULT_DOCKER_BATCH_CONCURRENCY = 3
+MAX_BATCH_CONCURRENCY = 10
 # 数据目录固定位于项目根下的 data/，展示相对路径即可，不暴露绝对路径。
 DATA_DIR_DISPLAY = "data"
 
@@ -57,6 +61,7 @@ def get_status() -> dict[str, Any]:
             "milvus_target": "",
             "milvus_lite_path": "",
             "milvus_collection": "",
+            "batch_concurrency": SERIAL_BATCH_CONCURRENCY,
             "config": _missing_config_map(str(exc)),
             "errors": [str(exc)],
         }
@@ -68,6 +73,7 @@ def get_status() -> dict[str, Any]:
             "milvus_target": "",
             "milvus_lite_path": "",
             "milvus_collection": "",
+            "batch_concurrency": SERIAL_BATCH_CONCURRENCY,
             "config": _missing_config_map(SAFE_CONFIG_PARSE_ERROR),
             "errors": [SAFE_CONFIG_PARSE_ERROR],
         }
@@ -79,9 +85,24 @@ def get_status() -> dict[str, Any]:
         "milvus_target": _milvus_target(config),
         "milvus_lite_path": str(config.milvus_lite_path),
         "milvus_collection": config.milvus_collection,
+        "batch_concurrency": _batch_concurrency(config),
         "config": {key: True for key in REQUIRED_CONFIG_KEYS},
         "errors": [],
     }
+
+
+def _batch_concurrency(config: RetrievalConfig) -> int:
+    if config.milvus_mode != "docker":
+        return SERIAL_BATCH_CONCURRENCY
+
+    raw_value = load_env_values().get("WEB_BATCH_CONCURRENCY", "").strip()
+    if not raw_value:
+        return DEFAULT_DOCKER_BATCH_CONCURRENCY
+    try:
+        parsed = int(raw_value)
+    except ValueError:
+        return DEFAULT_DOCKER_BATCH_CONCURRENCY
+    return max(SERIAL_BATCH_CONCURRENCY, min(MAX_BATCH_CONCURRENCY, parsed))
 
 
 def answer_question(

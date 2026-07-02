@@ -328,6 +328,14 @@ WEB_STUDIO_TRACE=false
 WEB_STUDIO_ENDPOINT=localhost:4317
 ```
 
+Web 批量执行并发数：
+
+```env
+WEB_BATCH_CONCURRENCY=3
+```
+
+`WEB_BATCH_CONCURRENCY` 控制 Web 批量问答同时执行的问题数（1-10，默认 3），仅在 `MILVUS_MODE=docker` 时生效；Milvus Lite 是单进程本地文件，lite 模式下批量执行强制串行。
+
 `MILVUS_MODE` 默认为 `lite`，继续使用 `MILVUS_LITE_PATH` 指向的 Milvus Lite 本地文件。
 
 如需连接本机 Docker Milvus：

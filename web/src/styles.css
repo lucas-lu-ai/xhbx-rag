@@ -665,7 +665,14 @@ textarea::placeholder {
   gap: 7px;
 }
 
-.file-field span,
+.file-field-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.file-field label,
 .batch-text-field span {
   color: #485a72;
   font-size: 13px;
@@ -723,10 +730,6 @@ textarea::placeholder {
   border-color: var(--color-border);
   background: rgb(255 255 255 / 0.64);
   color: var(--color-muted);
-}
-
-.batch-results {
-  min-height: 0;
 }
 
 .batch-empty-state {

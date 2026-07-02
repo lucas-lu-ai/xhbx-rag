@@ -14,6 +14,7 @@ const statusPayload = {
   milvus_target: ".local/milvus/xhbx_rag.db",
   milvus_lite_path: ".local/milvus/xhbx_rag.db",
   milvus_collection: "xhbx_sales_chunks",
+  batch_concurrency: 1,
   config: { API_KEY: true },
   errors: []
 };
@@ -377,6 +378,70 @@ test("runs batch questions sequentially and shows per-row process state", async 
   expect(screen.getAllByText("已完成问题理解")).toHaveLength(2);
 });
 
+test("runs batch questions concurrently when status reports docker concurrency", async () => {
+  const user = userEvent.setup();
+  const streamRequests: Array<{
+    body: { query: string; top_n: number; top_k: number };
+    resolve: () => void;
+  }> = [];
+  const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith("/api/status")) {
+      return jsonResponse({
+        ...statusPayload,
+        milvus_mode: "docker",
+        milvus_target: "http://127.0.0.1:19530",
+        batch_concurrency: 3
+      });
+    }
+    if (url.endsWith("/api/answer/stream")) {
+      const body = JSON.parse(String(init?.body));
+      const deferred = deferredResponse();
+      streamRequests.push({
+        body,
+        resolve: () => deferred.resolve(batchAnswerStreamResponse(body.query))
+      });
+      return deferred.promise;
+    }
+    return jsonResponse({ detail: "not found" }, { status: 404 });
+  });
+  vi.stubGlobal("fetch", fetcher);
+  render(<App />);
+
+  await user.click(screen.getByRole("button", { name: "批量" }));
+  await user.click(screen.getByLabelText("批量问题内容"));
+  await user.paste(
+    "问题,答案\n问题一怎么回应？,\n问题二怎么回应？,\n问题三怎么回应？,\n问题四怎么回应？,"
+  );
+  await user.click(screen.getByRole("button", { name: "解析内容" }));
+  await user.click(screen.getByRole("button", { name: "开始批量运行" }));
+
+  await waitFor(() => {
+    expect(streamRequests).toHaveLength(3);
+  });
+  expect(streamRequests.map((request) => request.body.query)).toEqual([
+    "问题一怎么回应？",
+    "问题二怎么回应？",
+    "问题三怎么回应？"
+  ]);
+
+  streamRequests[0].resolve();
+  await waitFor(() => {
+    expect(streamRequests).toHaveLength(4);
+  });
+  expect(streamRequests[3].body.query).toBe("问题四怎么回应？");
+
+  streamRequests[1].resolve();
+  streamRequests[2].resolve();
+  streamRequests[3].resolve();
+
+  expect(await screen.findByText("问题一怎么回应？ 的模型答案")).toBeInTheDocument();
+  expect(await screen.findByText("问题四怎么回应？ 的模型答案")).toBeInTheDocument();
+  await waitFor(() => {
+    expect(screen.getByRole("button", { name: "开始批量运行" })).toBeEnabled();
+  });
+});
+
 test("keeps batch input locked while a batch run is active", async () => {
   const user = userEvent.setup();
   const streamRequests: Array<{
@@ -682,6 +747,69 @@ test("downloads a backfilled xlsx answer file", async () => {
   restore();
 });
 
+test("shows retrieval evidences for the selected batch citation", async () => {
+  const user = userEvent.setup();
+  installFetchStub();
+  render(<App />);
+
+  await user.click(screen.getByRole("button", { name: "批量" }));
+  await user.type(
+    screen.getByLabelText("批量问题内容"),
+    "问题,答案\n客户说每年不能超过80万怎么办？,"
+  );
+  await user.click(screen.getByRole("button", { name: "解析内容" }));
+  await user.click(await screen.findByRole("button", { name: "开始批量运行" }));
+  expect(
+    await screen.findByText("先承接预算，再讨论缴费期和保障缺口。")
+  ).toBeInTheDocument();
+  expect(screen.getByText("暂无检索证据。")).toBeInTheDocument();
+
+  await user.click(screen.getByRole("button", { name: /引用 1/ }));
+
+  const evidenceList = await screen.findByRole("region", {
+    name: "检索证据列表"
+  });
+  expect(
+    within(evidenceList).getByText(
+      "客户担心预算，可以先承接预算，再对齐保障缺口。"
+    )
+  ).toBeInTheDocument();
+  expect(screen.queryByText("暂无检索证据。")).not.toBeInTheDocument();
+});
+
+test("downloads an empty xlsx batch template with headers only", async () => {
+  const user = userEvent.setup();
+  const { blobs, restore } = installDownloadStub();
+  installFetchStub();
+  render(<App />);
+
+  await user.click(screen.getByRole("button", { name: "批量" }));
+  await user.click(screen.getByRole("button", { name: "下载 xlsx 模板" }));
+
+  await waitFor(() => {
+    expect(blobs).toHaveLength(1);
+  });
+  const rows = await readXlsxBlob(blobs[0]);
+  expect(rows).toEqual([["问题", "答案"]]);
+  restore();
+});
+
+test("parses an uploaded file that follows the downloaded template", async () => {
+  const user = userEvent.setup();
+  const file = await makeXlsxFile([
+    ["问题", "答案"],
+    ["客户说每年不能超过80万怎么办？", null]
+  ]);
+  installFetchStub();
+  render(<App />);
+
+  await user.click(screen.getByRole("button", { name: "批量" }));
+  await user.upload(screen.getByLabelText("上传批量文件"), file);
+
+  expect(await screen.findByText("已解析 1 个问题")).toBeInTheDocument();
+  expect(screen.getByText("客户说每年不能超过80万怎么办？")).toBeInTheDocument();
+});
+
 test("exports bad case jsonl only for non-usable batch feedback", async () => {
   const user = userEvent.setup();
   const { requests } = installFetchStub();
@@ -709,7 +837,7 @@ test("exports bad case jsonl only for non-usable batch feedback", async () => {
     const record = JSON.parse(jsonl.trim());
     expect(record).toMatchObject({
       batch_source_label: "pasted.csv",
-      row_index: 2,
+      row_index: 1,
       input_answer: "人工答案",
       query: "客户说每年不能超过80万怎么办？",
       answer: "先承接预算，再讨论缴费期和保障缺口。",
