@@ -3,11 +3,9 @@ import {
   badCaseJsonlDownloadName,
   buildBackfilledDelimitedText,
   buildBackfilledTable,
-  normalizeBatchConcurrency,
   parseBatchTableInput,
   buildBadCaseJsonl,
-  parseBatchDelimitedInput,
-  runWithConcurrency
+  parseBatchDelimitedInput
 } from "./batch";
 import type { BatchBadCaseJsonlRecord, BatchQuestion } from "./types";
 
@@ -317,111 +315,3 @@ test("download name helpers 基于源文件名和扩展生成导出文件名", (
   expect(badCaseJsonlDownloadName("")).toBe("batch-bad-cases.jsonl");
 });
 
-test("normalizeBatchConcurrency 接受后端下发的合法并发数", () => {
-  expect(normalizeBatchConcurrency(1)).toBe(1);
-  expect(normalizeBatchConcurrency(3)).toBe(3);
-  expect(normalizeBatchConcurrency(10)).toBe(10);
-});
-
-test("normalizeBatchConcurrency 对缺失或非法值回退为串行", () => {
-  expect(normalizeBatchConcurrency(undefined)).toBe(1);
-  expect(normalizeBatchConcurrency(null)).toBe(1);
-  expect(normalizeBatchConcurrency(0)).toBe(1);
-  expect(normalizeBatchConcurrency(-2)).toBe(1);
-  expect(normalizeBatchConcurrency(2.5)).toBe(1);
-  expect(normalizeBatchConcurrency("3")).toBe(1);
-  expect(normalizeBatchConcurrency(999)).toBe(10);
-});
-
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((done) => {
-    resolve = done;
-  });
-  return { promise, resolve };
-}
-
-test("runWithConcurrency 在并发数为 1 时严格按顺序执行", async () => {
-  const events: string[] = [];
-  const gates = [deferred<void>(), deferred<void>(), deferred<void>()];
-
-  const running = runWithConcurrency(["a", "b", "c"], 1, async (item, index) => {
-    events.push(`start-${item}`);
-    await gates[index].promise;
-    events.push(`end-${item}`);
-    return item.toUpperCase();
-  });
-
-  await Promise.resolve();
-  expect(events).toEqual(["start-a"]);
-
-  gates[0].resolve();
-  await Promise.resolve();
-  gates[1].resolve();
-  await Promise.resolve();
-  gates[2].resolve();
-
-  expect(await running).toEqual(["A", "B", "C"]);
-  expect(events).toEqual([
-    "start-a",
-    "end-a",
-    "start-b",
-    "end-b",
-    "start-c",
-    "end-c"
-  ]);
-});
-
-test("runWithConcurrency 同时运行的任务数不超过并发上限", async () => {
-  const gates = new Map<string, ReturnType<typeof deferred<void>>>();
-  let inFlight = 0;
-  let maxInFlight = 0;
-
-  const running = runWithConcurrency(["a", "b", "c", "d"], 2, async (item) => {
-    inFlight += 1;
-    maxInFlight = Math.max(maxInFlight, inFlight);
-    const gate = deferred<void>();
-    gates.set(item, gate);
-    await gate.promise;
-    inFlight -= 1;
-    return item;
-  });
-
-  await Promise.resolve();
-  expect([...gates.keys()]).toEqual(["a", "b"]);
-
-  gates.get("a")!.resolve();
-  await Promise.resolve();
-  await Promise.resolve();
-  expect([...gates.keys()]).toEqual(["a", "b", "c"]);
-
-  gates.get("b")!.resolve();
-  gates.get("c")!.resolve();
-  await Promise.resolve();
-  await Promise.resolve();
-  gates.get("d")!.resolve();
-
-  expect(await running).toEqual(["a", "b", "c", "d"]);
-  expect(maxInFlight).toBe(2);
-});
-
-test("runWithConcurrency 结果按输入顺序返回且与完成顺序无关", async () => {
-  const gates = [deferred<void>(), deferred<void>(), deferred<void>()];
-
-  const running = runWithConcurrency([0, 1, 2], 3, async (item, index) => {
-    await gates[index].promise;
-    return `item-${item}`;
-  });
-
-  gates[2].resolve();
-  gates[0].resolve();
-  gates[1].resolve();
-
-  expect(await running).toEqual(["item-0", "item-1", "item-2"]);
-});
-
-test("runWithConcurrency 拒绝非法并发数", async () => {
-  await expect(runWithConcurrency(["a"], 0, async (item) => item)).rejects.toThrow(
-    "并发数必须是不小于 1 的整数"
-  );
-});

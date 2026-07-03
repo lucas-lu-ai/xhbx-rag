@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import jsonschema
+from agentscope._logging import logger as _agentscope_logger
 from agentscope._utils._common import _json_loads_with_repair
 from agentscope.credential import DashScopeCredential, OpenAICredential
 from agentscope.exception import ToolJSONDecodeError
@@ -44,6 +45,7 @@ _STRUCTURED_INSTRUCTION = (
     "by the user. Provide the fields directly as the tool arguments; do NOT "
     "wrap them in any extra key. DON'T do anything else.</system-reminder>"
 )
+_MODEL_RETRY_BODY_MAX_CHARS = 1200
 
 
 class SalesInsightGenerationError(RuntimeError):
@@ -133,6 +135,143 @@ class _SectionTaskFailure:
     error: str
 
 
+class _RetryDiagnosticMixin:
+    async def __call__(
+        self,
+        messages: list[Any],
+        tools: list[dict] | None = None,
+        tool_choice: ToolChoice | None = None,
+        **kwargs: Any,
+    ) -> object:
+        retryable = tuple(self._get_retryable_exceptions())
+        last_error: Exception | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                return await self._call_api(
+                    self.model,
+                    messages=messages,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    **kwargs,
+                )
+            except Exception as exc:
+                if not isinstance(exc, retryable):
+                    raise
+                last_error = exc
+                diagnostic = _format_model_retry_error(exc)
+                if attempt < self.max_retries:
+                    _agentscope_logger.warning(
+                        "Attempt %d failed for model %s: %s. "
+                        "retry diagnostic: %s. Retrying in %.1fs...",
+                        attempt + 1,
+                        self.model,
+                        str(exc),
+                        diagnostic,
+                        self.retry_delay,
+                    )
+                    await asyncio.sleep(self.retry_delay)
+                else:
+                    _agentscope_logger.warning(
+                        "All %d attempt(s) failed for model %s. "
+                        "retry diagnostic: %s",
+                        self.max_retries + 1,
+                        self.model,
+                        diagnostic,
+                    )
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError(
+            f"Failed to call model {self.model} after "
+            f"{self.max_retries + 1} retries.",
+        )
+
+
+class _RetryDiagnosticOpenAIChatModel(_RetryDiagnosticMixin, OpenAIChatModel):
+    pass
+
+
+class _RetryDiagnosticDashScopeChatModel(_RetryDiagnosticMixin, DashScopeChatModel):
+    pass
+
+
+def _format_model_retry_error(exc: Exception) -> str:
+    parts = [
+        f"type={exc.__class__.__name__}",
+        f"message={_safe_exception_message(exc)}",
+    ]
+    cause_chain = _format_exception_cause_chain(exc)
+    if cause_chain:
+        parts.append(f"cause={cause_chain}")
+    response = getattr(exc, "response", None)
+    if response is not None:
+        status_code = getattr(response, "status_code", None)
+        if status_code is not None:
+            parts.append(f"status={status_code}")
+        request_id = _response_request_id(response) or getattr(exc, "request_id", None)
+        if request_id:
+            parts.append(f"x-request-id={request_id}")
+        body = _response_body(response)
+        if body:
+            parts.append(f"body={body}")
+    return " ".join(parts)
+
+
+def _safe_exception_message(exc: BaseException) -> str:
+    message = str(exc).strip()
+    return message or repr(exc)
+
+
+def _format_exception_cause_chain(exc: BaseException) -> str:
+    causes: list[str] = []
+    seen: set[int] = set()
+    current = _next_exception_cause(exc)
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        causes.append(
+            f"{current.__class__.__name__}: {_safe_exception_message(current)}"
+        )
+        current = _next_exception_cause(current)
+    return " <- ".join(causes)
+
+
+def _next_exception_cause(exc: BaseException) -> BaseException | None:
+    if exc.__cause__ is not None:
+        return exc.__cause__
+    if not exc.__suppress_context__:
+        return exc.__context__
+    return None
+
+
+def _response_request_id(response: object) -> str:
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return ""
+    for key in ("x-request-id", "x-zhipu-request-id", "request-id"):
+        try:
+            value = headers.get(key)
+        except AttributeError:
+            value = None
+        if value:
+            return str(value)
+    return ""
+
+
+def _response_body(response: object) -> str:
+    body = getattr(response, "text", None)
+    if body is None:
+        content = getattr(response, "content", None)
+        if isinstance(content, bytes):
+            body = content.decode("utf-8", errors="replace")
+        elif content is not None:
+            body = str(content)
+    if not body:
+        return ""
+    text = str(body).replace("\n", "\\n").strip()
+    if len(text) > _MODEL_RETRY_BODY_MAX_CHARS:
+        return text[:_MODEL_RETRY_BODY_MAX_CHARS] + "...<truncated>"
+    return text
+
+
 class SalesInsightAgentScopeAgent:
     def __init__(
         self,
@@ -145,6 +284,8 @@ class SalesInsightAgentScopeAgent:
         retry_base_delay: float = 1.0,
         max_section_chars: int = DEFAULT_SECTION_MATERIAL_MAX_CHARS,
         enable_thinking: bool = True,
+        stream: bool = False,
+        compact_case_input: bool = False,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -157,12 +298,15 @@ class SalesInsightAgentScopeAgent:
             retry_attempts=retry_attempts,
             retry_base_delay=retry_base_delay,
             enable_thinking=enable_thinking,
+            stream=stream,
         )
         self.timeout = timeout
         self.retry_attempts = retry_attempts
         self.retry_base_delay = retry_base_delay
         self.max_section_chars = max_section_chars
         self.enable_thinking = enable_thinking
+        self.stream = stream
+        self.compact_case_input = compact_case_input
 
     def extract(self, *args: object) -> SectionSalesEvidence | CaseSalesInsightsSource:
         if len(args) == 1 and isinstance(args[0], SourceSection):
@@ -215,9 +359,10 @@ class SalesInsightAgentScopeAgent:
         case_name: str,
         evidences: list[SectionSalesEvidence],
     ) -> CaseSalesInsightsSource:
+        user_content = self._render_case_user_content(case_name, evidences)
         data = self._generate_structured(
             system_prompt=_CASE_SYSTEM_PROMPT,
-            user_content=_render_case_sales_evidence(case_name, evidences),
+            user_content=user_content,
             structured_model=CaseSalesInsightsSource,
         )
         data = _fill_blank_identity(data, "case_name", case_name)
@@ -228,13 +373,52 @@ class SalesInsightAgentScopeAgent:
         case_name: str,
         evidences: list[SectionSalesEvidence],
     ) -> CaseSalesInsightsSource:
+        user_content = self._render_case_user_content(case_name, evidences)
         data = await self._generate_structured_async(
             system_prompt=_CASE_SYSTEM_PROMPT,
-            user_content=_render_case_sales_evidence(case_name, evidences),
+            user_content=user_content,
             structured_model=CaseSalesInsightsSource,
         )
         data = _fill_blank_identity(data, "case_name", case_name)
         return CaseSalesInsightsSource.model_validate(data)
+
+    def case_model_input_trace_payload(
+        self,
+        case_name: str,
+        evidences: list[SectionSalesEvidence],
+    ) -> dict[str, Any]:
+        user_content = self._render_case_user_content(case_name, evidences)
+        schema_text = json.dumps(
+            _schema_of(CaseSalesInsightsSource),
+            ensure_ascii=False,
+            default=str,
+        )
+        return {
+            "case_name": case_name,
+            "model": self.model,
+            "stream": self.stream,
+            "compact": self.compact_case_input,
+            "evidence_count": len(evidences),
+            "system_prompt_chars": len(_CASE_SYSTEM_PROMPT),
+            "user_content_chars": len(user_content),
+            "structured_reminder_chars": len(_STRUCTURED_INSTRUCTION),
+            "tool_schema_chars": len(schema_text),
+            "tool_name": _STRUCTURED_FUNC_NAME,
+            "system_prompt": _CASE_SYSTEM_PROMPT,
+            "user_content": user_content,
+            "structured_reminder": _STRUCTURED_INSTRUCTION,
+        }
+
+    def _render_case_user_content(
+        self,
+        case_name: str,
+        evidences: list[SectionSalesEvidence],
+    ) -> str:
+        return _render_case_sales_evidence(
+            case_name,
+            evidences,
+            compact=self.compact_case_input,
+        )
 
     def _generate_structured(
         self,
@@ -282,6 +466,7 @@ class VisionImageDescriptionAgent:
         timeout: float = 90.0,
         retry_attempts: int = 5,
         retry_base_delay: float = 1.0,
+        stream: bool = False,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -294,7 +479,9 @@ class VisionImageDescriptionAgent:
             retry_attempts=retry_attempts,
             retry_base_delay=retry_base_delay,
             enable_thinking=False,
+            stream=stream,
         )
+        self.stream = stream
 
     def describe(
         self,
@@ -459,6 +646,12 @@ async def generate_case_sales_insights_async(
 
         all_sources = [source for section in sections for source in section.sources]
         case_agent = case_agent or section_agent  # type: ignore[assignment]
+        _emit_case_model_input_trace(
+            trace,
+            case_agent,
+            resolved_case_name,
+            evidences,
+        )
         raw_insights = await _extract_case_with_agent(
             case_agent,
             resolved_case_name,
@@ -505,15 +698,16 @@ def _build_dashscope_chat_model(
     retry_attempts: int,
     retry_base_delay: float,
     enable_thinking: bool,
+    stream: bool = False,
 ) -> DashScopeChatModel:
-    return DashScopeChatModel(
+    return _RetryDiagnosticDashScopeChatModel(
         credential=DashScopeCredential(api_key=api_key, base_url=base_url),
         model=model,
         parameters=DashScopeChatModel.Parameters(
             temperature=0,
             thinking_enable=enable_thinking,
         ),
-        stream=False,
+        stream=stream,
         max_retries=max(0, retry_attempts - 1),
         retry_delay=retry_base_delay,
         client_kwargs={"timeout": timeout},
@@ -529,13 +723,14 @@ def _build_structured_chat_model(
     retry_attempts: int,
     retry_base_delay: float,
     enable_thinking: bool,
+    stream: bool = False,
 ) -> OpenAIChatModel:
-    return OpenAIChatModel(
+    return _RetryDiagnosticOpenAIChatModel(
         credential=OpenAICredential(api_key=api_key, base_url=base_url),
         model=model,
         parameters=OpenAIChatModel.Parameters(temperature=0),
         formatter=OpenAIChatFormatter(),
-        stream=False,
+        stream=stream,
         max_retries=max(0, retry_attempts - 1),
         retry_delay=retry_base_delay,
         client_kwargs={"timeout": timeout},
@@ -977,7 +1172,25 @@ def _numbered_source_text(text: str) -> str:
 def _render_case_sales_evidence(
     case_name: str,
     evidences: list[SectionSalesEvidence],
+    *,
+    compact: bool = False,
 ) -> str:
+    if compact:
+        compact_evidences = [
+            _compact_section_sales_evidence(evidence) for evidence in evidences
+        ]
+        return "\n\n".join(
+            [
+                f"案例：{case_name}",
+                (
+                    "以下是精简后的章节销售证据：已移除每条引用中的长上下文、"
+                    "原文摘录和完整路径字段，但保留 filename、source_id、"
+                    "quote、locator 等可回填证据字段。"
+                ),
+                json.dumps(compact_evidences, ensure_ascii=False, indent=2),
+            ]
+        )
+
     blocks = [f"案例：{case_name}", "以下是该案例下各章节的销售证据："]
     for evidence in evidences:
         blocks.append(
@@ -986,6 +1199,110 @@ def _render_case_sales_evidence(
             f"{json.dumps(evidence.model_dump(mode='json'), ensure_ascii=False, indent=2)}"
         )
     return "\n\n".join(blocks)
+
+
+def _compact_section_sales_evidence(evidence: SectionSalesEvidence) -> dict[str, Any]:
+    return _without_empty_values(
+        {
+            "section_name": evidence.section_name,
+            "customer_signals": [
+                _compact_customer_signal(item) for item in evidence.customer_signals
+            ],
+            "sales_actions": [
+                _compact_sales_action(item) for item in evidence.sales_actions
+            ],
+            "script_quotes": [
+                _compact_script_quote(item) for item in evidence.script_quotes
+            ],
+            "objections": [
+                _compact_objection(item) for item in evidence.objections
+            ],
+            "strategy_candidates": [
+                _compact_strategy_candidate(item)
+                for item in evidence.strategy_candidates
+            ],
+        }
+    )
+
+
+def _compact_customer_signal(item: Any) -> dict[str, Any]:
+    return _without_empty_values(
+        {
+            "signal": item.signal,
+            "evidence": item.evidence,
+            "source_refs": _compact_source_refs(item.source_refs),
+        }
+    )
+
+
+def _compact_sales_action(item: Any) -> dict[str, Any]:
+    return _without_empty_values(
+        {
+            "action": item.action,
+            "stage_hint": item.stage_hint,
+            "evidence": item.evidence,
+            "source_refs": _compact_source_refs(item.source_refs),
+        }
+    )
+
+
+def _compact_script_quote(item: Any) -> dict[str, Any]:
+    return _without_empty_values(
+        {
+            "quote": item.quote,
+            "speaker": item.speaker,
+            "stage_hint": item.stage_hint,
+            "scenario_hint": item.scenario_hint,
+            "source_refs": _compact_source_refs(item.source_refs),
+        }
+    )
+
+
+def _compact_objection(item: Any) -> dict[str, Any]:
+    return _without_empty_values(
+        {
+            "objection": item.objection,
+            "response_evidence": item.response_evidence,
+            "source_refs": _compact_source_refs(item.source_refs),
+        }
+    )
+
+
+def _compact_strategy_candidate(item: Any) -> dict[str, Any]:
+    return _without_empty_values(
+        {
+            "name": item.name,
+            "reason": item.reason,
+            "confidence": item.confidence,
+            "inferred": item.inferred,
+            "source_refs": _compact_source_refs(item.source_refs),
+        }
+    )
+
+
+def _compact_source_refs(refs: list[EvidenceRef]) -> list[dict[str, Any]]:
+    return [
+        _without_empty_values(
+            {
+                "section_name": ref.section_name,
+                "source_id": ref.source_id,
+                "source_type": ref.source_type,
+                "filename": ref.filename,
+                "quote": ref.quote,
+                "locator": ref.locator,
+                "locator_confidence": ref.locator_confidence,
+            }
+        )
+        for ref in refs
+    ]
+
+
+def _without_empty_values(data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in data.items()
+        if value is not None and value != "" and value != [] and value != {}
+    }
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -1127,6 +1444,21 @@ async def _extract_case_with_agent(
     if extract_async is not None:
         return await _maybe_await(extract_async(case_name, evidences))
     return await _maybe_await(case_agent.extract(case_name, evidences))
+
+
+def _emit_case_model_input_trace(
+    trace: TraceSink | None,
+    case_agent: _CaseAgent,
+    case_name: str,
+    evidences: list[SectionSalesEvidence],
+) -> None:
+    if trace is None:
+        return
+    payload_builder = getattr(case_agent, "case_model_input_trace_payload", None)
+    if payload_builder is None:
+        return
+    payload = payload_builder(case_name, evidences)
+    emit_trace(trace, "generate.case_model_input", payload)
 
 
 def _extract_section_by_source(

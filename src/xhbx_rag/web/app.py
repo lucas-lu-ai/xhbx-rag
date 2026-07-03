@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,6 +11,15 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .bad_cases import save_bad_case
+from .batch_routes import router as batch_router
+from .batch_runner import BatchRunner
+from .batch_store import BatchRunStore
+from .safe_errors import (
+    MISSING_CONFIG_ERROR_PREFIX,
+    SAFE_ANSWER_ERROR_MESSAGES,
+    answer_exception_detail,
+    is_safe_answer_error,
+)
 from .services import (
     LOCAL_INDEX_UNAVAILABLE_ERROR,
     REQUIRED_CONFIG_KEYS,
@@ -21,19 +31,16 @@ from .source_paths import SourcePathError, reveal_in_finder
 
 logger = logging.getLogger(__name__)
 
-_SAFE_ANSWER_ERROR_MESSAGES = {
-    "问题不能为空",
-    "top_n 必须在 1 到 100 之间",
-    "top_k 必须在 1 到 20 之间",
-    "top_k 不能大于 top_n",
-    "配置解析失败，请检查 .env 中的数值配置。",
-}
+# 兼容旧下划线名，安全错误归一逻辑已迁移至 safe_errors 模块。
+_SAFE_ANSWER_ERROR_MESSAGES = SAFE_ANSWER_ERROR_MESSAGES
+_MISSING_CONFIG_ERROR_PREFIX = MISSING_CONFIG_ERROR_PREFIX
+_is_safe_answer_error = is_safe_answer_error
+_answer_exception_detail = answer_exception_detail
 
 SOURCE_REVEAL_CLIENT_ERROR_DETAIL = (
     "无法显示引用文件，请确认文件位于 data 目录内且仍然存在。"
 )
 BAD_CASE_SAVE_ERROR_DETAIL = "无法保存 bad case"
-_MISSING_CONFIG_ERROR_PREFIX = "缺少必要环境变量:"
 _SAFE_CONFIG_KEYS = set(REQUIRED_CONFIG_KEYS)
 _ALLOWED_BAD_CASE_ISSUE_TYPES = {
     "usable",
@@ -70,27 +77,6 @@ _ALLOWED_BAD_CASE_PROBLEM_TAGS = {
     "other",
 }
 _ALLOWED_EVIDENCE_FEEDBACK_JUDGEMENTS = {"should_use", "should_not_use"}
-
-
-def _is_safe_answer_error(message: str) -> bool:
-    if message in _SAFE_ANSWER_ERROR_MESSAGES:
-        return True
-    if not message.startswith(_MISSING_CONFIG_ERROR_PREFIX):
-        return False
-
-    raw_keys = message.removeprefix(_MISSING_CONFIG_ERROR_PREFIX)
-    keys = [item.strip() for item in raw_keys.split(",")]
-    return bool(keys) and all(key in _SAFE_CONFIG_KEYS for key in keys)
-
-
-def _answer_exception_detail(exc: Exception) -> str:
-    if isinstance(exc, ValueError):
-        message = str(exc)
-        if message == LOCAL_INDEX_UNAVAILABLE_ERROR:
-            return message
-        if _is_safe_answer_error(message):
-            return message
-    return "问答服务暂时不可用"
 
 
 class AnswerRequest(BaseModel):
@@ -187,15 +173,51 @@ class BadCaseRequest(BaseModel):
         return self
 
 
-def create_app() -> FastAPI:
-    web_app = FastAPI(title="xhbx-rag Web")
+def create_app(
+    batch_store: Any | None = None,
+    batch_runner: Any | None = None,
+) -> FastAPI:
+    @asynccontextmanager
+    async def lifespan(app_instance: FastAPI) -> AsyncIterator[None]:
+        runner = None
+        try:
+            store = getattr(app_instance.state, "batch_store", None)
+            if store is None:
+                store = BatchRunStore()
+                app_instance.state.batch_store = store
+            runner = getattr(app_instance.state, "batch_runner", None)
+            if runner is None:
+                runner = BatchRunner(store=store)
+                app_instance.state.batch_runner = runner
+            # 先恢复中断状态，再启动 worker，避免旧的 running 状态被并发读到。
+            store.recover_after_restart()
+            runner.start()
+        except Exception:
+            # 批量子系统初始化失败不应拖垮单问问答；清空 state 让批量路由
+            # 一致返回 500「批量任务存储不可用」，其余功能照常启动。
+            logger.exception("批量执行子系统初始化失败，Web 将在无批量能力下继续启动")
+            app_instance.state.batch_store = None
+            app_instance.state.batch_runner = None
+            runner = None
+        try:
+            yield
+        finally:
+            if runner is not None:
+                runner.stop()
+
+    web_app = FastAPI(title="xhbx-rag Web", lifespan=lifespan)
     web_app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
         allow_credentials=False,
-        allow_methods=["GET", "POST"],
+        allow_methods=["GET", "POST", "DELETE"],
         allow_headers=["*"],
     )
+    # 注入的 store/runner 直接放进 app.state，不依赖 lifespan（便于测试）。
+    if batch_store is not None:
+        web_app.state.batch_store = batch_store
+    if batch_runner is not None:
+        web_app.state.batch_runner = batch_runner
 
     @web_app.get("/api/status")
     def status() -> dict[str, Any]:
@@ -257,6 +279,8 @@ def create_app() -> FastAPI:
             logger.exception("Bad case route failed")
             raise HTTPException(status_code=500, detail=BAD_CASE_SAVE_ERROR_DETAIL) from exc
         return {"ok": True, "bad_case_id": result["bad_case_id"]}
+
+    web_app.include_router(batch_router)
 
     return web_app
 

@@ -12,6 +12,7 @@ from .models import (
     StructuredCaseKnowledge,
 )
 from .normalizer import make_case_id
+from .tagging import tag_chunk
 
 
 def _lines(items: Iterable[str]) -> list[str]:
@@ -221,4 +222,4 @@ def build_chunks(knowledge: StructuredCaseKnowledge) -> list[RagChunk]:
         chunks.append(
             _objection_chunk(knowledge.case_id, knowledge.case_name, item, index)
         )
-    return chunks
+    return [tag_chunk(chunk) for chunk in chunks]

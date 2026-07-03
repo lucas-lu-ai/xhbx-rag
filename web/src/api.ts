@@ -4,6 +4,13 @@ import type {
   AnswerStreamEvent,
   BadCaseRequest,
   BadCaseResponse,
+  BatchRowBadCaseRequest,
+  BatchRunDetail,
+  BatchRunListResponse,
+  BatchRunProgress,
+  BatchRunSummary,
+  CreateBatchRunRequest,
+  OkResponse,
   RevealRequest,
   RevealResponse,
   StatusResponse
@@ -145,6 +152,104 @@ export function submitBadCase(
   );
 }
 
+export function createBatchRun(
+  request: CreateBatchRunRequest,
+  options: ApiOptions = {}
+): Promise<BatchRunSummary> {
+  return requestJson<BatchRunSummary>(
+    "/api/batch-runs",
+    {
+      method: "POST",
+      body: JSON.stringify(request)
+    },
+    options
+  );
+}
+
+export function listBatchRuns(
+  options: ApiOptions = {}
+): Promise<BatchRunListResponse> {
+  return requestJson<BatchRunListResponse>(
+    "/api/batch-runs",
+    { method: "GET" },
+    options
+  );
+}
+
+export function getBatchRunProgress(
+  runId: string,
+  options: ApiOptions = {}
+): Promise<BatchRunProgress> {
+  return requestJson<BatchRunProgress>(
+    `/api/batch-runs/${encodeURIComponent(runId)}/progress`,
+    { method: "GET" },
+    options
+  );
+}
+
+export function getBatchRunDetail(
+  runId: string,
+  { includeTable = false }: { includeTable?: boolean } = {},
+  options: ApiOptions = {}
+): Promise<BatchRunDetail> {
+  const query = includeTable ? "?include_table=true" : "";
+  return requestJson<BatchRunDetail>(
+    `/api/batch-runs/${encodeURIComponent(runId)}${query}`,
+    { method: "GET" },
+    options
+  );
+}
+
+export function retryBatchRow(
+  runId: string,
+  rowIndex: number,
+  options: ApiOptions = {}
+): Promise<OkResponse> {
+  return requestJson<OkResponse>(
+    `/api/batch-runs/${encodeURIComponent(runId)}/rows/${rowIndex}/retry`,
+    { method: "POST" },
+    options
+  );
+}
+
+export function resumeBatchRun(
+  runId: string,
+  options: ApiOptions = {}
+): Promise<OkResponse> {
+  return requestJson<OkResponse>(
+    `/api/batch-runs/${encodeURIComponent(runId)}/resume`,
+    { method: "POST" },
+    options
+  );
+}
+
+export function deleteBatchRun(
+  runId: string,
+  options: ApiOptions = {}
+): Promise<OkResponse> {
+  return requestJson<OkResponse>(
+    `/api/batch-runs/${encodeURIComponent(runId)}`,
+    { method: "DELETE" },
+    options
+  );
+}
+
+export function saveBatchRowBadCase(
+  runId: string,
+  rowIndex: number,
+  request: BatchRowBadCaseRequest,
+  options: ApiOptions = {}
+): Promise<BadCaseResponse> {
+  return requestJson<BadCaseResponse>(
+    `/api/batch-runs/${encodeURIComponent(runId)}/rows/${rowIndex}/bad-case`,
+    {
+      method: "POST",
+      body: JSON.stringify(request)
+    },
+    options
+  );
+}
+
 async function requestJson<T>(
   path: string,
   init: RequestInit,
@@ -191,6 +296,23 @@ async function parseResponseBody(response: Response): Promise<unknown> {
 function responseDetail(body: unknown, status: number): string {
   if (isObject(body) && typeof body.detail === "string") {
     return body.detail;
+  }
+  // FastAPI 422 的 detail 是 pydantic 错误列表，提取首条错误为可读中文提示。
+  if (isObject(body) && Array.isArray(body.detail)) {
+    const first = body.detail[0];
+    if (isObject(first) && typeof first.msg === "string") {
+      const loc = Array.isArray(first.loc)
+        ? first.loc
+            .filter(
+              (part): part is string | number =>
+                typeof part === "string" || typeof part === "number"
+            )
+            .join(".")
+        : "";
+      return loc
+        ? `参数校验失败：${loc} - ${first.msg}`
+        : `参数校验失败：${first.msg}`;
+    }
   }
   return `请求失败 (${status})`;
 }

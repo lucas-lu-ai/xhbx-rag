@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from queue import Queue
 from pathlib import Path
-from threading import Thread
+from threading import Lock, Thread
 from typing import Any, Iterator, Mapping
 
 from xhbx_rag.answer import AnswerAgent, answer_query
@@ -48,6 +48,8 @@ DEFAULT_DOCKER_BATCH_CONCURRENCY = 3
 MAX_BATCH_CONCURRENCY = 10
 # 数据目录固定位于项目根下的 data/，展示相对路径即可，不暴露绝对路径。
 DATA_DIR_DISPLAY = "data"
+# Milvus Lite 是单进程文件库：进程内所有问答（单问 + 批量行）共用一把锁串行化。
+_LITE_ANSWER_LOCK = Lock()
 
 
 def get_status() -> dict[str, Any]:
@@ -85,13 +87,13 @@ def get_status() -> dict[str, Any]:
         "milvus_target": _milvus_target(config),
         "milvus_lite_path": str(config.milvus_lite_path),
         "milvus_collection": config.milvus_collection,
-        "batch_concurrency": _batch_concurrency(config),
+        "batch_concurrency": batch_concurrency(config),
         "config": {key: True for key in REQUIRED_CONFIG_KEYS},
         "errors": [],
     }
 
 
-def _batch_concurrency(config: RetrievalConfig) -> int:
+def batch_concurrency(config: RetrievalConfig) -> int:
     if config.milvus_mode != "docker":
         return SERIAL_BATCH_CONCURRENCY
 
@@ -103,6 +105,10 @@ def _batch_concurrency(config: RetrievalConfig) -> int:
     except ValueError:
         return DEFAULT_DOCKER_BATCH_CONCURRENCY
     return max(SERIAL_BATCH_CONCURRENCY, min(MAX_BATCH_CONCURRENCY, parsed))
+
+
+# 兼容旧名，避免存量调用点/测试破坏。
+_batch_concurrency = batch_concurrency
 
 
 def answer_question(
@@ -125,6 +131,36 @@ def answer_question(
     except ValueError as exc:
         raise ValueError(SAFE_CONFIG_PARSE_ERROR) from exc
 
+    if config.milvus_mode == "lite":
+        # Lite 模式下本地索引不支持并发打开，从资源构建到关闭全程持锁。
+        with _LITE_ANSWER_LOCK:
+            return _answer_question_with_config(
+                config=config,
+                query=stripped_query,
+                top_n=top_n,
+                top_k=top_k,
+                project_root=project_root,
+                trace=trace,
+            )
+    return _answer_question_with_config(
+        config=config,
+        query=stripped_query,
+        top_n=top_n,
+        top_k=top_k,
+        project_root=project_root,
+        trace=trace,
+    )
+
+
+def _answer_question_with_config(
+    *,
+    config: RetrievalConfig,
+    query: str,
+    top_n: int,
+    top_k: int,
+    project_root: Path | None = None,
+    trace: TraceSink | None = None,
+) -> dict[str, Any]:
     resources: list[object] = []
     try:
         query_agent = QueryUnderstandingAgent(
@@ -160,7 +196,7 @@ def answer_question(
         resources.append(raw_answer_agent)
         answer_agent = _RecordingAnswerAgent(raw_answer_agent)
         result = answer_query(
-            query=stripped_query,
+            query=query,
             query_agent=query_agent,
             embedding_client=embedding_client,
             store=store,

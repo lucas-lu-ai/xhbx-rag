@@ -228,3 +228,88 @@ export type BatchRunState = {
   running: boolean;
   active_question_id?: string;
 };
+
+export type BatchRunStatus = "pending" | "running" | "completed" | "interrupted";
+
+export type BatchRunSummary = {
+  run_id: string;
+  title: string;
+  status: BatchRunStatus;
+  source_label: string;
+  source_format: BatchSourceFormat;
+  question_total: number;
+  question_done: number;
+  question_failed: number;
+  created_at: string;
+  updated_at: string;
+};
+
+export type BatchRunListResponse = {
+  runs: BatchRunSummary[];
+};
+
+export type BatchRunQuestionProgress = {
+  row_index: number;
+  status: BatchQuestionStatus;
+  updated_at: string;
+};
+
+export type BatchRunProgress = {
+  run_id: string;
+  status: BatchRunStatus;
+  question_total: number;
+  question_done: number;
+  question_failed: number;
+  updated_at: string;
+  questions: BatchRunQuestionProgress[];
+};
+
+export type BatchRunQuestionDetail = {
+  row_index: number;
+  query: string;
+  input_answer: string;
+  top_n: number;
+  top_k: number;
+  status: BatchQuestionStatus;
+  response: AnswerResponse | null;
+  error: string | null;
+  bad_case: Record<string, unknown> | null;
+  updated_at: string;
+};
+
+export type BatchRunDetail = BatchRunSummary & {
+  questions: BatchRunQuestionDetail[];
+  headers?: string[];
+  rows?: string[][];
+};
+
+export type CreateBatchRunQuestion = {
+  row_index: number;
+  query: string;
+  input_answer: string;
+  top_n: number;
+  top_k: number;
+};
+
+export type CreateBatchRunRequest = {
+  title: string;
+  source_label: string;
+  source_format: BatchSourceFormat;
+  headers: string[];
+  rows: string[][];
+  questions: CreateBatchRunQuestion[];
+};
+
+export type BatchRowBadCaseRequest = BadCaseRequest & {
+  input_answer: string;
+  batch_source_label: string;
+};
+
+export type OkResponse = {
+  ok: boolean;
+};
+
+export type SessionSelection = {
+  kind: "chat" | "batch";
+  id: string;
+};

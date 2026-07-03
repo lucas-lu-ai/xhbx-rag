@@ -16,6 +16,8 @@ def test_milvus_chunk_record_flattens_metadata_and_json_fields() -> None:
             "stage": "售前",
             "scenario": "客户抗拒保险",
             "strategy_names": ["风险唤醒"],
+            "knowledge_type": "场景话术",
+            "tag_paths": ["销售技能/沟通谈判/保险理念沟通"],
         },
         citations=[EvidenceRef(section_name="第1节", quote="原文")],
         source_file="case.sales_insights.json",
@@ -30,6 +32,8 @@ def test_milvus_chunk_record_flattens_metadata_and_json_fields() -> None:
     assert row["chunk_type"] == "script"
     assert row["stage"] == "售前"
     assert '"strategy_names"' in row["metadata_json"]
+    assert '"knowledge_type": "场景话术"' in row["metadata_json"]
+    assert "销售技能/沟通谈判/保险理念沟通" in row["metadata_json"]
     assert '"section_name"' in row["citations_json"]
 
 

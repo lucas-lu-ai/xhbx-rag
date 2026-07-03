@@ -1,3 +1,4 @@
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -817,3 +818,78 @@ def test_answer_question_sanitizes_local_index_open_failure(monkeypatch) -> None
     assert str(exc_info.value) == LOCAL_INDEX_ERROR
     assert "/Users/milan" not in str(exc_info.value)
     assert "secret-token" not in str(exc_info.value)
+
+
+def test_batch_concurrency_public_name_with_legacy_alias(monkeypatch) -> None:
+    monkeypatch.setattr(
+        services, "load_env_values", lambda: {"WEB_BATCH_CONCURRENCY": "5"}
+    )
+    docker = _fake_config()
+    docker.milvus_mode = "docker"
+
+    assert services._batch_concurrency is services.batch_concurrency
+    assert services.batch_concurrency(_fake_config()) == 1
+    assert services.batch_concurrency(docker) == 5
+
+
+def test_answer_question_holds_lite_lock_during_execution(monkeypatch) -> None:
+    _install_rag_stubs(monkeypatch)
+    observed = {}
+
+    def fake_answer_query(**kwargs):
+        observed["locked"] = services._LITE_ANSWER_LOCK.locked()
+        return {"answer": "回答", "citations": [], "evidence_count": 0}
+
+    monkeypatch.setattr(services, "answer_query", fake_answer_query)
+
+    services.answer_question(query="q", top_n=20, top_k=5)
+
+    assert observed["locked"] is True
+    assert services._LITE_ANSWER_LOCK.locked() is False
+
+
+def test_answer_question_skips_lite_lock_for_docker_mode(monkeypatch) -> None:
+    _install_rag_stubs(monkeypatch)
+
+    def docker_config():
+        config = _fake_config()
+        config.milvus_mode = "docker"
+        return config
+
+    monkeypatch.setattr(services.RetrievalConfig, "from_env", docker_config)
+    observed = {}
+
+    def fake_answer_query(**kwargs):
+        observed["locked"] = services._LITE_ANSWER_LOCK.locked()
+        return {"answer": "回答", "citations": [], "evidence_count": 0}
+
+    monkeypatch.setattr(services, "answer_query", fake_answer_query)
+
+    services.answer_question(query="q", top_n=20, top_k=5)
+
+    assert observed["locked"] is False
+
+
+def test_answer_question_serializes_lite_calls(monkeypatch) -> None:
+    _install_rag_stubs(monkeypatch)
+    entered = threading.Event()
+
+    def fake_answer_query(**kwargs):
+        entered.set()
+        return {"answer": "回答", "citations": [], "evidence_count": 0}
+
+    monkeypatch.setattr(services, "answer_query", fake_answer_query)
+
+    services._LITE_ANSWER_LOCK.acquire()
+    worker = threading.Thread(
+        target=lambda: services.answer_question(query="q", top_n=20, top_k=5),
+        daemon=True,
+    )
+    try:
+        worker.start()
+        # 主线程持锁期间，lite 模式的问答不应进入执行阶段。
+        assert entered.wait(0.2) is False
+    finally:
+        services._LITE_ANSWER_LOCK.release()
+    worker.join(timeout=5)
+    assert entered.is_set() is True

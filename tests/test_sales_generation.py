@@ -10,9 +10,13 @@ from agentscope.model import ChatResponse
 from xhbx_rag.models import (
     CaseSalesInsightsSource,
     CaseSalesScript,
+    CustomerSignal,
     EvidenceRef,
+    ObjectionEvidence,
     SalesAction,
     SectionSalesEvidence,
+    ScriptQuote,
+    StrategyCandidate,
 )
 from xhbx_rag.sales_generation import (
     generate_case_sales_insights,
@@ -21,9 +25,16 @@ from xhbx_rag.sales_generation import (
 from xhbx_rag.sales_generation import (
     SalesInsightAgentScopeAgent,
     VisionImageDescriptionAgent,
+    _build_dashscope_chat_model,
+    _build_structured_chat_model,
     _call_agent_scope_structured_output,
+    _format_model_retry_error,
     _render_section_material,
+    _RetryDiagnosticDashScopeChatModel,
+    _RetryDiagnosticOpenAIChatModel,
 )
+from agentscope.credential import OpenAICredential
+from xhbx_rag.observability import MemoryTraceSink
 from xhbx_rag.source_loader import ParsedEmbeddedImage, ParsedSourceFile, SourceSection
 
 
@@ -79,6 +90,31 @@ class _SequenceStructuredToolChatModel:
             ],
             is_last=True,
         )
+
+
+class _RetryableDiagnosticChatModel(_RetryDiagnosticOpenAIChatModel):
+    @classmethod
+    def _get_retryable_exceptions(cls):
+        return (RuntimeError,)
+
+    async def _call_api(self, model_name, messages, **kwargs):
+        if not hasattr(self, "attempt_count"):
+            self.attempt_count = 0
+        self.attempt_count += 1
+        if self.attempt_count == 1:
+            cause = ValueError("tcp reset by peer")
+            raise RuntimeError("Connection error.") from cause
+        return ChatResponse(content=[TextBlock(text="ok")], is_last=True)
+
+
+class _FakeHttpResponse:
+    status_code = 502
+    headers = {"x-request-id": "req_123", "content-type": "application/json"}
+    text = '{"error":"upstream gateway closed"}'
+
+
+class _FakeHttpStatusError(Exception):
+    response = _FakeHttpResponse()
 
 
 class _FakeSectionAgent:
@@ -207,6 +243,72 @@ def test_sales_insight_agentscope_agent_uses_structured_tool_call() -> None:
     assert "MUST" in call["messages"][1].get_text_content()
 
 
+def test_retry_diagnostic_model_logs_exception_type_and_cause(monkeypatch) -> None:
+    logs: list[str] = []
+
+    def capture_warning(message, *args):
+        logs.append(message % args)
+
+    from xhbx_rag import sales_generation
+
+    monkeypatch.setattr(sales_generation._agentscope_logger, "warning", capture_warning)
+    model = _RetryableDiagnosticChatModel(
+        credential=OpenAICredential(api_key="key", base_url="https://api.example.com/v1"),
+        model="chat-model",
+        max_retries=1,
+        retry_delay=0,
+    )
+
+    response = asyncio.run(model([]))
+
+    assert response.content[0].text == "ok"
+    assert model.attempt_count == 2
+    assert "retry diagnostic" in logs[0]
+    assert "RuntimeError" in logs[0]
+    assert "Connection error." in logs[0]
+    assert "ValueError: tcp reset by peer" in logs[0]
+
+
+def test_format_model_retry_error_includes_http_response_details() -> None:
+    diagnostic = _format_model_retry_error(_FakeHttpStatusError("server failed"))
+
+    assert "FakeHttpStatusError" in diagnostic
+    assert "server failed" in diagnostic
+    assert "status=502" in diagnostic
+    assert "x-request-id=req_123" in diagnostic
+    assert "body={\"error\":\"upstream gateway closed\"}" in diagnostic
+
+
+def test_model_builders_use_retry_diagnostic_models() -> None:
+    structured = _build_structured_chat_model(
+        base_url="https://api.example.com/v1",
+        api_key="key",
+        model="chat-model",
+        timeout=10,
+        retry_attempts=2,
+        retry_base_delay=0.25,
+        enable_thinking=True,
+        stream=True,
+    )
+    vision = _build_dashscope_chat_model(
+        base_url="https://dashscope.example.com/compatible-mode/v1",
+        api_key="key",
+        model="vision-model",
+        timeout=10,
+        retry_attempts=2,
+        retry_base_delay=0.25,
+        enable_thinking=False,
+        stream=True,
+    )
+
+    assert isinstance(structured, _RetryDiagnosticOpenAIChatModel)
+    assert isinstance(vision, _RetryDiagnosticDashScopeChatModel)
+    assert structured.max_retries == 1
+    assert vision.max_retries == 1
+    assert structured.stream is True
+    assert vision.stream is True
+
+
 def test_sales_insight_agent_prompt_includes_line_numbers_for_source_refs() -> None:
     chat_model = _FakeStructuredToolChatModel(
         {
@@ -257,6 +359,133 @@ def test_sales_insight_agent_prompt_includes_line_numbers_for_source_refs() -> N
     assert "line_start/line_end" in user_text
     ref = evidence.sales_actions[0].source_refs[0]
     assert ref.locator["line_start"] == 2
+
+
+def test_sales_insight_agent_can_compact_case_input() -> None:
+    chat_model = _FakeStructuredToolChatModel(
+        {"case_name": "案例A", "case_summary": "摘要"}
+    )
+    agent = SalesInsightAgentScopeAgent(
+        base_url="https://api.example.com/v1",
+        api_key="secret",
+        model="chat-model",
+        chat_model=chat_model,
+        retry_base_delay=0,
+        compact_case_input=True,
+    )
+    long_context = "上下文" * 300
+    evidence = SectionSalesEvidence(
+        case_name="案例A",
+        section_name="第1节",
+        customer_signals=[
+            CustomerSignal(
+                signal="客户担心企业资产传承",
+                evidence="客户提到孩子接班和资产安全",
+                source_refs=[
+                    EvidenceRef(
+                        section_name="第1节",
+                        source_id="txt:a.txt",
+                        source_type="txt",
+                        filename="a.txt",
+                        source_path="案例A/第1节/a.txt",
+                        quote="孩子接班和资产安全",
+                        context=long_context,
+                        source_excerpt=long_context,
+                        locator={"line_start": 7, "line_end": 8},
+                        locator_confidence="exact",
+                    )
+                ],
+            )
+        ],
+        sales_actions=[
+            SalesAction(
+                action="用财富观念唤醒传承需求",
+                stage_hint="需求唤醒",
+                evidence="销售引导客户区分企业资产和家庭资产",
+            )
+        ],
+        script_quotes=[
+            ScriptQuote(
+                quote="先把企业资产和家庭资产分开看",
+                speaker="销售",
+                stage_hint="需求诊断",
+            )
+        ],
+        objections=[
+            ObjectionEvidence(
+                objection="客户觉得保险收益不高",
+                response_evidence="回应保险更看重确定性和传承安排",
+            )
+        ],
+        strategy_candidates=[
+            StrategyCandidate(
+                name="财富观念唤醒",
+                reason="先建立资产隔离与传承认知",
+                confidence="high",
+                inferred=False,
+            )
+        ],
+    )
+
+    agent.extract_case("案例A", [evidence])
+
+    user_text = chat_model.calls[0]["messages"][1].get_text_content()
+    assert "精简后的章节销售证据" in user_text
+    assert "客户担心企业资产传承" in user_text
+    assert "用财富观念唤醒传承需求" in user_text
+    assert "先把企业资产和家庭资产分开看" in user_text
+    assert "财富观念唤醒" in user_text
+    assert '"line_start": 7' in user_text
+    assert '"quote": "孩子接班和资产安全"' in user_text
+    assert "context" not in user_text
+    assert "source_excerpt" not in user_text
+    assert long_context not in user_text
+
+
+def test_generate_case_sales_insights_traces_final_case_model_input(tmp_path) -> None:
+    case_dir = tmp_path / "案例A"
+    section_dir = case_dir / "第1节"
+    section_dir.mkdir(parents=True)
+    (section_dir / "a.txt").write_text("客户关注预算", encoding="utf-8")
+    chat_model = _FakeStructuredToolChatModel(
+        {"case_name": "案例A", "case_summary": "预算相关摘要"}
+    )
+    case_agent = SalesInsightAgentScopeAgent(
+        base_url="https://api.example.com/v1",
+        api_key="secret",
+        model="chat-model",
+        chat_model=chat_model,
+        retry_base_delay=0,
+        compact_case_input=True,
+    )
+    trace = MemoryTraceSink()
+
+    result = generate_case_sales_insights(
+        case_dir=case_dir,
+        output_dir=tmp_path / "out",
+        section_agent=_FakeSectionAgent(),
+        case_agent=case_agent,
+        trace=trace,
+    )
+
+    assert result.status == "ok"
+    input_events = [
+        event for event in trace.events if event.step == "generate.case_model_input"
+    ]
+    assert len(input_events) == 1
+    payload = input_events[0].payload
+    assert payload["case_name"] == "案例A"
+    assert payload["evidence_count"] == 1
+    assert payload["compact"] is True
+    assert payload["model"] == "chat-model"
+    assert payload["stream"] is False
+    assert "案例级销售洞察专家" in payload["system_prompt"]
+    assert "精简后的章节销售证据" in payload["user_content"]
+    assert "识别预算上限" in payload["user_content"]
+    assert payload["user_content_chars"] == len(payload["user_content"])
+    model_user_text = chat_model.calls[0]["messages"][1].get_text_content()
+    assert payload["user_content"] in model_user_text
+    assert payload["structured_reminder"] in model_user_text
 
 
 def test_sales_insight_agentscope_agent_unwraps_nested_structured_output() -> None:

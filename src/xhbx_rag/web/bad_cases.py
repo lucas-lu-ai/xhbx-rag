@@ -39,13 +39,14 @@ def save_bad_case(
     payload: Mapping[str, Any],
     *,
     project_root: Path | None = None,
+    bad_case_id: str | None = None,
 ) -> dict[str, Any]:
     root = project_root or project_root_from_module()
     path = root / BAD_CASES_RELATIVE_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
 
     record = {
-        "bad_case_id": f"bad-{uuid4().hex}",
+        "bad_case_id": bad_case_id or f"bad-{uuid4().hex}",
         "created_at": datetime.now(UTC).isoformat(),
         **_with_chinese_labels(payload),
     }

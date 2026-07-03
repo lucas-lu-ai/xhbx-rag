@@ -62,6 +62,16 @@ def _build_parser() -> argparse.ArgumentParser:
         default=3,
         help="并发生成章节 sales_evidence 的任务数，默认 3",
     )
+    generate_parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="以流式方式调用大模型，便于规避长请求的网关空闲超时",
+    )
+    generate_parser.add_argument(
+        "--compact-case-input",
+        action="store_true",
+        help="整案汇总时使用精简后的章节证据，减少最终汇总请求长度",
+    )
     thinking_group = generate_parser.add_mutually_exclusive_group()
     generate_parser.set_defaults(enable_thinking=True)
     thinking_group.add_argument(
@@ -214,6 +224,8 @@ def _cmd_generate_insights(args: argparse.Namespace) -> int:
         retry_base_delay=args.retry_base_delay,
         max_section_chars=args.max_section_chars,
         enable_thinking=args.enable_thinking,
+        stream=args.stream,
+        compact_case_input=args.compact_case_input,
     )
     vision_agent = (
         VisionImageDescriptionAgent(
@@ -223,6 +235,7 @@ def _cmd_generate_insights(args: argparse.Namespace) -> int:
             timeout=args.timeout,
             retry_attempts=args.retry_attempts,
             retry_base_delay=args.retry_base_delay,
+            stream=args.stream,
         )
         if config.vision_model_name
         else None

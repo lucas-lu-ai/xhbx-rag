@@ -86,4 +86,10 @@ def test_script_chunk_contains_retrieval_text_metadata_and_citations() -> None:
     assert "客户抗拒保险的场景摘要" not in script_chunk.text
     assert script_chunk.metadata["stage"] == "售前"
     assert script_chunk.metadata["strategy_names"] == ["风险唤醒"]
+    assert script_chunk.metadata["knowledge_type"] == "场景话术"
+    assert "销售技能/沟通谈判/保险理念沟通" in script_chunk.metadata["tag_paths"]
+    assert "客户需求/家庭责任" in script_chunk.metadata["tag_paths"]
+    assert "标签：" in script_chunk.text
+    assert "销售技能/沟通谈判/保险理念沟通" in script_chunk.text
+    assert script_chunk.text.count("标签：") == 1
     assert script_chunk.citations[0].quote == "客户不想聊保险。"
