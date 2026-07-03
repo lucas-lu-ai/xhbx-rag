@@ -279,6 +279,22 @@ uv run xhbx-rag answer \
 
 证据不足或问题不属于检索范围时，`answer` 会返回“当前检索结果不足以确认。”
 
+## MCP 检索服务
+
+如果希望在 Claude Code、Claude Desktop 等 MCP 客户端里直接检索知识库，可以启动内置的 MCP 服务：
+
+```bash
+uv run xhbx-rag-mcp                              # stdio（默认，供本机客户端）
+uv run xhbx-rag-mcp --transport streamable-http  # HTTP（供远程客户端，默认 127.0.0.1:8000/mcp）
+```
+
+服务对外提供两个工具：
+
+- `search_knowledge(query, top_n=20, top_k=5)`：完整复用 `search` 的检索链（query understanding → 向量 + 关键词混合召回 → RRF 融合 → rerank），返回证据 chunk（含知识类型、原文引用与定位）。`top_n` 范围 1–100，`top_k` 范围 1–20 且不能大于 `top_n`。
+- `retrieval_status()`：返回 Milvus 模式与目标、collection 名称和必要配置是否齐全，不包含任何密钥内容。
+
+项目根目录的 `.mcp.json` 已注册该服务，在本仓库中打开 Claude Code 即可直接使用。服务从项目目录的 `.env` 读取配置，需要与 `search` 命令相同的模型、embedding、rerank 与 Milvus 配置；对外错误消息经过白名单过滤，不泄漏内部路径与堆栈。lite 模式下索引是本地单进程文件，MCP 服务与 Web 服务不能同时打开同一个索引文件。
+
 ## Web 问答界面
 
 如果希望在浏览器里直接问答并查看溯源，可以启动本机 Web 界面。第一版只读取已有索引，不在 Web 内执行 `generate-insights -> parse -> index`。

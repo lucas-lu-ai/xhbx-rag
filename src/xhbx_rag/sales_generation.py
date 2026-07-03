@@ -200,21 +200,21 @@ class _RetryDiagnosticMixin:
                 diagnostic = _format_model_retry_error(exc)
                 if attempt < self.max_retries:
                     _agentscope_logger.warning(
-                        "Attempt %d failed for model %s: %s. "
-                        "retry diagnostic: %s. Retrying in %.1fs...",
-                        attempt + 1,
+                        "模型 %s 调用被中断（第 %d/%d 次尝试），"
+                        "%.1f 秒后自动重试，任务不受影响。原因: %s。诊断: %s",
                         self.model,
+                        attempt + 1,
+                        self.max_retries + 1,
+                        self.retry_delay,
                         str(exc),
                         diagnostic,
-                        self.retry_delay,
                     )
                     await asyncio.sleep(self.retry_delay)
                 else:
                     _agentscope_logger.warning(
-                        "All %d attempt(s) failed for model %s. "
-                        "retry diagnostic: %s",
-                        self.max_retries + 1,
+                        "模型 %s 全部 %d 次尝试均失败，将向上抛出错误。诊断: %s",
                         self.model,
+                        self.max_retries + 1,
                         diagnostic,
                     )
         if last_error is not None:

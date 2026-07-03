@@ -828,10 +828,58 @@ def test_retry_diagnostic_model_logs_exception_type_and_cause(monkeypatch) -> No
 
     assert response.content[0].text == "ok"
     assert model.attempt_count == 2
-    assert "retry diagnostic" in logs[0]
+    assert "诊断" in logs[0]
     assert "RuntimeError" in logs[0]
     assert "Connection error." in logs[0]
     assert "ValueError: tcp reset by peer" in logs[0]
+
+
+def test_retry_log_message_signals_auto_recovery(monkeypatch) -> None:
+    logs: list[str] = []
+
+    def capture_warning(message, *args):
+        logs.append(message % args)
+
+    from xhbx_rag import sales_generation
+
+    monkeypatch.setattr(sales_generation._agentscope_logger, "warning", capture_warning)
+    model = _RetryableDiagnosticChatModel(
+        credential=OpenAICredential(api_key="key", base_url="https://api.example.com/v1"),
+        model="chat-model",
+        max_retries=1,
+        retry_delay=0,
+    )
+
+    asyncio.run(model([]))
+
+    assert "自动重试" in logs[0]
+    assert "任务不受影响" in logs[0]
+    assert "1/2" in logs[0]
+    assert "failed" not in logs[0]
+
+
+def test_retry_exhausted_log_message_reports_final_failure(monkeypatch) -> None:
+    logs: list[str] = []
+
+    def capture_warning(message, *args):
+        logs.append(message % args)
+
+    from xhbx_rag import sales_generation
+
+    monkeypatch.setattr(sales_generation._agentscope_logger, "warning", capture_warning)
+    model = _AlwaysDisconnectStreamChatModel(
+        credential=OpenAICredential(api_key="key", base_url="https://api.example.com/v1"),
+        model="chat-model",
+        stream=True,
+        max_retries=1,
+        retry_delay=0,
+    )
+
+    with pytest.raises(httpx.RemoteProtocolError):
+        asyncio.run(model([]))
+
+    assert "全部 2 次尝试均失败" in logs[-1]
+    assert "诊断" in logs[-1]
 
 
 def test_retry_mixin_drains_stream_and_retries_on_mid_stream_disconnect() -> None:

@@ -17,6 +17,7 @@ from xhbx_rag.observability import (
 )
 from xhbx_rag.query_understanding import QueryUnderstandingAgent
 from xhbx_rag.rerank import RerankClient
+from xhbx_rag.resource_utils import close_resources, is_local_index_open_failure
 
 from .source_paths import (
     can_reveal_source,
@@ -425,24 +426,8 @@ def _citation_for_ui(
     return ui_citation
 
 
-def _close_resources(resources: list[object]) -> None:
-    closed: set[int] = set()
-    for resource in resources:
-        for target in (
-            getattr(resource, "http_client", None),
-            getattr(resource, "client", None),
-            resource,
-        ):
-            if target is None or id(target) in closed:
-                continue
-            close = getattr(target, "close", None)
-            if not callable(close):
-                continue
-            closed.add(id(target))
-            try:
-                close()
-            except Exception:
-                pass
+# 资源关闭与 lite 占用判定逻辑与 MCP 服务面共用，统一放在 resource_utils。
+_close_resources = close_resources
 
 
 def _validate_limits(*, top_n: int, top_k: int) -> None:
@@ -465,17 +450,4 @@ def _missing_config_map(error: str) -> dict[str, bool]:
     return config
 
 
-def _is_local_index_open_failure(exc: Exception) -> bool:
-    return any(
-        "Open local milvus failed" in str(item)
-        for item in _exception_chain(exc)
-    )
-
-
-def _exception_chain(exc: BaseException):
-    seen: set[int] = set()
-    current: BaseException | None = exc
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        yield current
-        current = current.__cause__ or current.__context__
+_is_local_index_open_failure = is_local_index_open_failure

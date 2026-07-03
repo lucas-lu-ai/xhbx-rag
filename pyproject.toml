@@ -8,6 +8,7 @@ dependencies = [
   "agentscope==2.0.3",
   "fastapi>=0.115",
   "httpx>=0.27",
+  "mcp>=1.10",
   "pymilvus[milvus_lite]>=2.5",
   "pypdf>=6.14.2",
   "python-docx>=1.2.0",
@@ -17,6 +18,7 @@ dependencies = [
 
 [project.scripts]
 xhbx-rag = "xhbx_rag.cli:main"
+xhbx-rag-mcp = "xhbx_rag.mcp_server:main"
 
 [dependency-groups]
 dev = [

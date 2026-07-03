@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "xhbx-rag": {
+      "command": "uv",
+      "args": ["run", "xhbx-rag-mcp"]
+    }
+  }
+}

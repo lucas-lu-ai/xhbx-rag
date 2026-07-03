@@ -16,3 +16,4 @@ parsed/
 CLAUDE.md
 .claude/
 generated/
+.DS_Store
