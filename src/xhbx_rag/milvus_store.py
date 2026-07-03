@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 from collections import Counter
@@ -13,9 +14,41 @@ from pymilvus import DataType, MilvusClient
 from .chunk_io import chunk_text_hash
 from .models import EvidenceRef, RagChunk
 
+logger = logging.getLogger(__name__)
+
+_CITATION_EXCERPT_MAX_CHARS = 600
+_CITATIONS_JSON_MAX_BYTES = 65_535
+
 
 class MilvusStoreError(RuntimeError):
     """Raised when Milvus Lite operations fail."""
+
+
+def _compact_citation(citation: EvidenceRef) -> dict[str, Any]:
+    # context 不被检索/展示消费（完整版本在 chunks.jsonl / insights JSON 里），
+    # 不入库，避免撞 Milvus VARCHAR 上限。
+    data = citation.model_dump(mode="json", exclude={"context"})
+    excerpt = data.get("source_excerpt", "")
+    if isinstance(excerpt, str) and len(excerpt) > _CITATION_EXCERPT_MAX_CHARS:
+        data["source_excerpt"] = excerpt[:_CITATION_EXCERPT_MAX_CHARS]
+    return data
+
+
+def _citations_json(chunk_id: str, citations: list[EvidenceRef]) -> str:
+    compact = [_compact_citation(citation) for citation in citations]
+    while compact:
+        payload = json.dumps(compact, ensure_ascii=False)
+        if len(payload.encode("utf-8")) <= _CITATIONS_JSON_MAX_BYTES:
+            if len(compact) < len(citations):
+                logger.warning(
+                    "chunk %s 的 citations 超过 Milvus 字段上限，已丢弃尾部 %d/%d 条",
+                    chunk_id,
+                    len(citations) - len(compact),
+                    len(citations),
+                )
+            return payload
+        compact.pop()
+    return "[]"
 
 
 @dataclass(frozen=True)
@@ -40,10 +73,7 @@ class MilvusChunkRecord:
             "stage": str(metadata.get("stage", "")),
             "scenario": str(metadata.get("scenario", "")),
             "metadata_json": json.dumps(metadata, ensure_ascii=False),
-            "citations_json": json.dumps(
-                [citation.model_dump(mode="json") for citation in self.chunk.citations],
-                ensure_ascii=False,
-            ),
+            "citations_json": _citations_json(self.chunk.chunk_id, self.chunk.citations),
         }
 
 

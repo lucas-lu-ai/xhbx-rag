@@ -290,6 +290,141 @@ class CaseSalesInsightsSource(BaseModel):
         return _coerce_model_list(value)
 
 
+class _EvidenceIdsMixin(BaseModel):
+    """案例级分型调用的草稿模型基类：模型只引用证据短 ID，不抄写 EvidenceRef。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    evidence_ids: list[str] = Field(default_factory=list)
+
+    @field_validator("evidence_ids", mode="before")
+    @classmethod
+    def _evidence_ids(cls, value: object) -> list[str]:
+        return _coerce_str_list(value)
+
+
+class CustomerJourneyStepDraft(_EvidenceIdsMixin):
+    stage: str = ""
+    customer_state: str = ""
+    sales_goal: str = ""
+    key_actions: list[str] = Field(default_factory=list)
+
+    @field_validator("key_actions", mode="before")
+    @classmethod
+    def _key_actions(cls, value: object) -> list[str]:
+        return _coerce_str_list(value)
+
+
+class CaseSalesStrategyDraft(_EvidenceIdsMixin):
+    name: str = ""
+    aliases: list[str] = Field(default_factory=list)
+    definition: str = ""
+    applicable_stages: list[str] = Field(default_factory=list)
+    steps: list[str] = Field(default_factory=list)
+    do: list[str] = Field(default_factory=list)
+    dont: list[str] = Field(default_factory=list)
+    confidence: str = ""
+    inferred: bool = True
+
+    @field_validator(
+        "aliases",
+        "applicable_stages",
+        "steps",
+        "do",
+        "dont",
+        mode="before",
+    )
+    @classmethod
+    def _str_lists(cls, value: object) -> list[str]:
+        return _coerce_str_list(value)
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _confidence(cls, value: object) -> ConfidenceLevel:
+        return _coerce_confidence_level(value)
+
+
+class CaseSalesScriptDraft(_EvidenceIdsMixin):
+    script_id: str = ""
+    stage: str = ""
+    scenario: str = ""
+    customer_trigger: str = ""
+    goal: str = ""
+    source_quote: str = ""
+    coach_wording: str = ""
+    strategy_names: list[str] = Field(default_factory=list)
+    follow_up_questions: list[str] = Field(default_factory=list)
+    compliance_notes: list[str] = Field(default_factory=list)
+
+    @field_validator(
+        "strategy_names",
+        "follow_up_questions",
+        "compliance_notes",
+        mode="before",
+    )
+    @classmethod
+    def _str_lists(cls, value: object) -> list[str]:
+        return _coerce_str_list(value)
+
+
+class ObjectionHandlingDraft(_EvidenceIdsMixin):
+    objection: str = ""
+    diagnosis: str = ""
+    recommended_response: str = ""
+    related_strategy_names: list[str] = Field(default_factory=list)
+    related_script_ids: list[str] = Field(default_factory=list)
+
+    @field_validator("related_strategy_names", "related_script_ids", mode="before")
+    @classmethod
+    def _str_lists(cls, value: object) -> list[str]:
+        return _coerce_str_list(value)
+
+
+class CaseJourneyPart(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    case_summary: str = ""
+    customer_journey: list[CustomerJourneyStepDraft] = Field(default_factory=list)
+
+    @field_validator("customer_journey", mode="before")
+    @classmethod
+    def _lists(cls, value: object) -> list[object]:
+        return _coerce_model_list(value)
+
+
+class CaseStrategiesPart(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    strategies: list[CaseSalesStrategyDraft] = Field(default_factory=list)
+
+    @field_validator("strategies", mode="before")
+    @classmethod
+    def _lists(cls, value: object) -> list[object]:
+        return _coerce_model_list(value)
+
+
+class CaseScriptsPart(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    scripts: list[CaseSalesScriptDraft] = Field(default_factory=list)
+
+    @field_validator("scripts", mode="before")
+    @classmethod
+    def _lists(cls, value: object) -> list[object]:
+        return _coerce_model_list(value)
+
+
+class CaseObjectionsPart(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    objection_handling: list[ObjectionHandlingDraft] = Field(default_factory=list)
+
+    @field_validator("objection_handling", mode="before")
+    @classmethod
+    def _lists(cls, value: object) -> list[object]:
+        return _coerce_model_list(value)
+
+
 class StructuredCaseKnowledge(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

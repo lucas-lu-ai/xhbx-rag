@@ -20,6 +20,12 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+// @ts-expect-error Vitest runs in Node, while the app tsconfig intentionally omits Node types.
+const nodeFs = await import("node:fs");
+const styles = (
+  nodeFs as { readFileSync: (path: string, encoding: "utf8") => string }
+).readFileSync("src/styles.css", "utf8");
+
 function seedChatSessions() {
   localStorage.setItem(
     "xhbx-rag.chat-sessions.v1",
@@ -83,6 +89,31 @@ test("侧栏按 created_at 降序混排聊天与批量会话并展示徽标和�
   expect(names[1]).toContain("运行中");
   expect(names[1]).toContain("3/10");
 });
+
+test("侧栏新建会话和批量执行按钮使用一致的操作尺寸", async () => {
+  installFetchStub();
+  render(<App />);
+
+  const newSessionButton = await screen.findByRole("button", { name: "新会话" });
+  const createBatchButton = screen.getByRole("button", { name: "批量执行" });
+
+  expect(newSessionButton).toHaveClass("session-new-button");
+  expect(createBatchButton).toHaveClass("session-new-button");
+  expect(styleBlock(".session-new-button")).toContain("flex: 0 0 104px;");
+  expect(styleBlock(".session-new-button")).toContain("width: 104px;");
+  expect(styleBlock(".session-new-button")).toContain("min-height: 44px;");
+});
+
+function styleBlock(selector: string): string {
+  const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = new RegExp(`${escapedSelector}\\s*\\{([^}]*)\\}`, "m").exec(
+    styles
+  );
+  if (!match) {
+    throw new Error(`Missing CSS block for ${selector}`);
+  }
+  return match[1];
+}
 
 test("删除批量会话成功后从列表移除并回退到最新条目", async () => {
   const user = userEvent.setup();

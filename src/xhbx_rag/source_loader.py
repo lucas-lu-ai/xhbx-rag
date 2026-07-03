@@ -448,6 +448,12 @@ def _candidate_sources(
     ref: EvidenceRef,
     sources: tuple[ParsedSourceFile, ...] | list[ParsedSourceFile],
 ) -> list[ParsedSourceFile]:
+    if ref.source_path:
+        matched = [
+            source for source in sources if source.source_path == ref.source_path
+        ]
+        if matched:
+            return matched
     if ref.filename:
         matched = [source for source in sources if source.filename == ref.filename]
         if matched:
@@ -575,8 +581,8 @@ def _context_window(
     line_start: int,
     line_end: int,
     *,
-    before: int = 1,
-    after: int = 1,
+    before: int = 3,
+    after: int = 3,
 ) -> str:
     lines = text.splitlines()
     if not lines:

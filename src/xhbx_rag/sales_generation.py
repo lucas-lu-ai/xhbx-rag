@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 from copy import deepcopy
 import inspect
 import json
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -21,8 +22,13 @@ from agentscope.model import DashScopeChatModel, OpenAIChatModel
 from agentscope.tool import ToolChoice
 from pydantic import BaseModel, ValidationError
 
+from .evidence_catalog import EvidenceCatalog, build_evidence_catalog
 from .models import (
+    CaseJourneyPart,
+    CaseObjectionsPart,
     CaseSalesInsightsSource,
+    CaseScriptsPart,
+    CaseStrategiesPart,
     EvidenceRef,
     SectionSalesEvidence,
 )
@@ -118,6 +124,7 @@ class CaseSalesGenerationResult:
     insights_path: Path | None = None
     playbook_path: Path | None = None
     error: str | None = None
+    case_part_errors: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -135,6 +142,35 @@ class _SectionTaskFailure:
     error: str
 
 
+def _extra_retryable_exceptions() -> tuple[type[Exception], ...]:
+    """流式读取阶段抛出的传输层异常不会被 SDK 包装，需显式纳入重试。"""
+    extra: list[type[Exception]] = []
+    try:
+        import httpx
+    except ImportError:
+        pass
+    else:
+        extra.append(httpx.TransportError)
+    try:
+        import openai
+    except ImportError:
+        pass
+    else:
+        extra.extend([openai.APIConnectionError, openai.APITimeoutError])
+    return tuple(extra)
+
+
+async def _drain_stream_response(stream: Any) -> object | None:
+    completed: object | None = None
+    try:
+        async for chunk in stream:
+            if getattr(chunk, "is_last", False):
+                completed = chunk
+    finally:
+        await stream.aclose()
+    return completed
+
+
 class _RetryDiagnosticMixin:
     async def __call__(
         self,
@@ -143,17 +179,20 @@ class _RetryDiagnosticMixin:
         tool_choice: ToolChoice | None = None,
         **kwargs: Any,
     ) -> object:
-        retryable = tuple(self._get_retryable_exceptions())
+        retryable = tuple(self._get_retryable_exceptions()) + _extra_retryable_exceptions()
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
             try:
-                return await self._call_api(
+                response = await self._call_api(
                     self.model,
                     messages=messages,
                     tools=tools,
                     tool_choice=tool_choice,
                     **kwargs,
                 )
+                if inspect.isasyncgen(response):
+                    response = await _drain_stream_response(response)
+                return response
             except Exception as exc:
                 if not isinstance(exc, retryable):
                     raise
@@ -382,6 +421,24 @@ class SalesInsightAgentScopeAgent:
         data = _fill_blank_identity(data, "case_name", case_name)
         return CaseSalesInsightsSource.model_validate(data)
 
+    async def extract_case_part_async(
+        self,
+        part: str,
+        case_name: str,
+        catalog_text: str,
+        context_notes: str = "",
+    ) -> BaseModel:
+        prompt, part_model = _CASE_PART_SPECS[part]
+        user_content = catalog_text
+        if context_notes:
+            user_content += f"\n\n{context_notes}"
+        data = await self._generate_structured_async(
+            system_prompt=prompt,
+            user_content=user_content,
+            structured_model=part_model,
+        )
+        return part_model.model_validate(data)
+
     def case_model_input_trace_payload(
         self,
         case_name: str,
@@ -558,6 +615,8 @@ def generate_case_sales_insights(
     case_name: str | None = None,
     trace: TraceSink | None = None,
     section_concurrency: int = 1,
+    reuse_section_evidence: bool = False,
+    case_call_mode: str = "split",
 ) -> CaseSalesGenerationResult:
     try:
         asyncio.get_running_loop()
@@ -572,6 +631,8 @@ def generate_case_sales_insights(
                 case_name=case_name,
                 trace=trace,
                 section_concurrency=section_concurrency,
+                reuse_section_evidence=reuse_section_evidence,
+                case_call_mode=case_call_mode,
             )
         )
     raise RuntimeError("请在已运行的 event loop 内调用 generate_case_sales_insights_async")
@@ -587,7 +648,13 @@ async def generate_case_sales_insights_async(
     case_name: str | None = None,
     trace: TraceSink | None = None,
     section_concurrency: int = 1,
+    reuse_section_evidence: bool = False,
+    case_call_mode: str = "split",
 ) -> CaseSalesGenerationResult:
+    if case_call_mode not in ("split", "single"):
+        raise ValueError(
+            f"case_call_mode 只支持 split 或 single，收到: {case_call_mode!r}"
+        )
     resolved_case_name = case_name or case_dir.name
     evidence_paths: list[Path] = []
     failure_paths: list[Path] = []
@@ -620,6 +687,7 @@ async def generate_case_sales_insights_async(
                 output_dir=output_dir,
                 trace=trace,
                 semaphore=semaphore,
+                reuse_section_evidence=reuse_section_evidence,
             )
             for index, section in enumerate(sections)
             if section.primary_text.strip()
@@ -646,18 +714,38 @@ async def generate_case_sales_insights_async(
 
         all_sources = [source for section in sections for source in section.sources]
         case_agent = case_agent or section_agent  # type: ignore[assignment]
-        _emit_case_model_input_trace(
-            trace,
-            case_agent,
-            resolved_case_name,
-            evidences,
-        )
-        raw_insights = await _extract_case_with_agent(
-            case_agent,
-            resolved_case_name,
-            evidences,
-        )
-        insights = CaseSalesInsightsSource.model_validate(raw_insights)
+        case_part_errors: dict[str, str] = {}
+        part_extractor = getattr(case_agent, "extract_case_part_async", None)
+        if case_call_mode == "split" and part_extractor is not None:
+            insights, case_part_errors = await _extract_case_insights_by_parts_async(
+                case_agent,
+                resolved_case_name,
+                evidences,
+                output_dir=output_dir,
+                trace=trace,
+            )
+            if insights is None:
+                return CaseSalesGenerationResult(
+                    case_name=resolved_case_name,
+                    status="failed",
+                    evidence_paths=tuple(evidence_paths),
+                    failure_paths=tuple(failure_paths),
+                    error="案例级分型抽取全部失败",
+                    case_part_errors=tuple(sorted(case_part_errors.items())),
+                )
+        else:
+            _emit_case_model_input_trace(
+                trace,
+                case_agent,
+                resolved_case_name,
+                evidences,
+            )
+            raw_insights = await _extract_case_with_agent(
+                case_agent,
+                resolved_case_name,
+                evidences,
+            )
+            insights = CaseSalesInsightsSource.model_validate(raw_insights)
         insights = insights.model_copy(
             update={"case_name": insights.case_name or resolved_case_name}
         )
@@ -673,11 +761,12 @@ async def generate_case_sales_insights_async(
         )
         return CaseSalesGenerationResult(
             case_name=resolved_case_name,
-            status="ok",
+            status="partial" if case_part_errors else "ok",
             evidence_paths=tuple(evidence_paths),
             failure_paths=tuple(failure_paths),
             insights_path=write_result.insights_path,
             playbook_path=write_result.playbook_path,
+            case_part_errors=tuple(sorted(case_part_errors.items())),
         )
     except Exception as exc:  # noqa: BLE001 - keep CLI result JSON stable
         return CaseSalesGenerationResult(
@@ -1311,6 +1400,31 @@ async def _maybe_await(value: Any) -> Any:
     return value
 
 
+def _load_reusable_section_evidence(
+    section: SourceSection,
+    output_dir: Path,
+) -> tuple[SectionSalesEvidence, Path] | None:
+    path = (
+        output_dir
+        / _safe_name(section.case_name)
+        / f"{_safe_name(section.section_name)}.sales_evidence.json"
+    )
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        evidence = SectionSalesEvidence.model_validate(data)
+    except (OSError, ValueError, ValidationError):
+        return None
+    if not _has_sales_evidence(evidence):
+        return None
+    if evidence.section_name and evidence.section_name != section.section_name:
+        return None
+    if evidence.case_name and evidence.case_name != section.case_name:
+        return None
+    return evidence, path
+
+
 async def _run_section_generation_task(
     index: int,
     section: SourceSection,
@@ -1319,7 +1433,18 @@ async def _run_section_generation_task(
     output_dir: Path,
     trace: TraceSink | None,
     semaphore: asyncio.Semaphore,
+    reuse_section_evidence: bool = False,
 ) -> _SectionTaskSuccess | _SectionTaskFailure:
+    if reuse_section_evidence:
+        reused = _load_reusable_section_evidence(section, output_dir)
+        if reused is not None:
+            evidence, path = reused
+            emit_trace(
+                trace,
+                "generate.section_evidence_reused",
+                {"section_name": section.section_name, "path": str(path)},
+            )
+            return _SectionTaskSuccess(index=index, evidence=evidence, path=path)
     async with semaphore:
         try:
             evidence = await _extract_section_by_source_async(
@@ -1444,6 +1569,260 @@ async def _extract_case_with_agent(
     if extract_async is not None:
         return await _maybe_await(extract_async(case_name, evidences))
     return await _maybe_await(case_agent.extract(case_name, evidences))
+
+
+_CASE_PART_ORDER = (
+    "customer_journey",
+    "strategies",
+    "scripts",
+    "objection_handling",
+)
+
+
+def _case_parts_dir(output_dir: Path, case_name: str) -> Path:
+    return output_dir / _safe_name(case_name) / "case.insights_parts"
+
+
+def _evidences_fingerprint(evidences: list[SectionSalesEvidence]) -> str:
+    payload = json.dumps(
+        [evidence.model_dump(mode="json") for evidence in evidences],
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _case_part_fingerprint(evidences_fingerprint: str, context_notes: str) -> str:
+    """part 的输入除章节证据外还含上游 part 传递的上下文，两者都参与指纹。"""
+    return hashlib.sha256(
+        f"{evidences_fingerprint}\n{context_notes}".encode("utf-8")
+    ).hexdigest()
+
+
+def _case_part_is_empty(part_result: BaseModel) -> bool:
+    return not any(part_result.model_dump(mode="json").values())
+
+
+def _load_case_part_checkpoint(
+    path: Path,
+    fingerprint: str,
+    part_model: type[BaseModel],
+) -> BaseModel | None:
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get("input_fingerprint") != fingerprint:
+        return None
+    try:
+        return part_model.model_validate(payload.get("data") or {})
+    except ValidationError:
+        return None
+
+
+def _write_case_part_checkpoint(
+    path: Path,
+    fingerprint: str,
+    part_result: BaseModel,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_text(
+        path,
+        json.dumps(
+            {
+                "input_fingerprint": fingerprint,
+                "data": part_result.model_dump(mode="json"),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+    )
+
+
+async def _run_case_part_task(
+    case_agent: _CaseAgent,
+    part: str,
+    case_name: str,
+    catalog_text: str,
+    context_notes: str,
+    *,
+    parts_dir: Path,
+    fingerprint: str,
+    trace: TraceSink | None,
+) -> tuple[BaseModel | None, str | None]:
+    _, part_model = _CASE_PART_SPECS[part]
+    checkpoint_path = parts_dir / f"{part}.json"
+    part_fingerprint = _case_part_fingerprint(fingerprint, context_notes)
+    cached = _load_case_part_checkpoint(checkpoint_path, part_fingerprint, part_model)
+    if cached is not None:
+        emit_trace(
+            trace,
+            "generate.case_part_reused",
+            {"part": part, "path": str(checkpoint_path)},
+        )
+        return cached, None
+    emit_trace(
+        trace,
+        "generate.case_part_input",
+        {
+            "part": part,
+            "case_name": case_name,
+            "user_content_chars": len(catalog_text) + len(context_notes),
+        },
+    )
+    try:
+        raw = await case_agent.extract_case_part_async(  # type: ignore[attr-defined]
+            part,
+            case_name,
+            catalog_text,
+            context_notes,
+        )
+        part_result = part_model.model_validate(raw)
+    except Exception as exc:  # noqa: BLE001 - 单个 part 失败不拖垮其余 part
+        emit_trace(
+            trace,
+            "generate.case_part_failed",
+            {"part": part, "error": repr(exc)},
+        )
+        return None, repr(exc)
+    if _case_part_is_empty(part_result):
+        # 空结果不固化进 checkpoint，让后续重跑仍有机会重试该类型
+        emit_trace(trace, "generate.case_part_empty", {"part": part})
+        return part_result, None
+    try:
+        _write_case_part_checkpoint(checkpoint_path, part_fingerprint, part_result)
+    except OSError as exc:
+        emit_trace(
+            trace,
+            "generate.case_part_checkpoint_write_failed",
+            {"part": part, "error": repr(exc)},
+        )
+    emit_trace(trace, "generate.case_part_extracted", {"part": part})
+    return part_result, None
+
+
+def _resolve_draft_items(
+    drafts: list[BaseModel],
+    catalog: EvidenceCatalog,
+    *,
+    part: str,
+    trace: TraceSink | None,
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    unknown_all: list[str] = []
+    for draft in drafts:
+        data = draft.model_dump(mode="json")
+        evidence_ids = data.pop("evidence_ids", [])
+        refs, unknown = catalog.resolve_refs(evidence_ids)
+        unknown_all.extend(unknown)
+        data["evidence_refs"] = [ref.model_dump(mode="json") for ref in refs]
+        items.append(data)
+    if unknown_all:
+        emit_trace(
+            trace,
+            "generate.case_unknown_evidence_ids",
+            {"part": part, "ids": unknown_all},
+        )
+    return items
+
+
+async def _extract_case_insights_by_parts_async(
+    case_agent: _CaseAgent,
+    case_name: str,
+    evidences: list[SectionSalesEvidence],
+    *,
+    output_dir: Path,
+    trace: TraceSink | None,
+) -> tuple[CaseSalesInsightsSource | None, dict[str, str]]:
+    catalog = build_evidence_catalog(case_name, evidences)
+    catalog_text = catalog.render_text()
+    parts_dir = _case_parts_dir(output_dir, case_name)
+    fingerprint = _evidences_fingerprint(evidences)
+    errors: dict[str, str] = {}
+
+    def run_part(part: str, context_notes: str = ""):
+        return _run_case_part_task(
+            case_agent,
+            part,
+            case_name,
+            catalog_text,
+            context_notes,
+            parts_dir=parts_dir,
+            fingerprint=fingerprint,
+            trace=trace,
+        )
+
+    (journey_part, journey_error), (strategies_part, strategies_error) = (
+        await asyncio.gather(run_part("customer_journey"), run_part("strategies"))
+    )
+    if journey_error:
+        errors["customer_journey"] = journey_error
+    if strategies_error:
+        errors["strategies"] = strategies_error
+
+    strategy_names = (
+        [item.name for item in strategies_part.strategies if item.name]
+        if strategies_part is not None
+        else []
+    )
+    strategy_notes = (
+        "本案例已确认策略名列表：" + "、".join(strategy_names) if strategy_names else ""
+    )
+    scripts_part, scripts_error = await run_part("scripts", strategy_notes)
+    if scripts_error:
+        errors["scripts"] = scripts_error
+
+    objection_notes = [strategy_notes] if strategy_notes else []
+    if scripts_part is not None and scripts_part.scripts:
+        script_lines = "；".join(
+            f"{item.script_id}：{item.scenario}".strip("：")
+            for item in scripts_part.scripts
+        )
+        objection_notes.append(f"本案例已确认话术列表：{script_lines}")
+    objections_part, objections_error = await run_part(
+        "objection_handling",
+        "\n".join(objection_notes),
+    )
+    if objections_error:
+        errors["objection_handling"] = objections_error
+
+    parts = (journey_part, strategies_part, scripts_part, objections_part)
+    if all(part is None for part in parts):
+        return None, errors
+
+    insights = CaseSalesInsightsSource.model_validate(
+        {
+            "case_name": case_name,
+            "case_summary": journey_part.case_summary if journey_part else "",
+            "customer_journey": _resolve_draft_items(
+                journey_part.customer_journey if journey_part else [],
+                catalog,
+                part="customer_journey",
+                trace=trace,
+            ),
+            "strategies": _resolve_draft_items(
+                strategies_part.strategies if strategies_part else [],
+                catalog,
+                part="strategies",
+                trace=trace,
+            ),
+            "scripts": _resolve_draft_items(
+                scripts_part.scripts if scripts_part else [],
+                catalog,
+                part="scripts",
+                trace=trace,
+            ),
+            "objection_handling": _resolve_draft_items(
+                objections_part.objection_handling if objections_part else [],
+                catalog,
+                part="objection_handling",
+                trace=trace,
+            ),
+        }
+    )
+    return insights, errors
 
 
 def _emit_case_model_input_trace(
@@ -1907,3 +2286,71 @@ _CASE_SYSTEM_PROMPT = """你是保险公司 AI 教练系统的案例级销售洞
 5. coach_wording 可以更适合教练训练，但必须忠于 source_quote 的语义。
 6. 涉及收益、理赔、核保、产品责任、竞品比较时必须写合规提醒。
 7. 如果某个策略只是模型归纳，请保留 inferred=true，不要包装成公司标准打法。"""
+
+
+_CASE_PART_COMMON_PROMPT = """你是保险公司 AI 教练系统的案例级销售洞察专家。
+
+你会收到同一个绩优案例下多个章节的证据目录，每条证据以 [E001] 这样的短 ID 开头。
+
+引用证据的统一规则：
+1. 每个产出条目的 evidence_ids 填写支持该条目的证据短 ID 数组（如 ["E001","E015"]），
+   至少一条；只写 ID，不要抄写证据原文、来源文件名或任何定位信息。
+2. 严格基于证据目录归纳，不得杜撰客户背景、产品条款、收益、理赔或监管要求。
+3. 以完整案例为单位归纳，不要把每节割裂成孤立结论。"""
+
+
+_CASE_PART_JOURNEY_PROMPT = _CASE_PART_COMMON_PROMPT + """
+
+本次任务：提炼 case_summary 与 customer_journey。
+- case_summary：2-4 句话概括案例的客户画像、核心打法与成果。
+- customer_journey：客户从售前到成交/经营的阶段序列。综合各章节证据上的阶段提示
+  （如"[阶段：需求挖掘]"）做跨章节串联，按销售推进顺序排列；每个阶段给出
+  stage、customer_state（客户状态）、sales_goal（销售目标）、key_actions（关键动作）。
+
+输出 JSON object，字段：case_summary、customer_journey。"""
+
+
+_CASE_PART_STRATEGIES_PROMPT = _CASE_PART_COMMON_PROMPT + """
+
+本次任务：提炼 strategies（贯穿案例的销售策略）。
+- 对各章节的策略候选做跨章节去重合并：同一策略的不同命名合并为一条，
+  常用名放 name，其余写入 aliases。
+- 每条策略展开 definition（定义）、applicable_stages（适用阶段）、steps（步骤）、
+  do（建议做法）、dont（避免做法），并给出 confidence。
+- 策略是对证据的抽象，必须能被多个或明确的证据支持；不能把没有证据的
+  通用销售理论塞进结果。仅由模型归纳的策略保留 inferred=true。
+
+输出 JSON object，字段：strategies。"""
+
+
+_CASE_PART_SCRIPTS_PROMPT = _CASE_PART_COMMON_PROMPT + """
+
+本次任务：提炼 scripts（可复用的场景化话术）。
+- source_quote 保留证据中的原始话术表述；coach_wording 是更适合教练训练的改写，
+  但必须忠于 source_quote 的语义。
+- 每条话术给出 script_id（如 script_001 顺序编号）、stage、scenario、
+  customer_trigger（客户触发点）、goal、follow_up_questions（追问建议）。
+- 若用户内容末尾提供了"本案例已确认策略名列表"，strategy_names 只从该列表中选择；
+  没有合适的就留空。
+- 涉及收益、理赔、核保、产品责任、竞品比较时必须写 compliance_notes 合规提醒。
+
+输出 JSON object，字段：scripts。"""
+
+
+_CASE_PART_OBJECTIONS_PROMPT = _CASE_PART_COMMON_PROMPT + """
+
+本次任务：提炼 objection_handling（客户异议与应对）。
+- 每条给出 objection（异议原文大意）、diagnosis（异议背后的真实顾虑诊断）、
+  recommended_response（推荐回应方式）。
+- 若用户内容末尾提供了"本案例已确认策略名列表"或"本案例已确认话术列表"，
+  related_strategy_names / related_script_ids 只从对应列表中选择；没有合适的就留空。
+
+输出 JSON object，字段：objection_handling。"""
+
+
+_CASE_PART_SPECS: dict[str, tuple[str, type[BaseModel]]] = {
+    "customer_journey": (_CASE_PART_JOURNEY_PROMPT, CaseJourneyPart),
+    "strategies": (_CASE_PART_STRATEGIES_PROMPT, CaseStrategiesPart),
+    "scripts": (_CASE_PART_SCRIPTS_PROMPT, CaseScriptsPart),
+    "objection_handling": (_CASE_PART_OBJECTIONS_PROMPT, CaseObjectionsPart),
+}

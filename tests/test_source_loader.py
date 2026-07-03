@@ -77,6 +77,49 @@ def test_enrich_ref_uses_model_provided_line_span_when_quote_is_paraphrased(
     )
 
 
+def test_enrich_ref_context_window_covers_three_lines_each_side(tmp_path) -> None:
+    source = tmp_path / "第1节.track-0.txt"
+    source.write_text(
+        "\n".join(f"第{i}行内容" for i in range(1, 11)) + "\n",
+        encoding="utf-8",
+    )
+    parsed = parse_source_file(source)
+    ref = EvidenceRef(filename="第1节.track-0.txt", quote="第5行内容")
+
+    enriched = enrich_evidence_ref_location(ref, (parsed,))
+
+    assert enriched.locator["line_start"] == 5
+    assert enriched.context == "\n".join(
+        f"第{i}行内容" for i in range(2, 9)
+    )
+
+
+def test_enrich_ref_prefers_source_path_match_over_same_filename(tmp_path) -> None:
+    section_a = tmp_path / "第1节"
+    section_b = tmp_path / "第2节"
+    section_a.mkdir()
+    section_b.mkdir()
+    (section_a / "content.txt").write_text(
+        "A章开场\n客户说每年不能超过80万\nA章收尾\n", encoding="utf-8"
+    )
+    (section_b / "content.txt").write_text(
+        "B章开场\nB章第二行完全无关\nB章收尾\n", encoding="utf-8"
+    )
+    parsed_a = parse_source_file(section_a / "content.txt")
+    parsed_b = parse_source_file(section_b / "content.txt")
+    ref = EvidenceRef(
+        filename="content.txt",
+        source_path=str(section_a / "content.txt"),
+        quote="客户说每年不能超过80万",
+        locator={"line_start": 2, "line_end": 2},
+    )
+
+    enriched = enrich_evidence_ref_location(ref, (parsed_b, parsed_a))
+
+    assert enriched.source_excerpt == "客户说每年不能超过80万"
+    assert "B章" not in enriched.context
+
+
 def test_enrich_ref_marks_unmatched_when_line_span_and_quote_do_not_resolve(
     tmp_path,
 ) -> None:

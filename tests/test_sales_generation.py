@@ -1,18 +1,29 @@
 import base64
 import asyncio
+import inspect
 import json
 from io import BytesIO
 
+import httpx
+import pytest
 from PIL import Image
 from agentscope.message import DataBlock, TextBlock, ToolCallBlock
 from agentscope.model import ChatResponse
 
 from xhbx_rag.models import (
+    CaseJourneyPart,
+    CaseObjectionsPart,
     CaseSalesInsightsSource,
     CaseSalesScript,
+    CaseSalesScriptDraft,
+    CaseSalesStrategyDraft,
+    CaseScriptsPart,
+    CaseStrategiesPart,
+    CustomerJourneyStepDraft,
     CustomerSignal,
     EvidenceRef,
     ObjectionEvidence,
+    ObjectionHandlingDraft,
     SalesAction,
     SectionSalesEvidence,
     ScriptQuote,
@@ -24,6 +35,7 @@ from xhbx_rag.sales_generation import (
 )
 from xhbx_rag.sales_generation import (
     SalesInsightAgentScopeAgent,
+    SalesInsightGenerationError,
     VisionImageDescriptionAgent,
     _build_dashscope_chat_model,
     _build_structured_chat_model,
@@ -105,6 +117,44 @@ class _RetryableDiagnosticChatModel(_RetryDiagnosticOpenAIChatModel):
             cause = ValueError("tcp reset by peer")
             raise RuntimeError("Connection error.") from cause
         return ChatResponse(content=[TextBlock(text="ok")], is_last=True)
+
+
+class _StreamDisconnectThenSucceedChatModel(_RetryDiagnosticOpenAIChatModel):
+    """第一次返回中途断连的流式响应，第二次返回完整流。"""
+
+    async def _call_api(self, model_name, messages, **kwargs):
+        if not hasattr(self, "attempt_count"):
+            self.attempt_count = 0
+        self.attempt_count += 1
+        if self.attempt_count == 1:
+            return self._broken_stream()
+        return self._ok_stream()
+
+    async def _broken_stream(self):
+        yield ChatResponse(content=[TextBlock(text="部分输出")], is_last=False)
+        raise httpx.RemoteProtocolError(
+            "peer closed connection without sending complete message body"
+        )
+
+    async def _ok_stream(self):
+        yield ChatResponse(content=[TextBlock(text="中间块")], is_last=False)
+        yield ChatResponse(content=[TextBlock(text="完整回答")], is_last=True)
+
+
+class _AlwaysDisconnectStreamChatModel(_RetryDiagnosticOpenAIChatModel):
+    """每次调用都返回中途断连的流式响应。"""
+
+    async def _call_api(self, model_name, messages, **kwargs):
+        if not hasattr(self, "attempt_count"):
+            self.attempt_count = 0
+        self.attempt_count += 1
+        return self._broken_stream()
+
+    async def _broken_stream(self):
+        yield ChatResponse(content=[TextBlock(text="部分输出")], is_last=False)
+        raise httpx.RemoteProtocolError(
+            "peer closed connection without sending complete message body"
+        )
 
 
 class _FakeHttpResponse:
@@ -205,6 +255,521 @@ def test_generate_case_sales_insights_writes_located_refs_and_playbook(tmp_path)
     assert "客户说每年不能超过80万" in playbook
 
 
+class _LenientFakeCaseAgent:
+    def extract(self, case_name, evidences):
+        return CaseSalesInsightsSource(
+            case_name=case_name,
+            case_summary="汇总",
+            scripts=[
+                CaseSalesScript(
+                    script_id="script_001",
+                    stage="异议处理",
+                    scenario="客户预算封顶",
+                    source_quote="客户说每年不能超过80万",
+                    evidence_refs=[
+                        EvidenceRef(
+                            section_name="第1节",
+                            filename="第1节.track-0.txt",
+                            quote="客户说每年不能超过80万",
+                        )
+                    ],
+                )
+            ],
+        )
+
+
+class _ExplodingSectionAgent:
+    def extract(self, section):
+        raise AssertionError("复用模式下不应调用章节抽取")
+
+
+def _write_reusable_section_evidence(out_dir, case_name, section_name) -> None:
+    evidence = SectionSalesEvidence(
+        case_name=case_name,
+        section_name=section_name,
+        sales_actions=[
+            SalesAction(
+                action="已有动作",
+                evidence="已有证据",
+                source_refs=[
+                    EvidenceRef(
+                        section_name=section_name,
+                        filename="第1节.track-0.txt",
+                        quote="客户说每年不能超过80万",
+                    )
+                ],
+            )
+        ],
+    )
+    case_out = out_dir / case_name
+    case_out.mkdir(parents=True, exist_ok=True)
+    (case_out / f"{section_name}.sales_evidence.json").write_text(
+        json.dumps(evidence.model_dump(mode="json"), ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def test_reuse_section_evidence_skips_section_agent(tmp_path) -> None:
+    case_dir = tmp_path / "案例A"
+    section_dir = case_dir / "第1节"
+    section_dir.mkdir(parents=True)
+    (section_dir / "第1节.track-0.txt").write_text(
+        "老师开场\n客户说每年不能超过80万\n销售回应：可以看缴费期满的保单\n",
+        encoding="utf-8",
+    )
+    out_dir = tmp_path / "out"
+    _write_reusable_section_evidence(out_dir, "案例A", "第1节")
+    trace = MemoryTraceSink()
+
+    result = generate_case_sales_insights(
+        case_dir=case_dir,
+        output_dir=out_dir,
+        section_agent=_ExplodingSectionAgent(),
+        case_agent=_LenientFakeCaseAgent(),
+        trace=trace,
+        reuse_section_evidence=True,
+    )
+
+    assert result.status == "ok"
+    steps = [event.step for event in trace.events]
+    assert "generate.section_evidence_reused" in steps
+    assert result.evidence_paths
+    assert result.evidence_paths[0].name == "第1节.sales_evidence.json"
+
+
+def test_reuse_section_evidence_falls_back_to_extraction_when_file_invalid(
+    tmp_path,
+) -> None:
+    case_dir = tmp_path / "案例A"
+    section_dir = case_dir / "第1节"
+    section_dir.mkdir(parents=True)
+    (section_dir / "第1节.track-0.txt").write_text(
+        "老师开场\n客户说每年不能超过80万\n销售回应：可以看缴费期满的保单\n",
+        encoding="utf-8",
+    )
+    out_dir = tmp_path / "out"
+    case_out = out_dir / "案例A"
+    case_out.mkdir(parents=True)
+    (case_out / "第1节.sales_evidence.json").write_text(
+        "{损坏的 JSON", encoding="utf-8"
+    )
+    trace = MemoryTraceSink()
+
+    result = generate_case_sales_insights(
+        case_dir=case_dir,
+        output_dir=out_dir,
+        section_agent=_FakeSectionAgent(),
+        case_agent=_LenientFakeCaseAgent(),
+        trace=trace,
+        reuse_section_evidence=True,
+    )
+
+    assert result.status == "ok"
+    steps = [event.step for event in trace.events]
+    assert "generate.section_evidence_reused" not in steps
+    assert "generate.section_evidence_written" in steps
+
+
+class _FakePartCaseAgent:
+    """支持分型调用的 fake 案例级 agent。"""
+
+    def __init__(self, fail_parts: tuple[str, ...] = ()) -> None:
+        self.calls: list[str] = []
+        self.context_notes: dict[str, str] = {}
+        self.fail_parts = set(fail_parts)
+
+    def extract(self, case_name, evidences):
+        raise AssertionError("分型模式下不应走单次大调用")
+
+    async def extract_case_part_async(
+        self, part, case_name, catalog_text, context_notes=""
+    ):
+        self.calls.append(part)
+        self.context_notes[part] = context_notes
+        if part in self.fail_parts:
+            raise SalesInsightGenerationError(f"{part} 模拟失败")
+        if part == "customer_journey":
+            return CaseJourneyPart(
+                case_summary="预算封顶客户的加保案例",
+                customer_journey=[
+                    CustomerJourneyStepDraft(
+                        stage="异议处理",
+                        customer_state="有预算顾虑",
+                        sales_goal="确认预算红线",
+                        key_actions=["确认红线"],
+                        evidence_ids=["E001"],
+                    )
+                ],
+            )
+        if part == "strategies":
+            return CaseStrategiesPart(
+                strategies=[
+                    CaseSalesStrategyDraft(
+                        name="预算释放策略",
+                        definition="用缴清保单释放预算空间",
+                        confidence="high",
+                        inferred=False,
+                        evidence_ids=["E001"],
+                    )
+                ]
+            )
+        if part == "scripts":
+            return CaseScriptsPart(
+                scripts=[
+                    CaseSalesScriptDraft(
+                        script_id="script_001",
+                        stage="异议处理",
+                        scenario="客户预算封顶",
+                        source_quote="客户说每年不能超过80万",
+                        coach_wording="先确认红线，再看缴清保单释放的预算。",
+                        strategy_names=["预算释放策略"],
+                        evidence_ids=["E001", "E999"],
+                    )
+                ]
+            )
+        return CaseObjectionsPart(
+            objection_handling=[
+                ObjectionHandlingDraft(
+                    objection="预算不能再增加",
+                    diagnosis="客户以年度现金流设限",
+                    recommended_response="用已缴清保单释放预算",
+                    related_strategy_names=["预算释放策略"],
+                    related_script_ids=["script_001"],
+                    evidence_ids=["E001"],
+                )
+            ]
+        )
+
+
+def _make_case_material(tmp_path):
+    case_dir = tmp_path / "案例A"
+    section_dir = case_dir / "第1节"
+    section_dir.mkdir(parents=True)
+    (section_dir / "第1节.track-0.txt").write_text(
+        "老师开场\n客户说每年不能超过80万\n销售回应：可以看缴费期满的保单\n",
+        encoding="utf-8",
+    )
+    return case_dir
+
+
+def test_case_parts_mode_assembles_full_insights_with_resolved_refs(tmp_path) -> None:
+    case_dir = _make_case_material(tmp_path)
+    out_dir = tmp_path / "out"
+    agent = _FakePartCaseAgent()
+    trace = MemoryTraceSink()
+
+    result = generate_case_sales_insights(
+        case_dir=case_dir,
+        output_dir=out_dir,
+        section_agent=_FakeSectionAgent(),
+        case_agent=agent,
+        trace=trace,
+    )
+
+    assert result.status == "ok"
+    assert result.case_part_errors == ()
+    assert agent.calls.count("customer_journey") == 1
+    assert set(agent.calls) == {
+        "customer_journey",
+        "strategies",
+        "scripts",
+        "objection_handling",
+    }
+    assert "预算释放策略" in agent.context_notes["scripts"]
+    assert "script_001" in agent.context_notes["objection_handling"]
+    data = json.loads(result.insights_path.read_text(encoding="utf-8"))
+    assert data["case_summary"] == "预算封顶客户的加保案例"
+    script = data["scripts"][0]
+    assert script["source_quote"] == "客户说每年不能超过80万"
+    ref = script["evidence_refs"][0]
+    assert ref["locator"]["line_start"] == 2
+    assert ref["quote"] == "客户说每年不能超过80万"
+    steps = [event.step for event in trace.events]
+    assert steps.count("generate.case_part_extracted") == 4
+    assert "generate.case_unknown_evidence_ids" in steps
+    assert result.playbook_path.exists()
+
+
+def test_case_parts_mode_partial_when_one_part_fails(tmp_path) -> None:
+    case_dir = _make_case_material(tmp_path)
+    out_dir = tmp_path / "out"
+    agent = _FakePartCaseAgent(fail_parts=("strategies",))
+    trace = MemoryTraceSink()
+
+    result = generate_case_sales_insights(
+        case_dir=case_dir,
+        output_dir=out_dir,
+        section_agent=_FakeSectionAgent(),
+        case_agent=agent,
+        trace=trace,
+    )
+
+    assert result.status == "partial"
+    assert dict(result.case_part_errors).keys() == {"strategies"}
+    data = json.loads(result.insights_path.read_text(encoding="utf-8"))
+    assert data["strategies"] == []
+    assert data["scripts"]
+    assert data["objection_handling"]
+    steps = [event.step for event in trace.events]
+    assert "generate.case_part_failed" in steps
+
+
+def test_case_parts_mode_failed_when_all_parts_fail(tmp_path) -> None:
+    case_dir = _make_case_material(tmp_path)
+    out_dir = tmp_path / "out"
+    agent = _FakePartCaseAgent(
+        fail_parts=("customer_journey", "strategies", "scripts", "objection_handling")
+    )
+
+    result = generate_case_sales_insights(
+        case_dir=case_dir,
+        output_dir=out_dir,
+        section_agent=_FakeSectionAgent(),
+        case_agent=agent,
+    )
+
+    assert result.status == "failed"
+    assert result.insights_path is None
+    assert len(dict(result.case_part_errors)) == 4
+
+
+def test_case_parts_checkpoint_skips_completed_parts_on_rerun(tmp_path) -> None:
+    case_dir = _make_case_material(tmp_path)
+    out_dir = tmp_path / "out"
+
+    first = generate_case_sales_insights(
+        case_dir=case_dir,
+        output_dir=out_dir,
+        section_agent=_FakeSectionAgent(),
+        case_agent=_FakePartCaseAgent(),
+    )
+    assert first.status == "ok"
+
+    rerun_agent = _FakePartCaseAgent()
+    trace = MemoryTraceSink()
+    second = generate_case_sales_insights(
+        case_dir=case_dir,
+        output_dir=out_dir,
+        section_agent=_FakeSectionAgent(),
+        case_agent=rerun_agent,
+        trace=trace,
+    )
+
+    assert second.status == "ok"
+    assert rerun_agent.calls == []
+    steps = [event.step for event in trace.events]
+    assert steps.count("generate.case_part_reused") == 4
+
+
+def test_case_parts_checkpoint_invalidated_when_evidence_changes(tmp_path) -> None:
+    case_dir = _make_case_material(tmp_path)
+    out_dir = tmp_path / "out"
+
+    first = generate_case_sales_insights(
+        case_dir=case_dir,
+        output_dir=out_dir,
+        section_agent=_FakeSectionAgent(),
+        case_agent=_FakePartCaseAgent(),
+    )
+    assert first.status == "ok"
+
+    class _OtherSectionAgent(_FakeSectionAgent):
+        def extract(self, section):
+            evidence = super().extract(section)
+            return evidence.model_copy(
+                update={
+                    "sales_actions": [
+                        evidence.sales_actions[0].model_copy(
+                            update={"action": "改变后的动作"}
+                        )
+                    ]
+                }
+            )
+
+    rerun_agent = _FakePartCaseAgent()
+    second = generate_case_sales_insights(
+        case_dir=case_dir,
+        output_dir=out_dir,
+        section_agent=_OtherSectionAgent(),
+        case_agent=rerun_agent,
+    )
+
+    assert second.status == "ok"
+    assert set(rerun_agent.calls) == {
+        "customer_journey",
+        "strategies",
+        "scripts",
+        "objection_handling",
+    }
+
+
+def test_case_parts_checkpoint_reruns_dependent_part_when_context_changes(
+    tmp_path,
+) -> None:
+    case_dir = _make_case_material(tmp_path)
+    out_dir = tmp_path / "out"
+
+    first = generate_case_sales_insights(
+        case_dir=case_dir,
+        output_dir=out_dir,
+        section_agent=_FakeSectionAgent(),
+        case_agent=_FakePartCaseAgent(fail_parts=("strategies",)),
+    )
+    assert first.status == "partial"
+
+    rerun_agent = _FakePartCaseAgent()
+    second = generate_case_sales_insights(
+        case_dir=case_dir,
+        output_dir=out_dir,
+        section_agent=_FakeSectionAgent(),
+        case_agent=rerun_agent,
+    )
+
+    assert second.status == "ok"
+    assert "strategies" in rerun_agent.calls
+    assert "scripts" in rerun_agent.calls
+    assert "objection_handling" in rerun_agent.calls
+    assert "预算释放策略" in rerun_agent.context_notes["scripts"]
+    data = json.loads(second.insights_path.read_text(encoding="utf-8"))
+    assert data["scripts"][0]["strategy_names"] == ["预算释放策略"]
+
+
+def test_case_parts_empty_result_is_not_frozen_into_checkpoint(tmp_path) -> None:
+    case_dir = _make_case_material(tmp_path)
+    out_dir = tmp_path / "out"
+
+    class _EmptyStrategiesAgent(_FakePartCaseAgent):
+        async def extract_case_part_async(
+            self, part, case_name, catalog_text, context_notes=""
+        ):
+            if part == "strategies":
+                self.calls.append(part)
+                return CaseStrategiesPart(strategies=[])
+            return await super().extract_case_part_async(
+                part, case_name, catalog_text, context_notes
+            )
+
+    first = generate_case_sales_insights(
+        case_dir=case_dir,
+        output_dir=out_dir,
+        section_agent=_FakeSectionAgent(),
+        case_agent=_EmptyStrategiesAgent(),
+    )
+    assert first.status == "ok"
+    assert not (out_dir / "案例A" / "case.insights_parts" / "strategies.json").exists()
+
+    rerun_agent = _FakePartCaseAgent()
+    second = generate_case_sales_insights(
+        case_dir=case_dir,
+        output_dir=out_dir,
+        section_agent=_FakeSectionAgent(),
+        case_agent=rerun_agent,
+    )
+
+    assert second.status == "ok"
+    # strategies 重跑后产出了策略名单，scripts/objections 的输入随之变化，
+    # part 指纹正确失效并重跑；只有 journey 与上游无依赖，仍复用 checkpoint。
+    assert "customer_journey" not in rerun_agent.calls
+    assert set(rerun_agent.calls) == {
+        "strategies",
+        "scripts",
+        "objection_handling",
+    }
+
+
+def test_case_parts_checkpoint_write_failure_does_not_fail_the_part(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    case_dir = _make_case_material(tmp_path)
+    out_dir = tmp_path / "out"
+
+    from xhbx_rag import sales_generation as sg
+
+    def broken_write(path, fingerprint, part_result):
+        raise OSError("磁盘已满")
+
+    monkeypatch.setattr(sg, "_write_case_part_checkpoint", broken_write)
+
+    result = generate_case_sales_insights(
+        case_dir=case_dir,
+        output_dir=out_dir,
+        section_agent=_FakeSectionAgent(),
+        case_agent=_FakePartCaseAgent(),
+    )
+
+    assert result.status == "ok"
+    assert result.insights_path is not None
+
+
+def test_reuse_section_evidence_rejects_mismatched_section_name(tmp_path) -> None:
+    case_dir = _make_case_material(tmp_path)
+    out_dir = tmp_path / "out"
+    evidence = SectionSalesEvidence(
+        case_name="案例A",
+        section_name="完全不同的章节",
+        sales_actions=[
+            SalesAction(
+                action="来自别的章节的动作",
+                evidence="证据",
+                source_refs=[EvidenceRef(filename="x.txt", quote="引用")],
+            )
+        ],
+    )
+    case_out = out_dir / "案例A"
+    case_out.mkdir(parents=True)
+    (case_out / "第1节.sales_evidence.json").write_text(
+        json.dumps(evidence.model_dump(mode="json"), ensure_ascii=False),
+        encoding="utf-8",
+    )
+    trace = MemoryTraceSink()
+
+    result = generate_case_sales_insights(
+        case_dir=case_dir,
+        output_dir=out_dir,
+        section_agent=_FakeSectionAgent(),
+        case_agent=_LenientFakeCaseAgent(),
+        trace=trace,
+        reuse_section_evidence=True,
+        case_call_mode="single",
+    )
+
+    assert result.status == "ok"
+    steps = [event.step for event in trace.events]
+    assert "generate.section_evidence_reused" not in steps
+    assert "generate.section_evidence_written" in steps
+
+
+def test_generate_rejects_unknown_case_call_mode(tmp_path) -> None:
+    case_dir = _make_case_material(tmp_path)
+
+    with pytest.raises(ValueError, match="case_call_mode"):
+        generate_case_sales_insights(
+            case_dir=case_dir,
+            output_dir=tmp_path / "out",
+            section_agent=_FakeSectionAgent(),
+            case_agent=_FakePartCaseAgent(),
+            case_call_mode="splitt",
+        )
+
+
+def test_case_call_mode_single_uses_legacy_case_agent_path(tmp_path) -> None:
+    case_dir = _make_case_material(tmp_path)
+    out_dir = tmp_path / "out"
+    case_agent = _FakeCaseAgent()
+
+    result = generate_case_sales_insights(
+        case_dir=case_dir,
+        output_dir=out_dir,
+        section_agent=_FakeSectionAgent(),
+        case_agent=case_agent,
+        case_call_mode="single",
+    )
+
+    assert result.status == "ok"
+    assert case_agent.received is not None
+
+
 def test_sales_insight_agentscope_agent_uses_structured_tool_call() -> None:
     chat_model = _FakeStructuredToolChatModel(
         {"case_name": "案例A", "section_name": "第1节", "sales_actions": []}
@@ -267,6 +832,37 @@ def test_retry_diagnostic_model_logs_exception_type_and_cause(monkeypatch) -> No
     assert "RuntimeError" in logs[0]
     assert "Connection error." in logs[0]
     assert "ValueError: tcp reset by peer" in logs[0]
+
+
+def test_retry_mixin_drains_stream_and_retries_on_mid_stream_disconnect() -> None:
+    model = _StreamDisconnectThenSucceedChatModel(
+        credential=OpenAICredential(api_key="key", base_url="https://api.example.com/v1"),
+        model="chat-model",
+        stream=True,
+        max_retries=1,
+        retry_delay=0,
+    )
+
+    response = asyncio.run(model([]))
+
+    assert model.attempt_count == 2
+    assert not inspect.isasyncgen(response)
+    assert response.content[0].text == "完整回答"
+
+
+def test_retry_mixin_raises_after_stream_disconnect_exhausts_retries() -> None:
+    model = _AlwaysDisconnectStreamChatModel(
+        credential=OpenAICredential(api_key="key", base_url="https://api.example.com/v1"),
+        model="chat-model",
+        stream=True,
+        max_retries=1,
+        retry_delay=0,
+    )
+
+    with pytest.raises(httpx.RemoteProtocolError):
+        asyncio.run(model([]))
+
+    assert model.attempt_count == 2
 
 
 def test_format_model_retry_error_includes_http_response_details() -> None:
@@ -466,6 +1062,7 @@ def test_generate_case_sales_insights_traces_final_case_model_input(tmp_path) ->
         section_agent=_FakeSectionAgent(),
         case_agent=case_agent,
         trace=trace,
+        case_call_mode="single",
     )
 
     assert result.status == "ok"
@@ -486,6 +1083,45 @@ def test_generate_case_sales_insights_traces_final_case_model_input(tmp_path) ->
     model_user_text = chat_model.calls[0]["messages"][1].get_text_content()
     assert payload["user_content"] in model_user_text
     assert payload["structured_reminder"] in model_user_text
+
+
+def test_agentscope_agent_case_part_call_uses_part_prompt_and_catalog() -> None:
+    chat_model = _FakeStructuredToolChatModel(
+        {
+            "strategies": [
+                {
+                    "name": "预算释放策略",
+                    "definition": "用缴清保单释放预算",
+                    "evidence_ids": ["E001"],
+                }
+            ]
+        }
+    )
+    agent = SalesInsightAgentScopeAgent(
+        base_url="https://api.example.com/v1",
+        api_key="secret",
+        model="chat-model",
+        chat_model=chat_model,
+        retry_base_delay=0,
+    )
+
+    part = asyncio.run(
+        agent.extract_case_part_async(
+            "strategies",
+            "案例A",
+            "[E001] 识别预算上限｜解释：客户说每年不能超过80万",
+            "本案例已确认策略名列表：预算释放策略",
+        )
+    )
+
+    assert part.strategies[0].evidence_ids == ["E001"]
+    call = chat_model.calls[0]
+    system_text = call["messages"][0].get_text_content()
+    user_text = call["messages"][1].get_text_content()
+    assert "strategies" in system_text
+    assert "跨章节去重合并" in system_text
+    assert "[E001]" in user_text
+    assert "本案例已确认策略名列表" in user_text
 
 
 def test_sales_insight_agentscope_agent_unwraps_nested_structured_output() -> None:

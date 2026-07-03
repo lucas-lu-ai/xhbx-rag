@@ -16,6 +16,26 @@
 uv sync
 ```
 
+## 一键入库（generate-insights → parse → index）
+
+如果想把一个案例素材目录一条命令直通向量库，可以用 `ingest`：
+
+```bash
+uv run xhbx-rag ingest \
+  --case-dir "data/绩优案例/案例A" \
+  --generated-out generated \
+  --parsed-out parsed \
+  --index-mode incremental \
+  --stream --reuse-section-evidence --no-thinking --trace
+```
+
+`ingest` 支持 `generate-insights` 的全部参数（`--stream`、`--no-thinking`、`--reuse-section-evidence`、`--case-call-mode` 等）。执行语义：
+
+- generate 阶段 `failed` 时立即退出（parse/index 不执行）；`partial` 时继续入库已产出的知识类型
+- parse 失败会写 `parse_report.json` 并退出，不触碰索引
+- 结束时输出三阶段汇总 JSON（generate 状态与 `case_part_errors`、parse 计数、index 写入条数）
+- 重新生成同一案例后建议 `--index-mode rebuild`，避免 chunk_id 漂移导致新旧并存
+
 ## 生成销售洞察
 
 如果输入是原始案例素材目录，可以先生成 `case.sales_insights.json` 与 `case.sales_playbook.md`：
@@ -46,10 +66,18 @@ uv run xhbx-rag generate-insights \
 - 去掉同一章节目录里的完全重复素材副本，例如 `xxx.txt` 和 `xxx(1).txt`
 - 按章节并发生成节级证据，并在每个章节内按单个来源文件逐次请求模型，再合并为一个节级证据
 - 对单个来源文件失败做隔离，其他来源仍会继续处理
-- 对接口/网络错误走模型客户端重试；对结构化内容错误，会把校验错误和上次输出加入上下文后继续请求模型修复
+- 对接口/网络错误走模型客户端重试（流式响应中途断连也在重试范围内）；对结构化内容错误，会把校验错误和上次输出加入上下文后继续请求模型修复
 - 对章节失败做隔离并写入 `*.sales_evidence.failed.json`，只要还有成功章节，就继续汇总输出案例级 JSON 和 MD
 - 给模型的素材会带 `L001` 形式的行号；模型可以写归纳后的 `quote`，但必须在 `locator.line_start/line_end` 标明支撑它的原文行
 - 使用结构化 tool-call 生成节级/案例级 JSON，默认开启 Qwen 思考模式；如需快速调试或网络不稳可加 `--no-thinking`
+
+案例级汇总默认按知识类型拆成 4 次小调用（`--case-call-mode split`）：
+
+- 先把全部章节证据本地编成带短 ID（`E001`）的证据目录并做精确去重，只把知识主文本喂给模型；模型产出只引用 `evidence_ids`，完整的 `evidence_refs`（含 locator）由本地按 ID 回挂，不经模型抄写
+- 4 次调用依次产出 `case_summary+customer_journey`、`strategies`、`scripts`、`objection_handling`；单个类型失败不影响其余类型，结果状态为 `partial` 并在 `case_part_errors` 中列出失败原因，仍会写出可用的 insights 与 playbook
+- 每个类型成功后在 `generated/<case>/case.insights_parts/` 写入 checkpoint（带输入指纹）；重跑时输入未变的类型直接复用，不再请求模型
+- `--case-call-mode single` 可回退到旧的单次大调用
+- `--reuse-section-evidence` 可复用输出目录中已有的合法章节 `sales_evidence.json`，跳过章节级模型抽取（配合 checkpoint 实现断点续跑）
 
 网络不稳或模型响应慢时，可以调这些参数：
 

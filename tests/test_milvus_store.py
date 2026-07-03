@@ -37,6 +37,62 @@ def test_milvus_chunk_record_flattens_metadata_and_json_fields() -> None:
     assert '"section_name"' in row["citations_json"]
 
 
+def test_to_row_citations_drop_context_and_truncate_long_excerpt() -> None:
+    chunk = RagChunk(
+        chunk_id="chunk-1",
+        chunk_type="script",
+        text="话术文本",
+        metadata={"case_name": "案例A"},
+        citations=[
+            EvidenceRef(
+                section_name="第1节",
+                quote="原文引述",
+                context="很长的上下文" * 200,
+                source_excerpt="超长摘录" * 500,
+            )
+        ],
+        source_file="case.sales_insights.json",
+    )
+
+    row = MilvusChunkRecord.from_chunk(chunk, vector=[0.1, 0.2]).to_row()
+
+    import json
+
+    citations = json.loads(row["citations_json"])
+    assert "context" not in citations[0]
+    assert len(citations[0]["source_excerpt"]) <= 600
+    assert citations[0]["quote"] == "原文引述"
+
+
+def test_to_row_citations_json_never_exceeds_varchar_limit() -> None:
+    refs = [
+        EvidenceRef(
+            section_name=f"第{i}节",
+            quote=f"引述{i}" * 60,
+            source_excerpt="摘录内容" * 150,
+            source_path=f"案例A/第{i}节/文件{i}.txt",
+        )
+        for i in range(200)
+    ]
+    chunk = RagChunk(
+        chunk_id="chunk-1",
+        chunk_type="script",
+        text="话术文本",
+        metadata={"case_name": "案例A"},
+        citations=refs,
+        source_file="case.sales_insights.json",
+    )
+
+    row = MilvusChunkRecord.from_chunk(chunk, vector=[0.1, 0.2]).to_row()
+
+    assert len(row["citations_json"].encode("utf-8")) <= 65535
+    import json
+
+    kept = json.loads(row["citations_json"])
+    assert kept
+    assert kept[0]["section_name"] == "第0节"
+
+
 def test_create_milvus_store_uses_lite_path(monkeypatch) -> None:
     calls = []
 

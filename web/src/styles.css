@@ -169,11 +169,13 @@ h2 {
 }
 
 .session-new-button {
-  flex: 0 0 auto;
-  min-height: 38px;
-  padding: 7px 10px;
+  flex: 0 0 104px;
+  width: 104px;
+  min-height: 44px;
+  padding: 8px 10px;
   font-size: 13px;
   font-weight: 700;
+  white-space: nowrap;
 }
 
 .session-error {
@@ -1331,6 +1333,11 @@ dd {
   .session-header-actions {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .session-new-button {
+    flex-basis: auto;
+    width: 100%;
   }
 
   .session-list {

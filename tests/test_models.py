@@ -72,3 +72,70 @@ def test_confidence_fields_accept_numeric_model_output() -> None:
 
     assert candidate.confidence == "high"
     assert strategy.confidence == "mid"
+
+
+def test_case_part_draft_models_accept_evidence_ids_and_ignore_extras() -> None:
+    from xhbx_rag.models import (
+        CaseJourneyPart,
+        CaseObjectionsPart,
+        CaseScriptsPart,
+        CaseStrategiesPart,
+    )
+
+    journey = CaseJourneyPart.model_validate(
+        {
+            "case_summary": "全案摘要",
+            "customer_journey": [
+                {
+                    "stage": "需求挖掘",
+                    "customer_state": "有预算顾虑",
+                    "sales_goal": "确认预算红线",
+                    "key_actions": "确认红线",
+                    "evidence_ids": ["E001", "E002"],
+                    "extra_field": "忽略",
+                }
+            ],
+        }
+    )
+    strategies = CaseStrategiesPart.model_validate(
+        {
+            "strategies": [
+                {
+                    "name": "预算释放",
+                    "definition": "用缴清保单释放预算",
+                    "confidence": 0.9,
+                    "evidence_ids": "E001",
+                }
+            ]
+        }
+    )
+    scripts = CaseScriptsPart.model_validate(
+        {
+            "scripts": [
+                {
+                    "script_id": "script_001",
+                    "source_quote": "客户说每年不能超过80万",
+                    "evidence_ids": ["E003"],
+                }
+            ]
+        }
+    )
+    objections = CaseObjectionsPart.model_validate(
+        {
+            "objection_handling": [
+                {
+                    "objection": "保险收益太低",
+                    "diagnosis": "客户用投资收益率衡量保险",
+                    "evidence_ids": ["E004"],
+                }
+            ]
+        }
+    )
+
+    assert journey.case_summary == "全案摘要"
+    assert journey.customer_journey[0].evidence_ids == ["E001", "E002"]
+    assert journey.customer_journey[0].key_actions == ["确认红线"]
+    assert strategies.strategies[0].confidence == "high"
+    assert strategies.strategies[0].evidence_ids == ["E001"]
+    assert scripts.scripts[0].script_id == "script_001"
+    assert objections.objection_handling[0].diagnosis == "客户用投资收益率衡量保险"
