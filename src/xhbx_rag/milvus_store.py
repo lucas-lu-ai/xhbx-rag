@@ -18,6 +18,20 @@ logger = logging.getLogger(__name__)
 
 _CITATION_EXCERPT_MAX_CHARS = 600
 _CITATIONS_JSON_MAX_BYTES = 65_535
+_CHUNK_OUTPUT_FIELDS = [
+    "chunk_id",
+    "text",
+    "case_name",
+    "chunk_type",
+    "stage",
+    "scenario",
+    "metadata_json",
+    "citations_json",
+]
+_KEYWORD_CANDIDATE_OUTPUT_FIELDS = ["chunk_id", "text"]
+_KEYWORD_MIN_CANDIDATES = 50
+_KEYWORD_MAX_CANDIDATES = 200
+_KEYWORD_CANDIDATE_MULTIPLIER = 10
 
 
 class MilvusStoreError(RuntimeError):
@@ -157,16 +171,7 @@ class MilvusStore:
             data=[vector],
             filter=expr,
             limit=top_k,
-            output_fields=[
-                "chunk_id",
-                "text",
-                "case_name",
-                "chunk_type",
-                "stage",
-                "scenario",
-                "metadata_json",
-                "citations_json",
-            ],
+            output_fields=_CHUNK_OUTPUT_FIELDS,
         )
         hits: list[MilvusSearchHit] = []
         for item in results[0] if results else []:
@@ -197,20 +202,29 @@ class MilvusStore:
         rows = self.client.query(
             collection_name=self.collection_name,
             filter=expr,
-            limit=max(1000, top_k * 20),
-            output_fields=[
-                "chunk_id",
-                "text",
-                "case_name",
-                "chunk_type",
-                "stage",
-                "scenario",
-                "metadata_json",
-                "citations_json",
-            ],
+            limit=_keyword_candidate_limit(top_k),
+            output_fields=_KEYWORD_CANDIDATE_OUTPUT_FIELDS,
         )
-        scored_hits = _bm25_rank(query_tokens, rows)
-        return scored_hits[:top_k]
+        scored_rows = _bm25_score_rows(query_tokens, rows)[:top_k]
+        ranked_ids = _ranked_chunk_ids(scored_rows)
+        if not ranked_ids:
+            return []
+        detail_rows = self.client.query(
+            collection_name=self.collection_name,
+            filter=_chunk_id_filter_expr(ranked_ids),
+            limit=len(ranked_ids),
+            output_fields=_CHUNK_OUTPUT_FIELDS,
+        )
+        rows_by_id = {str(row.get("chunk_id", "")): row for row in detail_rows}
+        hits: list[MilvusSearchHit] = []
+        for score, row in scored_rows:
+            chunk_id = str(row.get("chunk_id", ""))
+            detail_row = rows_by_id.get(chunk_id)
+            if detail_row is not None:
+                hits.append(
+                    MilvusSearchHit(chunk=_chunk_from_entity(detail_row), score=score)
+                )
+        return hits
 
     def _collection_vector_dim(self) -> int:
         description = self.client.describe_collection(self.collection_name)
@@ -258,6 +272,27 @@ def _escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
+def _keyword_candidate_limit(top_k: int) -> int:
+    return min(
+        _KEYWORD_MAX_CANDIDATES,
+        max(_KEYWORD_MIN_CANDIDATES, top_k * _KEYWORD_CANDIDATE_MULTIPLIER),
+    )
+
+
+def _ranked_chunk_ids(scored_rows: list[tuple[float, dict[str, Any]]]) -> list[str]:
+    chunk_ids: list[str] = []
+    for _, row in scored_rows:
+        chunk_id = str(row.get("chunk_id", "")).strip()
+        if chunk_id and chunk_id not in chunk_ids:
+            chunk_ids.append(chunk_id)
+    return chunk_ids
+
+
+def _chunk_id_filter_expr(chunk_ids: list[str]) -> str:
+    quoted = ", ".join(f'"{_escape(chunk_id)}"' for chunk_id in chunk_ids)
+    return f"chunk_id in [{quoted}]"
+
+
 def _chunk_from_entity(entity: dict[str, Any]) -> RagChunk:
     metadata = json.loads(entity.get("metadata_json", "{}") or "{}")
     citations = [
@@ -275,6 +310,15 @@ def _chunk_from_entity(entity: dict[str, Any]) -> RagChunk:
 
 
 def _bm25_rank(query_tokens: list[str], rows: list[dict[str, Any]]) -> list[MilvusSearchHit]:
+    return [
+        MilvusSearchHit(chunk=_chunk_from_entity(row), score=score)
+        for score, row in _bm25_score_rows(query_tokens, rows)
+    ]
+
+
+def _bm25_score_rows(
+    query_tokens: list[str], rows: list[dict[str, Any]]
+) -> list[tuple[float, dict[str, Any]]]:
     if not rows:
         return []
     tokenized_docs = [_bm25_tokens(str(row.get("text", ""))) for row in rows]
@@ -310,10 +354,7 @@ def _bm25_rank(query_tokens: list[str], rows: list[dict[str, Any]]) -> list[Milv
             scored.append((score, row))
 
     scored.sort(key=lambda item: item[0], reverse=True)
-    return [
-        MilvusSearchHit(chunk=_chunk_from_entity(row), score=score)
-        for score, row in scored
-    ]
+    return scored
 
 
 def _bm25_tokens(text: str) -> list[str]:

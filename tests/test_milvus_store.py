@@ -250,3 +250,48 @@ def test_milvus_lite_store_keyword_search_ranks_exact_term_matches(tmp_path) -> 
     assert len(results) == 1
     assert results[0].chunk.chunk_id == "chunk-2"
     assert results[0].score > 0
+
+
+def test_keyword_search_limits_candidate_payload_before_loading_details() -> None:
+    class FakeMilvusClient:
+        def __init__(self) -> None:
+            self.query_calls = []
+
+        def has_collection(self, collection_name):
+            return True
+
+        def load_collection(self, collection_name):
+            pass
+
+        def query(self, **kwargs):
+            self.query_calls.append(kwargs)
+            if len(self.query_calls) == 1:
+                return [
+                    {"chunk_id": "chunk-1", "text": "普通家庭保障配置"},
+                    {"chunk_id": "chunk-2", "text": "客户预算不足时使用预算释放与置换法"},
+                ]
+            return [
+                {
+                    "chunk_id": "chunk-2",
+                    "text": "客户预算不足时使用预算释放与置换法",
+                    "case_name": "案例A",
+                    "chunk_type": "script",
+                    "stage": "异议处理",
+                    "scenario": "",
+                    "metadata_json": '{"case_name": "案例A", "stage": "异议处理"}',
+                    "citations_json": "[]",
+                }
+            ]
+
+    store = milvus_store.MilvusStore.__new__(milvus_store.MilvusStore)
+    store.collection_name = "chunks"
+    store.client = FakeMilvusClient()
+
+    results = store.keyword_search(query="预算释放", top_k=20)
+
+    assert [hit.chunk.chunk_id for hit in results] == ["chunk-2"]
+    first_call, second_call = store.client.query_calls
+    assert first_call["limit"] == 200
+    assert first_call["output_fields"] == ["chunk_id", "text"]
+    assert second_call["limit"] == 1
+    assert second_call["filter"] == 'chunk_id in ["chunk-2"]'
