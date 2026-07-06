@@ -4,7 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { App } from "./App";
 import {
   answerPayload,
-  answerPayloadWithCitations,
+  answerPayloadWithEvidences,
   answerStreamResponse,
   deferredResponse,
   installFetchStub,
@@ -173,8 +173,7 @@ test("titles a new session from the first submitted question and persists it", a
   expect(stored.sessions[0].title).toBe("客户说每年不能超过80万怎么办？");
 });
 
-test("collapses long citation lists and toggles all citations", async () => {
-  const user = userEvent.setup();
+test("marks answer-cited evidence cards with a badge", async () => {
   localStorage.setItem(
     "xhbx-rag.chat-sessions.v1",
     JSON.stringify({
@@ -183,7 +182,7 @@ test("collapses long citation lists and toggles all citations", async () => {
       sessions: [
         {
           id: "session-1",
-          title: "多引用回答",
+          title: "多证据回答",
           created_at: "2026-07-01T08:00:00.000Z",
           updated_at: "2026-07-01T08:01:00.000Z",
           turns: [
@@ -192,7 +191,7 @@ test("collapses long citation lists and toggles all citations", async () => {
               query: "客户预算有限怎么办？",
               top_n: 20,
               top_k: 10,
-              response: answerPayloadWithCitations(5)
+              response: answerPayloadWithEvidences(2, [2])
             }
           ]
         }
@@ -202,28 +201,13 @@ test("collapses long citation lists and toggles all citations", async () => {
   installFetchStub();
   render(<App />);
 
-  const citationList = await screen.findByLabelText("引用列表");
-  expect(within(citationList).getByRole("button", { name: /引用 1/ })).toBeInTheDocument();
-  expect(within(citationList).getByRole("button", { name: /引用 3/ })).toBeInTheDocument();
-  expect(
-    within(citationList).queryByRole("button", { name: /引用 4/ })
-  ).not.toBeInTheDocument();
-  expect(
-    within(citationList).queryByRole("button", { name: /引用 5/ })
-  ).not.toBeInTheDocument();
-
-  await user.click(within(citationList).getByRole("button", { name: "显示更多" }));
-
-  expect(within(citationList).getByRole("button", { name: /引用 4/ })).toBeInTheDocument();
-  expect(within(citationList).getByRole("button", { name: /引用 5/ })).toBeInTheDocument();
-  expect(within(citationList).getByRole("button", { name: "收起" })).toBeInTheDocument();
-
-  await user.click(within(citationList).getByRole("button", { name: "收起" }));
-
-  expect(
-    within(citationList).queryByRole("button", { name: /引用 4/ })
-  ).not.toBeInTheDocument();
-  expect(within(citationList).getByRole("button", { name: "显示更多" })).toBeInTheDocument();
+  const evidenceList = await screen.findByRole("region", {
+    name: "检索证据列表"
+  });
+  const cards = within(evidenceList).getAllByRole("article");
+  expect(cards).toHaveLength(2);
+  expect(within(cards[0]).queryByText("答案引用")).not.toBeInTheDocument();
+  expect(within(cards[1]).getByText("答案引用")).toBeInTheDocument();
 });
 
 test("loads status and submits a question", async () => {
@@ -239,7 +223,9 @@ test("loads status and submits a question", async () => {
   expect(
     await screen.findByText("先承接预算，再讨论缴费期和保障缺口。")
   ).toBeInTheDocument();
-  expect(screen.getByRole("button", { name: /引用 1/ })).toBeInTheDocument();
+  expect(
+    screen.getByRole("button", { name: "第2节.track-0.txt · L1" })
+  ).toBeInTheDocument();
   expect(screen.getByText("处理过程")).toBeInTheDocument();
   expect(screen.getByText("已完成问题理解")).toBeInTheDocument();
   expect(screen.getByText("已完成证据重排")).toBeInTheDocument();
@@ -313,17 +299,20 @@ test("streams answer text before final metadata arrives", async () => {
   expect(screen.getByText("处理过程")).toBeInTheDocument();
 });
 
-test("selects a citation and reveals the source file", async () => {
+test("selects an evidence source and reveals the source file", async () => {
   const user = userEvent.setup();
   const { requests } = installFetchStub();
   render(<App />);
 
   await user.type(screen.getByLabelText("输入问题"), "客户说每年不能超过80万怎么办？");
   await user.click(screen.getByRole("button", { name: "发送" }));
-  await user.click(await screen.findByRole("button", { name: /引用 1/ }));
+  const sourceButton = await screen.findByRole("button", {
+    name: "第2节.track-0.txt · L1"
+  });
+  await user.click(sourceButton);
 
-  expect(screen.getByText("data/案例A/第1节.track-0.txt")).toBeInTheDocument();
-  expect(screen.getByText("客户说每年保费预算不能超过80万")).toBeInTheDocument();
+  expect(sourceButton).toHaveAttribute("aria-pressed", "true");
+  expect(screen.getByText("data/案例A/第2节.track-0.txt")).toBeInTheDocument();
 
   await user.click(screen.getByRole("button", { name: "在 Finder 中显示文件" }));
 
@@ -331,7 +320,7 @@ test("selects a citation and reveals the source file", async () => {
   expect(requests).toContainEqual(
     expect.objectContaining({
       url: "/api/source/reveal",
-      body: { source_path: "data/案例A/第1节.track-0.txt" }
+      body: { source_path: "data/案例A/第2节.track-0.txt" }
     })
   );
 });
@@ -345,15 +334,50 @@ test("shows retrieval evidence used by the answer model", async () => {
   await user.click(screen.getByRole("button", { name: "发送" }));
 
   expect(await screen.findByText("检索证据")).toBeInTheDocument();
+  const evidenceList = screen.getByRole("region", { name: "检索证据列表" });
   expect(
-    screen.getByRole("region", { name: "检索证据列表" })
+    within(evidenceList).getByText("证据 1 · objection_handling")
   ).toBeInTheDocument();
-  expect(screen.getByText("证据 1 · objection_handling")).toBeInTheDocument();
   expect(
-    screen.getByText("客户担心预算，可以先承接预算，再对齐保障缺口。")
+    within(evidenceList).getByText(
+      "客户担心预算，可以先承接预算，再对齐保障缺口。"
+    )
   ).toBeInTheDocument();
-  expect(screen.getByText("案例A · 需求分析")).toBeInTheDocument();
-  expect(screen.getByText("第2节.track-0.txt · L1")).toBeInTheDocument();
+  expect(within(evidenceList).getByText("案例A · 需求分析")).toBeInTheDocument();
+  expect(
+    within(evidenceList).getByText("第2节.track-0.txt · L1")
+  ).toBeInTheDocument();
+  expect(within(evidenceList).getByText("答案引用")).toBeInTheDocument();
+});
+
+test("labels evidence inline and keeps it in usable feedback", async () => {
+  const user = userEvent.setup();
+  const { requests } = installFetchStub();
+  render(<App />);
+
+  await user.type(screen.getByLabelText("输入问题"), "客户说每年不能超过80万怎么办？");
+  await user.click(screen.getByRole("button", { name: "发送" }));
+  await user.click(await screen.findByLabelText("证据 1 排序太低"));
+  await user.click(screen.getByRole("button", { name: "可用" }));
+
+  expect(await screen.findByText("已记录可用反馈。")).toBeInTheDocument();
+  expect(requests).toContainEqual(
+    expect.objectContaining({
+      url: "/api/bad-cases",
+      body: expect.objectContaining({
+        feedback_result: "usable",
+        issue_types: ["usable"],
+        evidence_feedback: [
+          {
+            chunk_id: "case-a-2",
+            judgement: "ranking_low",
+            label: "案例A · 需求分析",
+            text_preview: "客户担心预算，可以先承接预算，再对齐保障缺口。"
+          }
+        ]
+      })
+    })
+  );
 });
 
 test("submits a bad case with retrieval context", async () => {

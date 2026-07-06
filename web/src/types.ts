@@ -24,6 +24,9 @@ export type Citation = {
   display_location: string;
   display_excerpt: string;
   can_reveal: boolean;
+  // 后端标注：是否为模型选中的引用，以及所属证据序号（1-based）。旧数据可能缺失。
+  selected?: boolean;
+  evidence_index?: number;
   [key: string]: unknown;
 };
 
@@ -160,7 +163,10 @@ export type BadCaseProblemTag =
   | "compliance_risk"
   | "other";
 
-export type EvidenceFeedbackJudgement = "should_use" | "should_not_use";
+export type EvidenceFeedbackJudgement =
+  | "should_use"
+  | "should_not_use"
+  | "ranking_low";
 
 export type EvidenceFeedback = {
   chunk_id?: string;

@@ -76,7 +76,7 @@ _ALLOWED_BAD_CASE_PROBLEM_TAGS = {
     "compliance_risk",
     "other",
 }
-_ALLOWED_EVIDENCE_FEEDBACK_JUDGEMENTS = {"should_use", "should_not_use"}
+_ALLOWED_EVIDENCE_FEEDBACK_JUDGEMENTS = {"should_use", "should_not_use", "ranking_low"}
 
 
 class AnswerRequest(BaseModel):

@@ -1,10 +1,26 @@
 import json
+from datetime import datetime
 
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
-from xhbx_rag.observability import CompositeTraceSink, MemoryTraceSink, StudioTraceSink
+from xhbx_rag.observability import (
+    CompositeTraceSink,
+    MemoryTraceSink,
+    StudioTraceSink,
+    TraceEvent,
+)
+
+
+def test_trace_event_timestamp_is_local_time_without_extra_fields() -> None:
+    before = datetime.now().replace(microsecond=0)
+
+    event = TraceEvent(step="test.step", payload={})
+
+    after = datetime.now().replace(microsecond=0)
+    parsed = datetime.strptime(event.timestamp, "%Y-%m-%d %H:%M:%S")
+    assert before <= parsed <= after
 
 
 def test_studio_trace_sink_exports_step_spans_under_root_span() -> None:

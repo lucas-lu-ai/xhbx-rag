@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sys
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any, Mapping, Protocol, TextIO
 
 from opentelemetry import trace as otel_trace
@@ -22,7 +22,9 @@ class TraceSink(Protocol):
 class TraceEvent:
     step: str
     payload: dict[str, Any]
-    timestamp: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
+    timestamp: str = field(
+        default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    )
 
     def to_dict(self) -> dict[str, Any]:
         return {

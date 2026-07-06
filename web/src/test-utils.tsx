@@ -30,7 +30,9 @@ export const answerPayload = {
       display_location: "L2",
       display_excerpt: "客户说每年保费预算不能超过80万",
       locator_confidence: "validated_span",
-      can_reveal: true
+      can_reveal: true,
+      selected: true,
+      evidence_index: 1
     }
   ],
   evidence_count: 1,
@@ -56,19 +58,42 @@ export const answerPayload = {
   ]
 };
 
-export function answerPayloadWithCitations(count: number) {
+// 构造多证据回答：citedIndexes 指定答案引用了哪些证据（1-based）。
+export function answerPayloadWithEvidences(
+  count: number,
+  citedIndexes: number[] = [1]
+) {
   return {
     ...answerPayload,
-    citations: Array.from({ length: count }, (_, index) => ({
-      filename: `第${index + 1}节.track-0.txt`,
+    citations: citedIndexes.map((evidenceIndex) => ({
+      filename: `第${evidenceIndex}节.track-0.txt`,
       source_type: "txt",
-      source_path: `data/案例A/第${index + 1}节.track-0.txt`,
-      display_location: `L${index + 1}`,
-      display_excerpt: `第${index + 1}条引用原文`,
+      source_path: `data/案例A/第${evidenceIndex}节.track-0.txt`,
+      display_location: `L${evidenceIndex}`,
+      display_excerpt: `第${evidenceIndex}条引用原文`,
       locator_confidence: "validated_span",
-      can_reveal: true
+      can_reveal: true,
+      selected: true,
+      evidence_index: evidenceIndex
     })),
-    evidence_count: count
+    evidence_count: count,
+    retrieval_evidences: Array.from({ length: count }, (_, index) => ({
+      chunk_id: `case-a-${index + 1}`,
+      chunk_type: "objection_handling",
+      text: `证据${index + 1}正文内容。`,
+      rerank_score: 0.9 - index * 0.1,
+      metadata: { case_name: "案例A", stage: `阶段${index + 1}` },
+      citations: [
+        {
+          filename: `第${index + 1}节.track-0.txt`,
+          source_type: "txt",
+          source_path: `data/案例A/第${index + 1}节.track-0.txt`,
+          display_location: `L${index + 1}`,
+          display_excerpt: `第${index + 1}条引用原文`,
+          can_reveal: true
+        }
+      ]
+    }))
   };
 }
 

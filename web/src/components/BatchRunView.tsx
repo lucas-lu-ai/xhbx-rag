@@ -35,7 +35,6 @@ import type {
   Citation
 } from "../types";
 import { BadCasePanel } from "./BadCasePanel";
-import { CitationList } from "./CitationList";
 
 type BatchRunViewProps = {
   runId: string;
@@ -298,7 +297,6 @@ function BatchRunRow({
   onRetry: () => void;
   submitBadCase: (payload: BadCaseRequest) => Promise<unknown>;
 }) {
-  const keyPrefix = `row-${question.row_index}`;
   const response = question.response ?? undefined;
 
   return (
@@ -349,22 +347,16 @@ function BatchRunRow({
             <p className="meta-text">改写问题：{response.rewritten_query}</p>
           )}
           {response && (
-            <>
-              <CitationList
-                citations={response.citations}
-                keyPrefix={keyPrefix}
-                selectedKey={selectedCitationKey}
-                onSelect={(citation, key) =>
-                  onSelectCitation(citation, key, response)
-                }
-              />
-              <BadCasePanel
-                turn={batchQuestionDetailToChatTurn(question)}
-                response={response}
-                submit={submitBadCase}
-                initiallySubmitted={Boolean(question.bad_case)}
-              />
-            </>
+            <BadCasePanel
+              turn={batchQuestionDetailToChatTurn(question)}
+              response={response}
+              submit={submitBadCase}
+              initiallySubmitted={Boolean(question.bad_case)}
+              selectedCitationKey={selectedCitationKey}
+              onSelectCitation={(citation, key) =>
+                onSelectCitation(citation, key, response)
+              }
+            />
           )}
         </div>
       )}

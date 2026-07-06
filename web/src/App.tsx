@@ -25,7 +25,6 @@ import {
 import { BatchCreateView } from "./components/BatchCreateView";
 import { BatchRunView } from "./components/BatchRunView";
 import { ChatView } from "./components/ChatView";
-import { EvidenceList } from "./components/EvidenceList";
 import { SessionSidebar } from "./components/SessionSidebar";
 import {
   loadSessionSelection,
@@ -338,7 +337,6 @@ export function App({
     effectiveSelection.kind === "batch"
       ? batchCitationResponse ?? undefined
       : chatLatestResponse;
-  const latestEvidences = evidenceResponse?.retrieval_evidences ?? [];
 
   return (
     <div className="app-shell">
@@ -471,7 +469,6 @@ export function App({
               {revealMessage && <p className="meta-text">{revealMessage}</p>}
             </div>
           )}
-          <EvidenceList response={evidenceResponse} evidences={latestEvidences} />
         </section>
       </aside>
     </div>

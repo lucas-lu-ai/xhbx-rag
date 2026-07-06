@@ -600,14 +600,7 @@ test("批量视图引用选中态使用稳定 key 并联动证据面板", async 
   expect(
     await screen.findByText("先承接预算，再讨论缴费期和保障缺口。")
   ).toBeInTheDocument();
-  expect(screen.getByText("暂无检索证据。")).toBeInTheDocument();
 
-  await user.click(screen.getByRole("button", { name: /引用 1/ }));
-
-  expect(screen.getByRole("button", { name: /引用 1/ })).toHaveAttribute(
-    "aria-pressed",
-    "true"
-  );
   const evidenceList = await screen.findByRole("region", {
     name: "检索证据列表"
   });
@@ -616,4 +609,12 @@ test("批量视图引用选中态使用稳定 key 并联动证据面板", async 
       "客户担心预算，可以先承接预算，再对齐保障缺口。"
     )
   ).toBeInTheDocument();
+
+  const sourceButton = within(evidenceList).getByRole("button", {
+    name: "第2节.track-0.txt · L1"
+  });
+  await user.click(sourceButton);
+
+  expect(sourceButton).toHaveAttribute("aria-pressed", "true");
+  expect(screen.getByText("data/案例A/第2节.track-0.txt")).toBeInTheDocument();
 });

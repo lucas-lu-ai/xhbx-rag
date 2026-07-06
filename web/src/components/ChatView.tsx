@@ -25,7 +25,7 @@ import type {
   Citation
 } from "../types";
 import { BadCasePanel } from "./BadCasePanel";
-import { CitationList, citationKey } from "./CitationList";
+import { firstCitationSelection } from "./EvidenceList";
 import { ProcessTimeline } from "./ProcessTimeline";
 
 const DEFAULT_TOP_N = 20;
@@ -140,9 +140,13 @@ export function ChatView({
     if (!mountedRef.current) {
       return;
     }
-    const first = response.citations[0];
+    const first = firstCitationSelection(
+      turnId,
+      response.citations,
+      response.retrieval_evidences ?? []
+    );
     if (first) {
-      onSelectCitation(first, citationKey(turnId, 0), response);
+      onSelectCitation(first.citation, first.key, response);
     } else {
       onSelectCitation(null, null, response);
     }
@@ -227,19 +231,16 @@ export function ChatView({
                     </p>
                   )}
                   {turn.response && (
-                    <>
-                      <CitationList
-                        citations={turn.response.citations}
-                        keyPrefix={turn.id}
-                        selectedKey={selectedCitationKey}
-                        onSelect={(citation, key) => {
-                          if (turn.response) {
-                            onSelectCitation(citation, key, turn.response);
-                          }
-                        }}
-                      />
-                      <BadCasePanel turn={turn} response={turn.response} />
-                    </>
+                    <BadCasePanel
+                      turn={turn}
+                      response={turn.response}
+                      selectedCitationKey={selectedCitationKey}
+                      onSelectCitation={(citation, key) => {
+                        if (turn.response) {
+                          onSelectCitation(citation, key, turn.response);
+                        }
+                      }}
+                    />
                   )}
                 </div>
               )}

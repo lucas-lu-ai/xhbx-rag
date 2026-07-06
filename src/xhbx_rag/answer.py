@@ -267,10 +267,13 @@ def _evidence_text(search_result: dict[str, Any]) -> str:
 
 
 def _all_citations(search_result: dict[str, Any]) -> list[dict[str, Any]]:
+    # evidence_index 标注引用属于第几条证据（1-based），供 UI 把引用挂回证据卡片。
     citations: list[dict[str, Any]] = []
-    for item in search_result.get("results", []) or []:
+    for evidence_index, item in enumerate(
+        search_result.get("results", []) or [], start=1
+    ):
         for citation in item.get("citations", []) or []:
-            citations.append(dict(citation))
+            citations.append({**citation, "evidence_index": evidence_index})
     return citations
 
 
@@ -284,7 +287,7 @@ def _selected_citations(
         if index in seen_indexes or index < 1 or index > len(citations):
             continue
         seen_indexes.add(index)
-        selected.append(citations[index - 1])
+        selected.append({**citations[index - 1], "selected": True})
     return selected
 
 
@@ -292,16 +295,22 @@ def _citations_with_evidence_fallback(
     search_result: dict[str, Any],
     selected: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
+    # 模型选中的引用标 selected=True；为溯源完整性兜底补齐的引用标 selected=False，
+    # UI 据此收敛展示而不丢失完整引用数据。
     citations = list(selected)
     seen_keys = {_citation_key(citation) for citation in citations}
-    for item in search_result.get("results", []) or []:
+    for evidence_index, item in enumerate(
+        search_result.get("results", []) or [], start=1
+    ):
         for citation in item.get("citations", []) or []:
             if not isinstance(citation, dict):
                 continue
             key = _citation_key(citation)
             if key in seen_keys:
                 continue
-            citations.append(dict(citation))
+            citations.append(
+                {**citation, "evidence_index": evidence_index, "selected": False}
+            )
             seen_keys.add(key)
     return citations
 

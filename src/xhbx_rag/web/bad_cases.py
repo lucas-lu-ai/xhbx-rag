@@ -32,6 +32,7 @@ ISSUE_TYPE_LABELS = {
 EVIDENCE_FEEDBACK_JUDGEMENT_LABELS = {
     "should_use": "应该用",
     "should_not_use": "不该用",
+    "ranking_low": "该用但排序太低",
 }
 
 

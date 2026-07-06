@@ -285,8 +285,11 @@ uv run xhbx-rag answer \
 
 ```bash
 uv run xhbx-rag-mcp                              # stdio（默认，供本机客户端）
-uv run xhbx-rag-mcp --transport streamable-http  # HTTP（供远程客户端，默认 127.0.0.1:8000/mcp）
+uv run xhbx-rag-mcp --transport streamable-http  # HTTP（供远程客户端，默认 http://127.0.0.1:8000/mcp）
+uv run xhbx-rag-mcp --transport streamable-http --host 0.0.0.0 --port 9331   # 自定义监听地址与端口
 ```
+
+`--host/--port` 仅对 `streamable-http` 生效。服务本身无鉴权，把 `--host` 绑定到非回环地址（如 `0.0.0.0`）前请确认处于可信内网，不要暴露到公网。
 
 服务对外提供两个工具：
 

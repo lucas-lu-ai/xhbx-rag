@@ -526,6 +526,67 @@ def test_bad_case_route_saves_payload(monkeypatch) -> None:
     assert calls["payload"]["retrieval_evidences"] == [{"chunk_id": "case-a-1"}]
 
 
+def test_bad_case_route_accepts_ranking_low_evidence_judgement(monkeypatch) -> None:
+    calls = {}
+
+    def fake_save_bad_case(payload: dict):
+        calls["payload"] = payload
+        return {"ok": True, "bad_case_id": "bad-case-2", "path": ".local/x.jsonl"}
+
+    monkeypatch.setattr(web_app, "save_bad_case", fake_save_bad_case)
+    client = TestClient(web_app.create_app())
+
+    response = client.post(
+        "/api/bad-cases",
+        json={
+            "query": "保单整理对客户有什么作用？",
+            "answer": "answer",
+            "top_n": 20,
+            "top_k": 5,
+            "issue_types": ["ranking_wrong"],
+            "evidence_feedback": [
+                {
+                    "chunk_id": "case-a-1",
+                    "judgement": "ranking_low",
+                    "label": "案例A · 需求分析",
+                    "text_preview": "先做保单整理。",
+                }
+            ],
+            "citations": [],
+            "retrieval_evidences": [],
+        },
+    )
+
+    assert response.status_code == 200
+    assert calls["payload"]["evidence_feedback"][0]["judgement"] == "ranking_low"
+
+
+def test_bad_case_route_rejects_unknown_evidence_judgement(monkeypatch) -> None:
+    def fail_if_called(payload: dict):
+        raise AssertionError("save_bad_case should not be called")
+
+    monkeypatch.setattr(web_app, "save_bad_case", fail_if_called)
+    client = TestClient(web_app.create_app())
+
+    response = client.post(
+        "/api/bad-cases",
+        json={
+            "query": "保单整理对客户有什么作用？",
+            "answer": "answer",
+            "top_n": 20,
+            "top_k": 5,
+            "issue_types": ["other"],
+            "evidence_feedback": [
+                {"chunk_id": "case-a-1", "judgement": "not_allowed"}
+            ],
+            "citations": [],
+            "retrieval_evidences": [],
+        },
+    )
+
+    assert response.status_code == 422
+
+
 def test_bad_case_route_rejects_unknown_issue_type(monkeypatch) -> None:
     def fail_if_called(payload: dict):
         raise AssertionError("save_bad_case should not be called")

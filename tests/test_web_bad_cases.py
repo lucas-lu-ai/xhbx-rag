@@ -62,6 +62,12 @@ def test_save_bad_case_adds_chinese_labels_for_review_fields(tmp_path: Path) -> 
                     "label": "案例B · 销售动作",
                     "text_preview": "先介绍销售流程。",
                 },
+                {
+                    "chunk_id": "case-c-3",
+                    "judgement": "ranking_low",
+                    "label": "案例C · 缺口分析",
+                    "text_preview": "缺口分析应更靠前。",
+                },
             ],
         },
         project_root=tmp_path,
@@ -84,6 +90,8 @@ def test_save_bad_case_adds_chinese_labels_for_review_fields(tmp_path: Path) -> 
     assert record["evidence_feedback"][0]["judgement_label"] == "应该用"
     assert record["evidence_feedback"][1]["judgement"] == "should_not_use"
     assert record["evidence_feedback"][1]["judgement_label"] == "不该用"
+    assert record["evidence_feedback"][2]["judgement"] == "ranking_low"
+    assert record["evidence_feedback"][2]["judgement_label"] == "该用但排序太低"
 
 
 def test_save_bad_case_appends_multiple_records(tmp_path: Path) -> None:

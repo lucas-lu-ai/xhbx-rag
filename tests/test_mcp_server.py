@@ -186,3 +186,19 @@ def test_create_default_server_without_injection():
     server = create_mcp_server()
     tools = asyncio.run(server.list_tools())
     assert {tool.name for tool in tools} == {"search_knowledge", "retrieval_status"}
+
+
+def test_create_server_uses_default_http_binding():
+    server = create_mcp_server(searcher=FakeSearcher())
+    assert server.settings.host == "127.0.0.1"
+    assert server.settings.port == 8000
+
+
+def test_create_server_accepts_custom_http_binding():
+    server = create_mcp_server(
+        searcher=FakeSearcher(),
+        host="0.0.0.0",
+        port=9331,
+    )
+    assert server.settings.host == "0.0.0.0"
+    assert server.settings.port == 9331

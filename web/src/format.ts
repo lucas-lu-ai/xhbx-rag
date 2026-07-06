@@ -30,6 +30,17 @@ export function formatEvidenceSource(citation: Citation): string {
   return [file, location].filter(Boolean).join(" · ");
 }
 
+const LOCATOR_CONFIDENCE_LABELS: Record<string, string> = {
+  validated_span: "精确定位",
+  exact: "精确定位",
+  approximate: "近似定位",
+  unmatched: "原文未匹配"
+};
+
+export function formatLocatorConfidence(value?: string): string {
+  return value ? LOCATOR_CONFIDENCE_LABELS[value] ?? "" : "";
+}
+
 export function formatScore(value: unknown): string {
   return typeof value === "number" && Number.isFinite(value)
     ? value.toFixed(2)

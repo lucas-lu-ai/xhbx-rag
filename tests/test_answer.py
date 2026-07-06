@@ -191,6 +191,8 @@ def test_answer_from_search_result_maps_selected_citations_and_emits_trace() -> 
         "第1节.docx",
         "第3节.docx",
     ]
+    assert [citation["selected"] for citation in result["citations"]] == [True, True]
+    assert [citation["evidence_index"] for citation in result["citations"]] == [2, 1]
     assert [event.step for event in trace.events] == ["answer.generated"]
     assert trace.events[0].payload["citation_count"] == 2
 
@@ -216,6 +218,9 @@ def test_answer_from_search_result_supplements_underselected_citations_with_evid
         "第3节.docx",
         "第1节.docx",
     ]
+    # 模型选中的引用与兜底补齐的引用要能区分，且都能挂回对应证据。
+    assert [citation["selected"] for citation in result["citations"]] == [True, False]
+    assert [citation["evidence_index"] for citation in result["citations"]] == [1, 2]
 
 
 def test_answer_from_search_result_skips_model_when_no_results() -> None:

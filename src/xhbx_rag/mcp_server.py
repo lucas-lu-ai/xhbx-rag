@@ -34,6 +34,10 @@ SERVER_INSTRUCTIONS = (
 DEFAULT_TOP_N = 20
 DEFAULT_TOP_K = 5
 
+# 仅对 streamable-http 传输生效；stdio 模式忽略。
+DEFAULT_HTTP_HOST = "127.0.0.1"
+DEFAULT_HTTP_PORT = 8000
+
 UNAVAILABLE_SEARCH_ERROR = "检索服务暂时不可用"
 SAFE_CONFIG_PARSE_ERROR = "配置解析失败，请检查 .env 中的数值配置。"
 LOCAL_INDEX_UNAVAILABLE_ERROR = (
@@ -136,12 +140,15 @@ class ConfiguredEvidenceSearcher:
 def create_mcp_server(
     searcher: EvidenceSearcher | None = None,
     status_provider: Callable[[], dict[str, Any]] | None = None,
+    *,
+    host: str = DEFAULT_HTTP_HOST,
+    port: int = DEFAULT_HTTP_PORT,
 ) -> FastMCP:
     active_searcher = searcher if searcher is not None else ConfiguredEvidenceSearcher()
     active_status = (
         status_provider if status_provider is not None else _default_status_provider
     )
-    server = FastMCP(SERVER_NAME, instructions=SERVER_INSTRUCTIONS)
+    server = FastMCP(SERVER_NAME, instructions=SERVER_INSTRUCTIONS, host=host, port=port)
 
     @server.tool(
         name="search_knowledge",
@@ -246,10 +253,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         default="stdio",
         help="传输方式：stdio 供本机客户端（默认），streamable-http 供远程客户端",
     )
+    parser.add_argument(
+        "--host",
+        default=DEFAULT_HTTP_HOST,
+        help=(
+            "HTTP 监听地址，仅对 streamable-http 生效，默认 127.0.0.1。"
+            "服务无鉴权，绑定非回环地址前请确认处于可信内网"
+        ),
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_HTTP_PORT,
+        help="HTTP 监听端口，仅对 streamable-http 生效，默认 8000",
+    )
     args = parser.parse_args(argv)
-    create_mcp_server().run(transport=args.transport)
+    create_mcp_server(host=args.host, port=args.port).run(transport=args.transport)
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+    # uv run xhbx-rag-mcp --transport streamable-http --port 9331
+    #     name="xhbx_rag",
+    #     transport="streamable_http",
+    #     url="http://<服务机IP>:9331/mcp"
