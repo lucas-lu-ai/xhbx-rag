@@ -255,6 +255,36 @@ def infer_tags(
     }
 
 
+def infer_query_tags(text: str) -> list[str]:
+    """对查询文本套用与 chunk 相同的打标规则，返回标签路径。
+
+    不含合规风险维度：合规标签用于回答侧提示，不参与召回加权。
+    """
+    haystack = text.lower()
+    if not haystack.strip():
+        return []
+    paths = list(_paths_from_rules(haystack, _BUSINESS_TAG_RULES))
+    paths.extend(
+        f"销售阶段/{value}" for value in _values_from_rules(haystack, _SALES_STAGE_RULES)
+    )
+    paths.extend(
+        f"客户画像/{value}"
+        for value in _values_from_rules(haystack, _CUSTOMER_SEGMENT_RULES)
+    )
+    paths.extend(
+        f"客户需求/{value}" for value in _values_from_rules(haystack, _CUSTOMER_NEED_RULES)
+    )
+    paths.extend(
+        f"险种产品/{value}"
+        for value in _values_from_rules(haystack, _PRODUCT_CATEGORY_RULES)
+    )
+    paths.extend(
+        f"异议类型/{value}"
+        for value in _values_from_rules(haystack, _OBJECTION_TYPE_RULES)
+    )
+    return _dedupe(paths)
+
+
 def render_tag_line(metadata: dict[str, Any]) -> str:
     tag_paths = _str_list(metadata.get("tag_paths"))
     if not tag_paths:

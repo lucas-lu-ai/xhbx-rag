@@ -1,5 +1,5 @@
 from xhbx_rag.models import EvidenceRef, RagChunk
-from xhbx_rag.tagging import render_tag_line, tag_chunk
+from xhbx_rag.tagging import infer_query_tags, render_tag_line, tag_chunk
 
 
 def test_tag_chunk_adds_chinese_tags_from_text_and_metadata() -> None:
@@ -76,3 +76,22 @@ def test_tag_chunk_marks_product_and_compliance_risk() -> None:
 
 def test_render_tag_line_returns_empty_without_paths() -> None:
     assert render_tag_line({"tag_paths": []}) == ""
+
+
+def test_infer_query_tags_uses_same_rules_as_chunk_tagging() -> None:
+    tags = infer_query_tags("高净值客户财富传承的话术怎么讲")
+
+    assert "客户画像/高净值客户" in tags
+    assert "客户需求/财富传承" in tags
+    assert "客户经营/特殊客户服务/高净值客户服务" in tags
+
+
+def test_infer_query_tags_excludes_compliance_risk_dimension() -> None:
+    tags = infer_query_tags("怎么给客户讲保证收益的年金")
+
+    assert "险种产品/年金险" in tags
+    assert not any(tag.startswith("合规风险/") for tag in tags)
+
+
+def test_infer_query_tags_returns_empty_when_nothing_matches() -> None:
+    assert infer_query_tags("今天天气怎么样") == []

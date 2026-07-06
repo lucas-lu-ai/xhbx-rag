@@ -269,9 +269,99 @@ def test_search_evidence_hybrid_retrieval_fuses_vector_and_keyword_hits() -> Non
         "search.vector_searched",
         "search.keyword_searched",
         "search.hybrid_fused",
+        "search.tag_boosted",
         "search.reranked",
         "search.completed",
     ]
+
+
+def _tagged_chunk(chunk_id: str, text: str, tag_paths: list[str]) -> RagChunk:
+    return RagChunk(
+        chunk_id=chunk_id,
+        chunk_type="script",
+        text=text,
+        metadata={"case_name": "案例A", "stage": "需求分析", "tag_paths": tag_paths},
+        citations=[],
+        source_file="case.sales_insights.json",
+    )
+
+
+def test_search_evidence_tag_boost_promotes_tag_matched_candidate() -> None:
+    class _WealthQueryAgent:
+        def understand(self, query: str) -> QueryUnderstanding:
+            return QueryUnderstanding(
+                intent="script_search",
+                rewritten_query="高净值客户财富传承的话术",
+                needs_retrieval=True,
+                filters=QueryFilters(),
+            )
+
+    embedding = _FakeEmbedding()
+    store = _FakeHybridStore()
+    hit_a = MilvusSearchHit(chunk=_tagged_chunk("a", "开场寒暄", []), score=0.9)
+    hit_b = MilvusSearchHit(chunk=_tagged_chunk("b", "讲产品组合", []), score=0.8)
+    hit_c = MilvusSearchHit(
+        chunk=_tagged_chunk(
+            "c",
+            "高净值客户传承安排讲解",
+            ["客户画像/高净值客户", "客户需求/财富传承"],
+        ),
+        score=0.7,
+    )
+    store.hits = [hit_a, hit_b]
+    store.keyword_hits = [hit_a, hit_c]
+    reranker = _CapturingReranker()
+    trace = MemoryTraceSink()
+
+    result = search_evidence(
+        query="高净值客户怎么聊财富传承？",
+        query_agent=_WealthQueryAgent(),
+        embedding_client=embedding,
+        store=store,
+        reranker=reranker,
+        top_n=2,
+        top_k=2,
+        trace=trace,
+    )
+
+    # 无加权时 RRF 排序为 a > b > c，top_n=2 会截掉 c；
+    # 标签命中 2 条路径后 c 的融合分 ×1.2 超过 b，挤进 rerank 名单。
+    assert reranker.calls[0]["documents"] == ["开场寒暄", "高净值客户传承安排讲解"]
+    assert [item["chunk_id"] for item in result["results"]] == ["a", "c"]
+
+    steps = [event.step for event in trace.events]
+    assert steps.index("search.tag_boosted") == steps.index("search.hybrid_fused") + 1
+    boost_event = trace.events[steps.index("search.tag_boosted")]
+    assert "客户画像/高净值客户" in boost_event.payload["query_tag_paths"]
+    assert boost_event.payload["boosted_count"] == 1
+    assert boost_event.payload["boosted"][0]["chunk_id"] == "c"
+    assert boost_event.payload["boosted"][0]["matched_tag_paths"] == [
+        "客户画像/高净值客户",
+        "客户需求/财富传承",
+    ]
+    assert boost_event.payload["boosted"][0]["boost_factor"] == 1.2
+
+
+def test_search_evidence_skips_tag_boost_when_query_has_no_tags() -> None:
+    embedding = _FakeEmbedding()
+    store = _FakeHybridStore()
+    hit = MilvusSearchHit(chunk=_chunk("c1", "客户抗拒时先聊家庭话题"), score=0.5)
+    store.hits = [hit]
+    store.keyword_hits = [hit]
+    trace = MemoryTraceSink()
+
+    search_evidence(
+        query="客户不想聊保险怎么开场？",
+        query_agent=_FakeQueryAgent(),
+        embedding_client=embedding,
+        store=store,
+        reranker=_EmptyReranker(),
+        top_n=20,
+        top_k=1,
+        trace=trace,
+    )
+
+    assert "search.tag_boosted" not in [event.step for event in trace.events]
 
 
 def test_search_evidence_emits_step_trace_events() -> None:
