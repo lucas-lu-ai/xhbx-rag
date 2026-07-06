@@ -139,8 +139,10 @@ def search_evidence(
     else:
         candidates = vector_hits
     query_tag_paths = infer_query_tags(rewritten_query)
+    boost_by_chunk_id: dict[str, dict] = {}
     if query_tag_paths:
         candidates, boost_details = _apply_tag_boost(candidates, query_tag_paths)
+        boost_by_chunk_id = {item["chunk_id"]: item for item in boost_details}
         emit_trace(
             trace,
             "search.tag_boosted",
@@ -168,7 +170,14 @@ def search_evidence(
             ],
         },
     )
-    results = [_serialize_hit(hits[item.index], item) for item in reranked]
+    results = [
+        _serialize_hit(
+            hits[item.index],
+            item,
+            boost=boost_by_chunk_id.get(hits[item.index].chunk.chunk_id),
+        )
+        for item in reranked
+    ]
     emit_trace(trace, "search.completed", {"result_count": len(results)})
     return {
         "original_query": query,
@@ -263,13 +272,20 @@ def _rrf_fuse(
     ]
 
 
-def _serialize_hit(hit: MilvusSearchHit, rerank: RerankResult) -> dict:
+def _serialize_hit(
+    hit: MilvusSearchHit,
+    rerank: RerankResult,
+    *,
+    boost: dict | None = None,
+) -> dict:
     return {
         "chunk_id": hit.chunk.chunk_id,
         "chunk_type": hit.chunk.chunk_type,
         "text": hit.chunk.text,
         "score": hit.score,
         "rerank_score": rerank.relevance_score,
+        "matched_tag_paths": list(boost["matched_tag_paths"]) if boost else [],
+        "tag_boost_factor": boost["boost_factor"] if boost else 1.0,
         "metadata": hit.chunk.metadata,
         "citations": [
             citation.model_dump(mode="json") for citation in hit.chunk.citations

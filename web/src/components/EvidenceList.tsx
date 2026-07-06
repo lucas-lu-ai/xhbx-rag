@@ -4,7 +4,8 @@ import {
   formatEvidenceMeta,
   formatEvidenceSource,
   formatLocatorConfidence,
-  formatScore
+  formatScore,
+  formatTagBoost
 } from "../format";
 import type {
   Citation,
@@ -113,6 +114,8 @@ export function EvidenceList({
           const cited = citedIndexes.has(index + 1);
           const meta = formatEvidenceMeta(evidence.metadata);
           const score = formatScore(evidence.rerank_score);
+          const matchedTags = evidence.matched_tag_paths ?? [];
+          const boostLabel = formatTagBoost(evidence.tag_boost_factor);
           const text = evidence.text || evidence.text_preview || "没有正文内容。";
           const citations = evidence.citations ?? [];
           const feedbackKey = feedbackKeyOf(index, evidence);
@@ -132,6 +135,23 @@ export function EvidenceList({
                 </span>
               </div>
               {meta && <p className="meta-text">{meta}</p>}
+              {matchedTags.length > 0 && (
+                <div
+                  className="evidence-tag-hits"
+                  aria-label={`证据 ${index + 1} 命中标签`}
+                >
+                  {boostLabel && (
+                    <span className="evidence-boost-badge">
+                      标签提权 {boostLabel}
+                    </span>
+                  )}
+                  {matchedTags.map((tag) => (
+                    <span className="evidence-tag-chip" key={tag}>
+                      {tag}
+                    </span>
+                  ))}
+                </div>
+              )}
               <p className="evidence-text">{text}</p>
               {citations.length > 0 && (
                 <div className="evidence-source-list" aria-label="证据来源">

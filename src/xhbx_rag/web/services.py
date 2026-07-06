@@ -330,6 +330,7 @@ _STREAM_STEP_MESSAGES = {
     "search.vector_searched": "已完成向量检索",
     "search.keyword_searched": "已完成关键词检索",
     "search.hybrid_fused": "已完成混合召回融合",
+    "search.tag_boosted": "已完成标签加权",
     "search.reranked": "已完成证据重排",
     "search.completed": "已完成检索",
     "answer.skipped": "已跳过回答生成",

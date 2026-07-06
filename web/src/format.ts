@@ -60,6 +60,13 @@ export function formatSessionTime(value: string): string {
   }).format(date);
 }
 
+export function formatTagBoost(value: unknown): string {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 1) {
+    return "";
+  }
+  return `×${Number(value.toFixed(2))}`;
+}
+
 export function formatProcessPayload(payload?: Record<string, unknown>): string {
   if (!payload) {
     return "";
@@ -67,6 +74,10 @@ export function formatProcessPayload(payload?: Record<string, unknown>): string 
   const rewrittenQuery = stringValue(payload.rewritten_query);
   if (rewrittenQuery) {
     return `改写为：${rewrittenQuery}`;
+  }
+  if (Array.isArray(payload.query_tag_paths)) {
+    const boostedCount = numberValue(payload.boosted_count) || "0";
+    return `识别标签 ${payload.query_tag_paths.length} 个 · 提权证据 ${boostedCount} 条`;
   }
   const candidateCount = numberValue(payload.candidate_count);
   if (candidateCount !== "") {

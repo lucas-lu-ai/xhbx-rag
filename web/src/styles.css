@@ -1166,6 +1166,35 @@ dd {
   line-height: 1.35;
 }
 
+.evidence-tag-hits {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.evidence-boost-badge {
+  border: 1px solid rgb(217 119 6 / 0.32);
+  border-radius: 999px;
+  background: rgb(255 251 235 / 0.9);
+  color: #b45309;
+  padding: 2px 8px;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.evidence-tag-chip {
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  background: rgb(255 255 255 / 0.72);
+  color: #475569;
+  padding: 2px 8px;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
 .evidence-feedback-actions {
   display: flex;
   flex-wrap: wrap;

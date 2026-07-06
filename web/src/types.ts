@@ -37,6 +37,8 @@ export type RetrievalEvidence = {
   text_preview?: string;
   score?: number;
   rerank_score?: number;
+  matched_tag_paths?: string[];
+  tag_boost_factor?: number;
   metadata?: Record<string, unknown>;
   citations?: Citation[];
   [key: string]: unknown;

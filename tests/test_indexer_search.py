@@ -329,6 +329,17 @@ def test_search_evidence_tag_boost_promotes_tag_matched_candidate() -> None:
     assert reranker.calls[0]["documents"] == ["开场寒暄", "高净值客户传承安排讲解"]
     assert [item["chunk_id"] for item in result["results"]] == ["a", "c"]
 
+    # 命中信息随证据序列化输出，Web 层证据卡片直接展示。
+    boosted_item = next(item for item in result["results"] if item["chunk_id"] == "c")
+    assert boosted_item["matched_tag_paths"] == [
+        "客户画像/高净值客户",
+        "客户需求/财富传承",
+    ]
+    assert boosted_item["tag_boost_factor"] == 1.2
+    plain_item = next(item for item in result["results"] if item["chunk_id"] == "a")
+    assert plain_item["matched_tag_paths"] == []
+    assert plain_item["tag_boost_factor"] == 1.0
+
     steps = [event.step for event in trace.events]
     assert steps.index("search.tag_boosted") == steps.index("search.hybrid_fused") + 1
     boost_event = trace.events[steps.index("search.tag_boosted")]

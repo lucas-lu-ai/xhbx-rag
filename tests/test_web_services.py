@@ -484,6 +484,20 @@ def test_answer_question_stream_events_emit_steps_deltas_and_final(
 ) -> None:
     def fake_answer_question(*, query, top_n, top_k, project_root=None, trace=None):
         trace.emit("search.query_understood", {"rewritten_query": "预算不超过80万"})
+        trace.emit(
+            "search.tag_boosted",
+            {
+                "query_tag_paths": ["客户需求/保费预算"],
+                "boosted_count": 1,
+                "boosted": [
+                    {
+                        "chunk_id": "c1",
+                        "matched_tag_paths": ["客户需求/保费预算"],
+                        "boost_factor": 1.1,
+                    }
+                ],
+            },
+        )
         trace.emit("search.reranked", {"result_count": 2})
         return {
             "original_query": query,
@@ -511,7 +525,11 @@ def test_answer_question_stream_events_emit_steps_deltas_and_final(
     assert events[0]["step"] == "search.query_understood"
     assert events[0]["message"] == "已完成问题理解"
     assert events[0]["payload"] == {"rewritten_query": "预算不超过80万"}
-    assert events[1]["step"] == "search.reranked"
+    assert events[1]["step"] == "search.tag_boosted"
+    assert events[1]["message"] == "已完成标签加权"
+    assert events[1]["payload"]["query_tag_paths"] == ["客户需求/保费预算"]
+    assert events[1]["payload"]["boosted"][0]["chunk_id"] == "c1"
+    assert events[2]["step"] == "search.reranked"
     assert "".join(
         event["text"] for event in events if event["type"] == "answer_delta"
     ) == "先承接预算，再讨论缴费期和保障缺口。"
