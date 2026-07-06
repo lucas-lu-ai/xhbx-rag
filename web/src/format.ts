@@ -67,6 +67,16 @@ export function formatTagBoost(value: unknown): string {
   return `×${Number(value.toFixed(2))}`;
 }
 
+export function evidenceComplianceRisks(
+  metadata?: Record<string, unknown>
+): string[] {
+  const value = metadata?.compliance_risks;
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.map((item) => stringValue(item)).filter(Boolean);
+}
+
 export function formatProcessPayload(payload?: Record<string, unknown>): string {
   if (!payload) {
     return "";

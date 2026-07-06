@@ -55,3 +55,26 @@ test("没有命中标签时不渲染标签区域", () => {
 
   expect(screen.queryByText(/标签提权/)).not.toBeInTheDocument();
 });
+
+test("带合规风险标签的证据显示合规注意徽标", () => {
+  renderEvidences([
+    {
+      chunk_id: "c1",
+      chunk_type: "script",
+      text: "涉及收益表述的话术",
+      metadata: { compliance_risks: ["收益承诺风险", "适当性风险"] },
+      citations: []
+    },
+    {
+      chunk_id: "c2",
+      chunk_type: "script",
+      text: "普通话术",
+      citations: []
+    }
+  ]);
+
+  expect(
+    screen.getByText("合规注意 · 收益承诺风险、适当性风险")
+  ).toBeInTheDocument();
+  expect(screen.getAllByText(/合规注意/)).toHaveLength(1);
+});

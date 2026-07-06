@@ -196,6 +196,7 @@ def answer_from_search_result(
         {
             "evidence_count": evidence_count,
             "citation_count": len(citations),
+            "compliance_risks": _collect_compliance_risks(search_result),
             "answer_preview": _preview(answer),
         },
     )
@@ -226,15 +227,63 @@ def _answer_payload(
 
 
 def _build_user_prompt(search_result: dict[str, Any]) -> str:
-    return "\n".join(
-        [
-            f"原始问题：{search_result.get('original_query', '')}",
-            f"改写问题：{search_result.get('rewritten_query', '')}",
-            "",
-            "检索证据：",
-            _evidence_text(search_result),
-        ]
-    )
+    lines = [
+        f"原始问题：{search_result.get('original_query', '')}",
+        f"改写问题：{search_result.get('rewritten_query', '')}",
+        "",
+        "检索证据：",
+        _evidence_text(search_result),
+    ]
+    compliance_block = _compliance_guidance_text(search_result)
+    if compliance_block:
+        lines.extend(["", compliance_block])
+    return "\n".join(lines)
+
+
+# 打标规则给证据标注的合规风险 → 回答生成时的定向约束。
+# 键与 tagging._COMPLIANCE_RISK_RULES 的标签值一致；未收录的风险走通用兜底文案。
+_COMPLIANCE_GUIDANCE = {
+    "收益承诺风险": "不得出现保证收益、稳赚、一定有收益等承诺性表述。",
+    "夸大保障风险": "不得使用什么都保、全覆盖等夸大保障范围的表述。",
+    "理赔承诺风险": "不得承诺一定赔付或任何理赔结果。",
+    "适当性风险": "不得使用最好、唯一、一定适合等绝对化推荐表述。",
+    "医疗建议风险": "不得给出诊断、治疗、用药等医疗建议。",
+    "税务法律建议风险": "不得提供避税、税务筹划或法律安排建议。",
+    "隐私信息风险": "不得复述身份证、手机号、银行卡等客户隐私信息。",
+    "竞品比较风险": "不得贬低或否定其他公司及其产品。",
+    "误导销售风险": "不得出现返佣、返钱或夸大利益的误导表述。",
+    "产品适配风险": "不得宣称产品适合所有人。",
+}
+
+
+def _collect_compliance_risks(search_result: dict[str, Any]) -> list[str]:
+    risks: list[str] = []
+    seen: set[str] = set()
+    for item in search_result.get("results", []) or []:
+        metadata = item.get("metadata") or {}
+        values = metadata.get("compliance_risks") or []
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            text = str(value).strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            risks.append(text)
+    return risks
+
+
+def _compliance_guidance_text(search_result: dict[str, Any]) -> str:
+    risks = _collect_compliance_risks(search_result)
+    if not risks:
+        return ""
+    lines = ["合规注意（回答必须遵守）："]
+    for risk in risks:
+        guidance = _COMPLIANCE_GUIDANCE.get(
+            risk, "回答需谨慎表述，不得作出无证据支持的承诺。"
+        )
+        lines.append(f"- 证据涉及{risk}：{guidance}")
+    return "\n".join(lines)
 
 
 def _evidence_text(search_result: dict[str, Any]) -> str:

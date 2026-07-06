@@ -223,6 +223,85 @@ def test_answer_from_search_result_supplements_underselected_citations_with_evid
     assert [citation["evidence_index"] for citation in result["citations"]] == [1, 2]
 
 
+def _answer_http_client() -> _FakeHttpClient:
+    return _FakeHttpClient(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": '{"answer":"稳健的沟通建议。","citation_indexes":[1]}'
+                    }
+                }
+            ]
+        }
+    )
+
+
+def test_answer_agent_injects_compliance_guidance_for_risky_evidence() -> None:
+    http = _answer_http_client()
+    agent = AnswerAgent(
+        base_url="https://api.example.com/v1",
+        api_key="secret",
+        model="chat-model",
+        http_client=http,
+    )
+    search_result = _search_result()
+    search_result["results"][0]["metadata"]["compliance_risks"] = [
+        "收益承诺风险",
+        "理赔承诺风险",
+    ]
+
+    agent.generate(search_result)
+
+    user_content = http.calls[0]["json"]["messages"][-1]["content"]
+    assert "合规注意" in user_content
+    assert "保证收益" in user_content
+    assert "承诺一定赔付" in user_content
+
+
+def test_answer_agent_omits_compliance_block_without_risky_evidence() -> None:
+    http = _answer_http_client()
+    agent = AnswerAgent(
+        base_url="https://api.example.com/v1",
+        api_key="secret",
+        model="chat-model",
+        http_client=http,
+    )
+
+    agent.generate(_search_result())
+
+    user_content = http.calls[0]["json"]["messages"][-1]["content"]
+    assert "合规注意" not in user_content
+
+
+def test_answer_from_search_result_traces_compliance_risks() -> None:
+    class _FakeAnswerAgent:
+        def generate(self, search_result: dict):
+            return type(
+                "Answer",
+                (),
+                {"answer": "稳健的沟通建议。", "citation_indexes": [1]},
+            )()
+
+    search_result = _search_result()
+    search_result["results"][0]["metadata"]["compliance_risks"] = ["收益承诺风险"]
+    search_result["results"][1]["metadata"]["compliance_risks"] = [
+        "收益承诺风险",
+        "适当性风险",
+    ]
+    trace = MemoryTraceSink()
+
+    answer_from_search_result(
+        search_result,
+        answer_agent=_FakeAnswerAgent(),
+        trace=trace,
+    )
+
+    payload = trace.events[0].payload
+    # 跨证据去重且保持首次出现顺序。
+    assert payload["compliance_risks"] == ["收益承诺风险", "适当性风险"]
+
+
 def test_answer_from_search_result_skips_model_when_no_results() -> None:
     class _FailingAnswerAgent:
         def generate(self, search_result: dict):

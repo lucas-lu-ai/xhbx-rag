@@ -1,4 +1,8 @@
-import { formatProcessPayload, formatTagBoost } from "./format";
+import {
+  evidenceComplianceRisks,
+  formatProcessPayload,
+  formatTagBoost
+} from "./format";
 
 test("formatProcessPayload 显示标签加权摘要", () => {
   expect(
@@ -23,4 +27,14 @@ test("formatTagBoost 只在实际提权时返回倍数", () => {
   expect(formatTagBoost(1)).toBe("");
   expect(formatTagBoost(undefined)).toBe("");
   expect(formatTagBoost("1.2")).toBe("");
+});
+
+test("evidenceComplianceRisks 从 metadata 提取合规风险列表", () => {
+  expect(
+    evidenceComplianceRisks({ compliance_risks: ["收益承诺风险", "适当性风险"] })
+  ).toEqual(["收益承诺风险", "适当性风险"]);
+  expect(evidenceComplianceRisks({ compliance_risks: [] })).toEqual([]);
+  expect(evidenceComplianceRisks({ compliance_risks: "不是数组" })).toEqual([]);
+  expect(evidenceComplianceRisks({})).toEqual([]);
+  expect(evidenceComplianceRisks(undefined)).toEqual([]);
 });

@@ -1,6 +1,7 @@
 import { Search } from "lucide-react";
 
 import {
+  evidenceComplianceRisks,
   formatEvidenceMeta,
   formatEvidenceSource,
   formatLocatorConfidence,
@@ -116,6 +117,7 @@ export function EvidenceList({
           const score = formatScore(evidence.rerank_score);
           const matchedTags = evidence.matched_tag_paths ?? [];
           const boostLabel = formatTagBoost(evidence.tag_boost_factor);
+          const complianceRisks = evidenceComplianceRisks(evidence.metadata);
           const text = evidence.text || evidence.text_preview || "没有正文内容。";
           const citations = evidence.citations ?? [];
           const feedbackKey = feedbackKeyOf(index, evidence);
@@ -135,12 +137,17 @@ export function EvidenceList({
                 </span>
               </div>
               {meta && <p className="meta-text">{meta}</p>}
-              {matchedTags.length > 0 && (
+              {(matchedTags.length > 0 || complianceRisks.length > 0) && (
                 <div
                   className="evidence-tag-hits"
                   aria-label={`证据 ${index + 1} 命中标签`}
                 >
-                  {boostLabel && (
+                  {complianceRisks.length > 0 && (
+                    <span className="evidence-compliance-badge">
+                      合规注意 · {complianceRisks.join("、")}
+                    </span>
+                  )}
+                  {boostLabel && matchedTags.length > 0 && (
                     <span className="evidence-boost-badge">
                       标签提权 {boostLabel}
                     </span>
