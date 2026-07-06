@@ -10,9 +10,16 @@ from typing import Sequence
 from .answer import AnswerAgent, answer_query
 from .chunk_builder import build_chunks
 from .config import RetrievalConfig
+from .course_enrichment import CourseEnrichmentAgentScopeAgent
+from .course_parser import parse_course_dir
 from .embedding import EmbeddingClient
 from .indexer import index_chunks
-from .milvus_store import MilvusStore, create_milvus_store
+from .milvus_store import (
+    MilvusStore,
+    MultiCollectionStore,
+    create_milvus_store,
+    create_retrieval_store,
+)
 from .normalizer import normalize_case
 from .observability import (
     CompositeTraceSink,
@@ -99,6 +106,24 @@ def _add_generate_insights_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_trace_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--trace",
+        action="store_true",
+        help="将步骤 trace 以 JSONL 写到 stderr",
+    )
+    parser.add_argument(
+        "--studio",
+        action="store_true",
+        help="将步骤 trace 发送到 AgentScope Studio",
+    )
+    parser.add_argument(
+        "--studio-endpoint",
+        default="localhost:4317",
+        help="AgentScope Studio OTLP gRPC endpoint，默认 localhost:4317",
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="xhbx-rag",
@@ -150,6 +175,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="入库模式：incremental 使用 upsert 增量覆盖同 chunk_id；rebuild 清空 collection 后重新入库",
     )
     index_parser.add_argument(
+        "--collection",
+        choices=["case", "course"],
+        default="case",
+        help="目标 collection：case 写入案例库（默认），course 写入课程库",
+    )
+    index_parser.add_argument(
         "--trace",
         action="store_true",
         help="将步骤 trace 以 JSONL 写到 stderr",
@@ -164,6 +195,48 @@ def _build_parser() -> argparse.ArgumentParser:
         default="localhost:4317",
         help="AgentScope Studio OTLP gRPC endpoint，默认 localhost:4317",
     )
+
+    parse_course_parser = subparsers.add_parser(
+        "parse-course",
+        help="解析培训课程目录并规则切块，产出 chunks.jsonl 与 parse_report.json",
+    )
+    parse_course_parser.add_argument("--course-dir", required=True, type=Path)
+    parse_course_parser.add_argument(
+        "--out",
+        type=Path,
+        default=Path("parsed_courses"),
+        help="输出目录，默认 parsed_courses",
+    )
+    parse_course_parser.add_argument(
+        "--no-enrich",
+        action="store_true",
+        help="关闭课程级 LLM 摘要与打标（默认开启，失败自动降级为纯规则产物）",
+    )
+    _add_trace_arguments(parse_course_parser)
+
+    ingest_course_parser = subparsers.add_parser(
+        "ingest-course",
+        help="一键执行 parse-course → index，把培训课程目录直通课程库",
+    )
+    ingest_course_parser.add_argument("--course-dir", required=True, type=Path)
+    ingest_course_parser.add_argument(
+        "--out",
+        type=Path,
+        default=Path("parsed_courses"),
+        help="parse-course 输出目录，默认 parsed_courses",
+    )
+    ingest_course_parser.add_argument(
+        "--index-mode",
+        choices=["incremental", "rebuild"],
+        default="incremental",
+        help="index 写入模式，默认 incremental",
+    )
+    ingest_course_parser.add_argument(
+        "--no-enrich",
+        action="store_true",
+        help="关闭课程级 LLM 摘要与打标（默认开启，失败自动降级为纯规则产物）",
+    )
+    _add_trace_arguments(ingest_course_parser)
 
     search_parser = subparsers.add_parser("search", help="检索销售洞察 evidence chunks")
     search_parser.add_argument("--query", required=True)
@@ -369,8 +442,28 @@ def _embedding_client(config: RetrievalConfig) -> EmbeddingClient:
     )
 
 
-def _milvus_store(config: RetrievalConfig) -> MilvusStore:
+def _milvus_store(config: RetrievalConfig, collection: str = "case") -> MilvusStore:
+    if collection == "course":
+        return create_milvus_store(
+            config, collection_name=config.milvus_course_collection
+        )
     return create_milvus_store(config)
+
+
+def _retrieval_store(config: RetrievalConfig) -> MultiCollectionStore:
+    return create_retrieval_store(config)
+
+
+def _course_enrichment_agent(
+    config: RetrievalConfig, no_enrich: bool
+) -> CourseEnrichmentAgentScopeAgent | None:
+    if no_enrich:
+        return None
+    return CourseEnrichmentAgentScopeAgent(
+        base_url=config.base_url,
+        api_key=config.api_key,
+        model=config.model_name,
+    )
 
 
 def _trace_sink(args: argparse.Namespace, root_name: str) -> TraceSink | None:
@@ -398,13 +491,55 @@ def _cmd_index(args: argparse.Namespace) -> int:
         count = index_chunks(
             args.chunks,
             _embedding_client(config),
-            _milvus_store(config),
+            _milvus_store(config, collection=getattr(args, "collection", "case")),
             trace=trace,
             mode=args.mode,
         )
     finally:
         close_trace(trace)
     print(json.dumps({"indexed": count}, ensure_ascii=False))
+    return 0
+
+
+def _cmd_parse_course(args: argparse.Namespace) -> int:
+    config = RetrievalConfig.from_env()
+    trace = _trace_sink(args, "xhbx-rag.parse-course")
+    try:
+        report = parse_course_dir(
+            args.course_dir,
+            args.out,
+            enrichment_agent=_course_enrichment_agent(config, args.no_enrich),
+            trace=trace,
+        )
+    finally:
+        close_trace(trace)
+    print(report.to_json())
+    return 0
+
+
+def _cmd_ingest_course(args: argparse.Namespace) -> int:
+    config = RetrievalConfig.from_env()
+    trace = _trace_sink(args, "xhbx-rag.ingest-course")
+    summary: dict = {"parse": None, "index": None}
+    try:
+        report = parse_course_dir(
+            args.course_dir,
+            args.out,
+            enrichment_agent=_course_enrichment_agent(config, args.no_enrich),
+            trace=trace,
+        )
+        summary["parse"] = report.counts
+        indexed = index_chunks(
+            Path(report.output_files["chunks"]),
+            _embedding_client(config),
+            _milvus_store(config, collection="course"),
+            trace=trace,
+            mode=args.index_mode,
+        )
+        summary["index"] = {"indexed": indexed, "mode": args.index_mode}
+    finally:
+        close_trace(trace)
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -420,7 +555,7 @@ def _cmd_search(args: argparse.Namespace) -> int:
                 model=config.model_name,
             ),
             embedding_client=_embedding_client(config),
-            store=_milvus_store(config),
+            store=_retrieval_store(config),
             reranker=RerankClient(
                 base_url=config.rerank_base_url,
                 api_key=config.rerank_api_key,
@@ -448,7 +583,7 @@ def _cmd_answer(args: argparse.Namespace) -> int:
                 model=config.model_name,
             ),
             embedding_client=_embedding_client(config),
-            store=_milvus_store(config),
+            store=_retrieval_store(config),
             reranker=RerankClient(
                 base_url=config.rerank_base_url,
                 api_key=config.rerank_api_key,
@@ -493,6 +628,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _cmd_ingest(args)
     if args.command == "index":
         return _cmd_index(args)
+    if args.command == "parse-course":
+        return _cmd_parse_course(args)
+    if args.command == "ingest-course":
+        return _cmd_ingest_course(args)
     if args.command == "search":
         return _cmd_search(args)
     if args.command == "answer":

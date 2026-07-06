@@ -27,6 +27,7 @@ class RetrievalConfig:
     milvus_uri: str
     milvus_token: str
     milvus_collection: str
+    milvus_course_collection: str
     milvus_vector_dim: int | None = None
 
     @classmethod
@@ -79,6 +80,11 @@ class RetrievalConfig:
                 "xhbx_sales_chunks",
             ).strip()
             or "xhbx_sales_chunks",
+            milvus_course_collection=values.get(
+                "MILVUS_COURSE_COLLECTION",
+                "xhbx_course_chunks",
+            ).strip()
+            or "xhbx_course_chunks",
             milvus_vector_dim=int(vector_dim) if vector_dim else None,
         )
 
@@ -96,6 +102,7 @@ class RetrievalConfig:
             f"milvus_lite_path={self.milvus_lite_path}, "
             f"milvus_uri={self.milvus_uri}, "
             f"milvus_collection={self.milvus_collection}, "
+            f"milvus_course_collection={self.milvus_course_collection}, "
             f"milvus_vector_dim={self.milvus_vector_dim})"
         )
 

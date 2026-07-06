@@ -8,7 +8,7 @@ from typing import Any, Callable, Iterator, Mapping
 from xhbx_rag.answer import AnswerAgent, answer_query
 from xhbx_rag.config import ConfigError, RetrievalConfig, load_env_values
 from xhbx_rag.embedding import EmbeddingClient
-from xhbx_rag.milvus_store import create_milvus_store
+from xhbx_rag.milvus_store import create_retrieval_store
 from xhbx_rag.observability import (
     CompositeTraceSink,
     TraceSink,
@@ -64,6 +64,7 @@ def get_status() -> dict[str, Any]:
             "milvus_target": "",
             "milvus_lite_path": "",
             "milvus_collection": "",
+            "milvus_course_collection": "",
             "batch_concurrency": SERIAL_BATCH_CONCURRENCY,
             "config": _missing_config_map(str(exc)),
             "errors": [str(exc)],
@@ -76,6 +77,7 @@ def get_status() -> dict[str, Any]:
             "milvus_target": "",
             "milvus_lite_path": "",
             "milvus_collection": "",
+            "milvus_course_collection": "",
             "batch_concurrency": SERIAL_BATCH_CONCURRENCY,
             "config": _missing_config_map(SAFE_CONFIG_PARSE_ERROR),
             "errors": [SAFE_CONFIG_PARSE_ERROR],
@@ -88,6 +90,7 @@ def get_status() -> dict[str, Any]:
         "milvus_target": _milvus_target(config),
         "milvus_lite_path": str(config.milvus_lite_path),
         "milvus_collection": config.milvus_collection,
+        "milvus_course_collection": config.milvus_course_collection,
         "batch_concurrency": batch_concurrency(config),
         "config": {key: True for key in REQUIRED_CONFIG_KEYS},
         "errors": [],
@@ -181,7 +184,7 @@ def _answer_question_with_config(
         )
         resources.append(embedding_client)
         try:
-            store = create_milvus_store(config)
+            store = create_retrieval_store(config)
         except Exception as exc:
             if config.milvus_mode == "lite" and _is_local_index_open_failure(exc):
                 raise ValueError(LOCAL_INDEX_UNAVAILABLE_ERROR) from exc

@@ -18,7 +18,7 @@ from mcp.server.fastmcp import FastMCP
 
 from .config import RetrievalConfig
 from .embedding import EmbeddingClient
-from .milvus_store import create_milvus_store
+from .milvus_store import create_milvus_store, create_retrieval_store
 from .query_understanding import QueryUnderstandingAgent
 from .rerank import RerankClient
 from .resource_utils import close_resources, is_local_index_open_failure
@@ -34,9 +34,11 @@ SERVER_INSTRUCTIONS = (
 DEFAULT_TOP_N = 20
 DEFAULT_TOP_K = 5
 
-# 仅对 streamable-http 传输生效；stdio 模式忽略。
+# 仅对 HTTP 类传输（streamable-http / sse）生效；stdio 模式忽略。
 DEFAULT_HTTP_HOST = "127.0.0.1"
 DEFAULT_HTTP_PORT = 8000
+DEFAULT_STREAMABLE_HTTP_PATH = "/mcp"
+DEFAULT_SSE_PATH = "/sse"
 
 UNAVAILABLE_SEARCH_ERROR = "检索服务暂时不可用"
 SAFE_CONFIG_PARSE_ERROR = "配置解析失败，请检查 .env 中的数值配置。"
@@ -112,7 +114,7 @@ class ConfiguredEvidenceSearcher:
             )
             resources.append(embedding_client)
             try:
-                store = create_milvus_store(config)
+                store = create_retrieval_store(config)
             except Exception as exc:
                 if config.milvus_mode == "lite" and is_local_index_open_failure(exc):
                     raise ValueError(LOCAL_INDEX_UNAVAILABLE_ERROR) from exc
@@ -143,12 +145,21 @@ def create_mcp_server(
     *,
     host: str = DEFAULT_HTTP_HOST,
     port: int = DEFAULT_HTTP_PORT,
+    sse_path: str = DEFAULT_SSE_PATH,
+    streamable_http_path: str = DEFAULT_STREAMABLE_HTTP_PATH,
 ) -> FastMCP:
     active_searcher = searcher if searcher is not None else ConfiguredEvidenceSearcher()
     active_status = (
         status_provider if status_provider is not None else _default_status_provider
     )
-    server = FastMCP(SERVER_NAME, instructions=SERVER_INSTRUCTIONS, host=host, port=port)
+    server = FastMCP(
+        SERVER_NAME,
+        instructions=SERVER_INSTRUCTIONS,
+        host=host,
+        port=port,
+        sse_path=sse_path,
+        streamable_http_path=streamable_http_path,
+    )
 
     @server.tool(
         name="search_knowledge",
@@ -201,6 +212,7 @@ def _default_status_provider() -> dict[str, Any]:
             "milvus_mode": "",
             "milvus_target": "",
             "milvus_collection": "",
+            "milvus_course_collection": "",
             "errors": [_safe_error_message(exc)],
         }
     target = (
@@ -213,6 +225,7 @@ def _default_status_provider() -> dict[str, Any]:
         "milvus_mode": config.milvus_mode,
         "milvus_target": target,
         "milvus_collection": config.milvus_collection,
+        "milvus_course_collection": config.milvus_course_collection,
         "errors": [],
     }
 
@@ -249,15 +262,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--transport",
-        choices=["stdio", "streamable-http"],
+        choices=["stdio", "streamable-http", "sse"],
         default="stdio",
-        help="传输方式：stdio 供本机客户端（默认），streamable-http 供远程客户端",
+        help=(
+            "传输方式：stdio 供本机客户端（默认），streamable-http 供远程客户端，"
+            "sse 兼容只支持旧版 HTTP+SSE 协议的客户端"
+        ),
     )
     parser.add_argument(
         "--host",
         default=DEFAULT_HTTP_HOST,
         help=(
-            "HTTP 监听地址，仅对 streamable-http 生效，默认 127.0.0.1。"
+            "HTTP 监听地址，仅对 streamable-http/sse 生效，默认 127.0.0.1。"
             "服务无鉴权，绑定非回环地址前请确认处于可信内网"
         ),
     )
@@ -265,10 +281,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--port",
         type=int,
         default=DEFAULT_HTTP_PORT,
-        help="HTTP 监听端口，仅对 streamable-http 生效，默认 8000",
+        help="HTTP 监听端口，仅对 streamable-http/sse 生效，默认 8000",
+    )
+    parser.add_argument(
+        "--path",
+        default=None,
+        help=(
+            "HTTP 端点路径，用于适配客户端固定拼接的路径："
+            "streamable-http 默认 /mcp，sse 默认 /sse（如客户端拼 /mcp/sse 则传 --path /mcp/sse）"
+        ),
     )
     args = parser.parse_args(argv)
-    create_mcp_server(host=args.host, port=args.port).run(transport=args.transport)
+    sse_path = (
+        args.path
+        if args.transport == "sse" and args.path
+        else DEFAULT_SSE_PATH
+    )
+    streamable_http_path = (
+        args.path
+        if args.transport == "streamable-http" and args.path
+        else DEFAULT_STREAMABLE_HTTP_PATH
+    )
+    create_mcp_server(
+        host=args.host,
+        port=args.port,
+        sse_path=sse_path,
+        streamable_http_path=streamable_http_path,
+    ).run(transport=args.transport)
     return 0
 
 
@@ -279,3 +318,8 @@ if __name__ == "__main__":
     #     name="xhbx_rag",
     #     transport="streamable_http",
     #     url="http://<服务机IP>:9331/mcp"
+
+    # uv run xhbx-rag-mcp --transport sse --path /mcp/sse --host 0.0.0.0 --port 9331
+    #     name="xhbx_rag",
+    #     transport="sse",
+    #     url="http://<服务机IP>:9331/mcp/sse",

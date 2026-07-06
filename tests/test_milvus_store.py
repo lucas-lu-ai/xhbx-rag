@@ -1,6 +1,8 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 import xhbx_rag.milvus_store as milvus_store
 from xhbx_rag.milvus_store import MilvusChunkRecord, MilvusLiteStore
 from xhbx_rag.models import EvidenceRef, RagChunk
@@ -295,3 +297,145 @@ def test_keyword_search_limits_candidate_payload_before_loading_details() -> Non
     assert first_call["output_fields"] == ["chunk_id", "text"]
     assert second_call["limit"] == 1
     assert second_call["filter"] == 'chunk_id in ["chunk-2"]'
+
+
+def _lite_store_with_chunks(tmp_path, name: str, chunks: list[tuple[RagChunk, list[float]]]):
+    # 两个 collection 共存于同一个 Milvus 实例（与 lite/docker 生产拓扑一致）
+    store = MilvusLiteStore(db_path=tmp_path / "rag.db", collection_name=name)
+    store.ensure_collection(vector_dim=len(chunks[0][1]))
+    store.upsert([MilvusChunkRecord.from_chunk(chunk, vector) for chunk, vector in chunks])
+    return store
+
+
+def _chunk(chunk_id: str, text: str, chunk_type: str = "strategy") -> RagChunk:
+    return RagChunk(
+        chunk_id=chunk_id,
+        chunk_type=chunk_type,
+        text=text,
+        metadata={"case_name": "案例A"},
+        citations=[],
+        source_file="demo",
+    )
+
+
+def test_multi_collection_store_merges_vector_hits_by_score(tmp_path) -> None:
+    case_store = _lite_store_with_chunks(
+        tmp_path, "case_chunks", [(_chunk("case-1", "保单整理发现缺口"), [1.0, 0.0, 0.0])]
+    )
+    course_store = _lite_store_with_chunks(
+        tmp_path,
+        "course_chunks",
+        [(_chunk("course-1", "促成课程讲义", "training_course"), [0.9, 0.1, 0.0])],
+    )
+    store = milvus_store.MultiCollectionStore([case_store, course_store])
+
+    hits = store.search(vector=[1.0, 0.0, 0.0], top_k=2, filters=None)
+
+    # Milvus Lite 的 COSINE distance 越小越相似，聚合层需自适应方向：
+    # case-1 与查询向量完全同向，必须排在 course-1 之前。
+    assert [hit.chunk.chunk_id for hit in hits] == ["case-1", "course-1"]
+
+    top1 = store.search(vector=[1.0, 0.0, 0.0], top_k=1, filters=None)
+    assert [hit.chunk.chunk_id for hit in top1] == ["case-1"]
+
+
+def test_multi_collection_store_keyword_search_scores_pooled_candidates(tmp_path) -> None:
+    # “保单整理”在案例库出现于全部文档、课程库只出现一次；
+    # 若各库独立打分，case 库中该词 IDF≈0，case-hit 会被埋没；
+    # 合池统一打分后包含目标词的文档应稳定进入结果。
+    case_store = _lite_store_with_chunks(
+        tmp_path,
+        "case_chunks",
+        [
+            (_chunk("case-1", "保单整理发现家庭保障缺口"), [1.0, 0.0, 0.0]),
+            (_chunk("case-2", "保单整理是重要动作"), [0.9, 0.1, 0.0]),
+        ],
+    )
+    course_store = _lite_store_with_chunks(
+        tmp_path,
+        "course_chunks",
+        [
+            (_chunk("course-1", "促成课程讲义与训练通关", "training_course"), [0.8, 0.2, 0.0]),
+            (_chunk("course-2", "保单整理课程实操", "training_course"), [0.7, 0.3, 0.0]),
+        ],
+    )
+    store = milvus_store.MultiCollectionStore([case_store, course_store])
+
+    hits = store.keyword_search(query="保单整理", top_k=3)
+
+    hit_ids = {hit.chunk.chunk_id for hit in hits}
+    assert "course-2" in hit_ids
+    assert hit_ids <= {"case-1", "case-2", "course-2"}
+    scores = [hit.score for hit in hits]
+    assert scores == sorted(scores, reverse=True)
+
+
+def test_multi_collection_store_degrades_when_one_collection_missing(tmp_path) -> None:
+    case_store = _lite_store_with_chunks(
+        tmp_path, "case_chunks", [(_chunk("case-1", "保单整理发现缺口"), [1.0, 0.0, 0.0])]
+    )
+    empty_store = MilvusLiteStore(
+        db_path=tmp_path / "rag.db", collection_name="course_chunks"
+    )
+    store = milvus_store.MultiCollectionStore([case_store, empty_store])
+
+    vector_hits = store.search(vector=[1.0, 0.0, 0.0], top_k=2, filters=None)
+    keyword_hits = store.keyword_search(query="保单整理", top_k=2)
+
+    assert [hit.chunk.chunk_id for hit in vector_hits] == ["case-1"]
+    assert [hit.chunk.chunk_id for hit in keyword_hits] == ["case-1"]
+
+
+def test_multi_collection_store_raises_when_all_collections_missing(tmp_path) -> None:
+    empty_a = MilvusLiteStore(db_path=tmp_path / "rag.db", collection_name="a_chunks")
+    empty_b = MilvusLiteStore(db_path=tmp_path / "rag.db", collection_name="b_chunks")
+    store = milvus_store.MultiCollectionStore([empty_a, empty_b])
+
+    with pytest.raises(milvus_store.MilvusStoreError):
+        store.search(vector=[1.0, 0.0, 0.0], top_k=1, filters=None)
+
+
+def test_multi_collection_store_rejects_mismatched_vector_dims(tmp_path) -> None:
+    case_store = _lite_store_with_chunks(
+        tmp_path, "case_chunks", [(_chunk("case-1", "保单整理发现缺口"), [1.0, 0.0, 0.0])]
+    )
+    course_store = _lite_store_with_chunks(
+        tmp_path,
+        "course_chunks",
+        [(_chunk("course-1", "促成课程讲义", "training_course"), [0.9, 0.1])],
+    )
+    store = milvus_store.MultiCollectionStore([case_store, course_store])
+
+    with pytest.raises(milvus_store.MilvusStoreError, match="维度"):
+        store.search(vector=[1.0, 0.0, 0.0], top_k=2, filters=None)
+
+
+def test_keyword_candidates_and_fetch_chunks_by_ids(tmp_path) -> None:
+    store = MilvusLiteStore(
+        db_path=tmp_path / "rag.db",
+        collection_name="test_chunks",
+    )
+    chunk = RagChunk(
+        chunk_id="chunk-1",
+        chunk_type="strategy",
+        text="客户可以通过保单整理发现家庭保障缺口",
+        metadata={"case_name": "案例A"},
+        citations=[],
+        source_file="case.sales_insights.json",
+    )
+    store.ensure_collection(vector_dim=3)
+    store.upsert([MilvusChunkRecord.from_chunk(chunk, vector=[0.1, 0.2, 0.3])])
+
+    candidates = store.keyword_candidates(
+        query_tokens=milvus_store._bm25_tokens("保单整理"),
+        top_k=5,
+        filters=None,
+    )
+
+    assert [row["chunk_id"] for row in candidates] == ["chunk-1"]
+    assert set(candidates[0]) >= {"chunk_id", "text"}
+
+    rows_by_id = store.fetch_chunks_by_ids(["chunk-1", "chunk-missing"])
+
+    assert set(rows_by_id) == {"chunk-1"}
+    assert rows_by_id["chunk-1"]["chunk_type"] == "strategy"

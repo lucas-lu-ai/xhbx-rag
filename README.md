@@ -143,6 +143,31 @@ uv run xhbx-rag index --chunks parsed/<case_id>/chunks.jsonl
 uv run xhbx-rag answer --query "客户说每年不能超过80万怎么办？" --top-n 20 --top-k 5
 ```
 
+## 培训课程知识入库（parse-course / ingest-course）
+
+除绩优案例外，还支持把培训课程资产（制式课件、教材、书稿）入库为独立的课程知识库。课程管线不走案例级 LLM 抽取，而是**规则切块**：pptx 按页切（正文 + 讲师备注合并，备注中"教学时间/教学方式"剔除、"教学目标"进 metadata），docx 按标题层级切，pdf 按页切；每门课额外产出一个课程概览 chunk。
+
+```bash
+# 一键：解析切块 → 写入课程库（MILVUS_COURSE_COLLECTION）
+uv run xhbx-rag ingest-course --course-dir "data/新华培训数据" --trace
+
+# 分步：先看切块产物，再入库
+uv run xhbx-rag parse-course --course-dir "data/新华培训数据" --out parsed_courses --no-enrich
+uv run xhbx-rag index --chunks parsed_courses/chunks.jsonl --collection course
+```
+
+- 默认开启课程级 LLM 增值（每门课一次小调用生成摘要、受众与销售环节标签），`--no-enrich` 可关闭；增值失败自动降级为纯规则产物并计入报告，不阻塞入库。
+- 扫描时自动跳过 `~$` 临时文件、隐藏文件与不支持的扩展名；单个文件解析失败不拖垮整批（记入 `parse_report.json` 的 `failed_files`）。
+- `parse_report.json` 会统计内容完全相同的重复文件（`duplicate_text_hashes`），供人工清理。
+- doc/ppt/wps 老格式需先转换（依赖本机 LibreOffice）：
+
+```bash
+uv run python scripts/convert_legacy_formats.py --dir "data/新华培训数据" --dry-run   # 先看计划
+uv run python scripts/convert_legacy_formats.py --dir "data/新华培训数据"             # 执行转换
+```
+
+检索时案例库与课程库**聚合召回**：向量召回按分数跨库合并，BM25 关键词召回把两库候选合池后统一打分，聚合后走同一条 RRF 融合 → 标签软加权 → rerank 链路。`search / answer` / Web / MCP 无需额外参数。
+
 ## Milvus Lite 本地入库
 
 解析得到 `chunks.jsonl` 后，可以先写入本地 Milvus Lite 做检索验证：
@@ -287,9 +312,10 @@ uv run xhbx-rag answer \
 uv run xhbx-rag-mcp                              # stdio（默认，供本机客户端）
 uv run xhbx-rag-mcp --transport streamable-http  # HTTP（供远程客户端，默认 http://127.0.0.1:8000/mcp）
 uv run xhbx-rag-mcp --transport streamable-http --host 0.0.0.0 --port 9331   # 自定义监听地址与端口
+uv run xhbx-rag-mcp --transport sse --path /mcp/sse --port 9331              # 兼容旧版 HTTP+SSE 协议客户端
 ```
 
-`--host/--port` 仅对 `streamable-http` 生效。服务本身无鉴权，把 `--host` 绑定到非回环地址（如 `0.0.0.0`）前请确认处于可信内网，不要暴露到公网。
+`--host/--port/--path` 仅对 HTTP 类传输（`streamable-http` / `sse`）生效。`--path` 用于适配客户端固定拼接的端点路径：`streamable-http` 默认 `/mcp`，`sse` 默认 `/sse`；如果调用方框架自动在 `ip:端口` 后拼 `/mcp/sse`，用上面的 sse 示例即可。服务本身无鉴权，把 `--host` 绑定到非回环地址（如 `0.0.0.0`）前请确认处于可信内网，不要暴露到公网。
 
 服务对外提供两个工具：
 
@@ -375,8 +401,11 @@ MILVUS_LITE_PATH=.local/milvus/xhbx_rag.db
 MILVUS_URI=http://localhost:19530
 MILVUS_TOKEN=
 MILVUS_COLLECTION=xhbx_sales_chunks
+MILVUS_COURSE_COLLECTION=xhbx_course_chunks
 MILVUS_VECTOR_DIM=
 ```
+
+`MILVUS_COLLECTION` 存放绩优案例知识；`MILVUS_COURSE_COLLECTION`（默认 `xhbx_course_chunks`）存放培训课程知识，检索时两库聚合召回。
 
 Web AgentScope Studio trace：
 

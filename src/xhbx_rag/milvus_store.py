@@ -192,30 +192,15 @@ class MilvusStore:
     ) -> list[MilvusSearchHit]:
         if top_k <= 0:
             return []
-        if not self.client.has_collection(self.collection_name):
-            raise MilvusStoreError("Milvus collection 不存在，请先运行 index")
         query_tokens = _bm25_tokens(query)
         if not query_tokens:
             return []
-        self.client.load_collection(self.collection_name)
-        expr = _build_filter_expr(filters or {})
-        rows = self.client.query(
-            collection_name=self.collection_name,
-            filter=expr,
-            limit=_keyword_candidate_limit(top_k),
-            output_fields=_KEYWORD_CANDIDATE_OUTPUT_FIELDS,
-        )
+        rows = self.keyword_candidates(query_tokens, top_k=top_k, filters=filters)
         scored_rows = _bm25_score_rows(query_tokens, rows)[:top_k]
         ranked_ids = _ranked_chunk_ids(scored_rows)
         if not ranked_ids:
             return []
-        detail_rows = self.client.query(
-            collection_name=self.collection_name,
-            filter=_chunk_id_filter_expr(ranked_ids),
-            limit=len(ranked_ids),
-            output_fields=_CHUNK_OUTPUT_FIELDS,
-        )
-        rows_by_id = {str(row.get("chunk_id", "")): row for row in detail_rows}
+        rows_by_id = self.fetch_chunks_by_ids(ranked_ids)
         hits: list[MilvusSearchHit] = []
         for score, row in scored_rows:
             chunk_id = str(row.get("chunk_id", ""))
@@ -226,6 +211,38 @@ class MilvusStore:
                 )
         return hits
 
+    def keyword_candidates(
+        self,
+        query_tokens: list[str],
+        top_k: int,
+        filters: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        if not query_tokens:
+            return []
+        if not self.client.has_collection(self.collection_name):
+            raise MilvusStoreError("Milvus collection 不存在，请先运行 index")
+        self.client.load_collection(self.collection_name)
+        expr = _build_filter_expr(filters or {})
+        return list(
+            self.client.query(
+                collection_name=self.collection_name,
+                filter=expr,
+                limit=_keyword_candidate_limit(top_k),
+                output_fields=_KEYWORD_CANDIDATE_OUTPUT_FIELDS,
+            )
+        )
+
+    def fetch_chunks_by_ids(self, chunk_ids: list[str]) -> dict[str, dict[str, Any]]:
+        if not chunk_ids:
+            return {}
+        detail_rows = self.client.query(
+            collection_name=self.collection_name,
+            filter=_chunk_id_filter_expr(chunk_ids),
+            limit=len(chunk_ids),
+            output_fields=_CHUNK_OUTPUT_FIELDS,
+        )
+        return {str(row.get("chunk_id", "")): row for row in detail_rows}
+
     def _collection_vector_dim(self) -> int:
         description = self.client.describe_collection(self.collection_name)
         for field in description.get("fields", []):
@@ -235,6 +252,145 @@ class MilvusStore:
         raise MilvusStoreError("Milvus collection 缺少 vector 字段")
 
 
+class MultiCollectionStore:
+    """跨多个 collection 的只读聚合检索视图。
+
+    写入（ensure_collection / upsert / drop_collection）仍走各单库 store；
+    聚合层只负责向量召回的分数合并与 BM25 候选合池统一打分。
+    """
+
+    def __init__(self, stores: list[MilvusStore]) -> None:
+        if not stores:
+            raise ValueError("MultiCollectionStore 需要至少一个 store")
+        self.stores = list(stores)
+        self._dims_validated = False
+
+    def search(
+        self,
+        vector: list[float],
+        top_k: int,
+        filters: dict[str, Any] | None = None,
+    ) -> list[MilvusSearchHit]:
+        available = self._available_stores()
+        self._validate_vector_dims(available)
+        hit_lists = [
+            store.search(vector=vector, top_k=top_k, filters=filters)
+            for store in available
+        ]
+        return _merge_ranked_hit_lists(
+            hit_lists,
+            top_k,
+            default_higher_is_better=not all(
+                isinstance(store, MilvusLiteStore) for store in available
+            ),
+        )
+
+    def keyword_search(
+        self,
+        query: str,
+        top_k: int,
+        filters: dict[str, Any] | None = None,
+    ) -> list[MilvusSearchHit]:
+        if top_k <= 0:
+            return []
+        query_tokens = _bm25_tokens(query)
+        if not query_tokens:
+            return []
+        available = self._available_stores()
+        all_rows: list[dict[str, Any]] = []
+        store_index_by_row_id: dict[int, int] = {}
+        for store_index, store in enumerate(available):
+            for row in store.keyword_candidates(query_tokens, top_k=top_k, filters=filters):
+                store_index_by_row_id[id(row)] = store_index
+                all_rows.append(row)
+        # IDF 与平均文档长度必须在合并后的候选池上统一计算，
+        # 各库独立打分的 BM25 分数不可比。
+        scored_rows = _bm25_score_rows(query_tokens, all_rows)[:top_k]
+        if not scored_rows:
+            return []
+        ids_by_store: dict[int, list[str]] = {}
+        for _, row in scored_rows:
+            store_index = store_index_by_row_id[id(row)]
+            ids_by_store.setdefault(store_index, []).append(str(row.get("chunk_id", "")))
+        details_by_store = {
+            store_index: available[store_index].fetch_chunks_by_ids(chunk_ids)
+            for store_index, chunk_ids in ids_by_store.items()
+        }
+        hits: list[MilvusSearchHit] = []
+        for score, row in scored_rows:
+            store_index = store_index_by_row_id[id(row)]
+            chunk_id = str(row.get("chunk_id", ""))
+            detail_row = details_by_store[store_index].get(chunk_id)
+            if detail_row is not None:
+                hits.append(
+                    MilvusSearchHit(chunk=_chunk_from_entity(detail_row), score=score)
+                )
+        return hits
+
+    def close(self) -> None:
+        for store in self.stores:
+            close = getattr(store.client, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _available_stores(self) -> list[MilvusStore]:
+        available = [
+            store
+            for store in self.stores
+            if store.client.has_collection(store.collection_name)
+        ]
+        if not available:
+            raise MilvusStoreError("Milvus collection 不存在，请先运行 index")
+        if len(available) < len(self.stores):
+            missing = [
+                store.collection_name
+                for store in self.stores
+                if store not in available
+            ]
+            logger.warning("部分 Milvus collection 不存在，已降级跳过: %s", missing)
+        return available
+
+    def _validate_vector_dims(self, available: list[MilvusStore]) -> None:
+        if self._dims_validated or len(available) < 2:
+            return
+        dims = {store.collection_name: store._collection_vector_dim() for store in available}
+        if len(set(dims.values())) > 1:
+            raise MilvusStoreError(f"Milvus collection 向量维度不一致: {dims}")
+        self._dims_validated = True
+
+
+def _merge_ranked_hit_lists(
+    hit_lists: list[list[MilvusSearchHit]],
+    top_k: int,
+    default_higher_is_better: bool = True,
+) -> list[MilvusSearchHit]:
+    """按分数合并多个库的有序命中列表。
+
+    同一 Milvus 实例、同一 metric 下各库分数可比，但方向不可写死：
+    标准 server 的 COSINE distance 是相似度（越大越相似），Milvus Lite
+    返回的是余弦距离（越小越相似）。每个库自身的返回顺序总是
+    "最相似在前"，优先据此从分数序列推断方向；命中不足以推断时
+    回退到调用方按部署类型给出的默认方向。
+    """
+    higher_is_better = _infer_score_direction(hit_lists, default_higher_is_better)
+    merged = [hit for hits in hit_lists for hit in hits]
+    merged.sort(key=lambda hit: hit.score, reverse=higher_is_better)
+    return merged[:top_k]
+
+
+def _infer_score_direction(
+    hit_lists: list[list[MilvusSearchHit]], default: bool
+) -> bool:
+    for hits in hit_lists:
+        scores = [hit.score for hit in hits]
+        if len(scores) >= 2 and scores[0] != scores[-1]:
+            return scores[0] > scores[-1]
+    return default
+
+
 class MilvusLiteStore(MilvusStore):
     def __init__(self, db_path: Path, collection_name: str) -> None:
         self.db_path = db_path
@@ -242,16 +398,27 @@ class MilvusLiteStore(MilvusStore):
         super().__init__(str(self.db_path), collection_name)
 
 
-def create_milvus_store(config: Any) -> MilvusStore:
+def create_milvus_store(config: Any, collection_name: str | None = None) -> MilvusStore:
+    resolved_collection = collection_name or config.milvus_collection
     if config.milvus_mode == "lite":
         return MilvusLiteStore(
             db_path=config.milvus_lite_path,
-            collection_name=config.milvus_collection,
+            collection_name=resolved_collection,
         )
     return MilvusStore(
         uri=config.milvus_uri,
-        collection_name=config.milvus_collection,
+        collection_name=resolved_collection,
         token=config.milvus_token,
+    )
+
+
+def create_retrieval_store(config: Any) -> MultiCollectionStore:
+    """构建生产读路径的聚合检索视图：案例库 + 课程库。"""
+    return MultiCollectionStore(
+        [
+            create_milvus_store(config),
+            create_milvus_store(config, collection_name=config.milvus_course_collection),
+        ]
     )
 
 

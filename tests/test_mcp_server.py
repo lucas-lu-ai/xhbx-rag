@@ -192,6 +192,8 @@ def test_create_server_uses_default_http_binding():
     server = create_mcp_server(searcher=FakeSearcher())
     assert server.settings.host == "127.0.0.1"
     assert server.settings.port == 8000
+    assert server.settings.sse_path == "/sse"
+    assert server.settings.streamable_http_path == "/mcp"
 
 
 def test_create_server_accepts_custom_http_binding():
@@ -202,3 +204,13 @@ def test_create_server_accepts_custom_http_binding():
     )
     assert server.settings.host == "0.0.0.0"
     assert server.settings.port == 9331
+
+
+def test_create_server_accepts_custom_endpoint_paths():
+    server = create_mcp_server(
+        searcher=FakeSearcher(),
+        sse_path="/mcp/sse",
+        streamable_http_path="/knowledge",
+    )
+    assert server.settings.sse_path == "/mcp/sse"
+    assert server.settings.streamable_http_path == "/knowledge"

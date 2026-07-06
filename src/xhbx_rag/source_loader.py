@@ -6,7 +6,7 @@ import mimetypes
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from .models import EvidenceRef
 
@@ -99,6 +99,7 @@ def parse_source_file(path: Path, *, base_dir: Path | None = None) -> ParsedSour
         raise ValueError(f"不支持的素材文件类型: {path}")
     parser = _PARSERS[source_type]
     text, warnings, images = parser(path)
+    text = _sanitize_surrogates(text)
     source_path = _relative_path(path, base_dir) if base_dir is not None else str(path)
     return ParsedSourceFile(
         source_id=f"{source_type}:{path.name}",
@@ -202,6 +203,16 @@ def _source_preference_key(source: ParsedSourceFile) -> tuple[int, int, str]:
     return has_copy_suffix, is_empty, source.filename
 
 
+def _sanitize_surrogates(text: str) -> str:
+    """剔除孤立 UTF-16 代理字符（Office 文件中的数学符号等偶发产生），
+    否则后续 utf-8 编码（hash/JSON/入库）会抛 UnicodeEncodeError。"""
+    try:
+        text.encode("utf-8")
+        return text
+    except UnicodeEncodeError:
+        return text.encode("utf-8", errors="ignore").decode("utf-8")
+
+
 def _parse_txt(path: Path) -> tuple[str, tuple[str, ...], tuple[ParsedEmbeddedImage, ...]]:
     try:
         text = path.read_text(encoding="utf-8")
@@ -274,11 +285,23 @@ def _parse_pptx(path: Path) -> tuple[str, tuple[str, ...], tuple[ParsedEmbeddedI
                     line = " | ".join(cell for cell in cells if cell)
                     if line:
                         parts.append(line)
+        notes = _slide_notes_text(slide)
+        if notes:
+            parts.append(f"### 讲师备注\n{notes}")
         if parts:
             blocks.append(f"## 第 {index} 页\n" + "\n".join(parts))
     text = "\n\n".join(blocks)
     images = _extract_zip_images(path, prefix="ppt/media/", source_type="pptx")
     return text, () if text.strip() else ("pptx 无文本内容",), images
+
+
+def _slide_notes_text(slide: Any) -> str:
+    if not getattr(slide, "has_notes_slide", False):
+        return ""
+    notes_frame = slide.notes_slide.notes_text_frame
+    if notes_frame is None:
+        return ""
+    return notes_frame.text.strip()
 
 
 def _parse_pdf(path: Path) -> tuple[str, tuple[str, ...], tuple[ParsedEmbeddedImage, ...]]:

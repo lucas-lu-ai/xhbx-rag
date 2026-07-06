@@ -208,6 +208,64 @@ def test_parse_pptx_source_extracts_embedded_images(tmp_path) -> None:
     assert parsed.images[0].data == image_path.read_bytes()
 
 
+def test_parse_pptx_source_extracts_speaker_notes(tmp_path) -> None:
+    from pptx import Presentation
+    from pptx.util import Inches
+
+    pptx_path = tmp_path / "课件.pptx"
+    presentation = Presentation()
+
+    slide1 = presentation.slides.add_slide(presentation.slide_layouts[6])
+    textbox1 = slide1.shapes.add_textbox(Inches(1), Inches(1), Inches(4), Inches(1))
+    textbox1.text_frame.text = "促成的含义及重要性"
+    slide1.notes_slide.notes_text_frame.text = "教学时间：1.5分钟\n教学目标：使营销员明白促成的含义"
+
+    slide2 = presentation.slides.add_slide(presentation.slide_layouts[6])
+    textbox2 = slide2.shapes.add_textbox(Inches(1), Inches(1), Inches(4), Inches(1))
+    textbox2.text_frame.text = "训练通关"
+
+    slide3 = presentation.slides.add_slide(presentation.slide_layouts[6])
+    slide3.notes_slide.notes_text_frame.text = "本页仅有讲师备注"
+
+    presentation.save(str(pptx_path))
+
+    parsed = parse_source_file(pptx_path)
+
+    page1, page2, page3 = (
+        block for block in parsed.text.split("\n\n") if block.startswith("## 第")
+    )
+    assert "促成的含义及重要性" in page1
+    assert "### 讲师备注" in page1
+    assert "教学目标：使营销员明白促成的含义" in page1
+    assert page1.index("促成的含义及重要性") < page1.index("### 讲师备注")
+
+    assert "训练通关" in page2
+    assert "### 讲师备注" not in page2
+
+    assert page3.startswith("## 第 3 页")
+    assert "### 讲师备注" in page3
+    assert "本页仅有讲师备注" in page3
+
+
+def test_parse_source_file_sanitizes_lone_surrogates(tmp_path, monkeypatch) -> None:
+    import xhbx_rag.source_loader as source_loader
+
+    dirty_text = "促成话术\ud835要点"
+    monkeypatch.setitem(
+        source_loader._PARSERS,
+        "txt",
+        lambda path: (dirty_text, (), ()),
+    )
+    source = tmp_path / "课件.txt"
+    source.write_text("占位", encoding="utf-8")
+
+    parsed = parse_source_file(source)
+
+    parsed.text.encode("utf-8")
+    assert "促成话术" in parsed.text
+    assert "要点" in parsed.text
+
+
 def test_parse_pdf_source_extracts_embedded_images(tmp_path) -> None:
     pdf_path = tmp_path / "讲义.pdf"
     Image.open(BytesIO(_png_bytes())).save(pdf_path, "PDF")

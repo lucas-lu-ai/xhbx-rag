@@ -28,6 +28,7 @@ def _fake_config() -> SimpleNamespace:
         milvus_uri="http://localhost:19530",
         milvus_token="",
         milvus_collection="xhbx_sales_chunks",
+        milvus_course_collection="xhbx_course_chunks",
     )
 
 
@@ -76,7 +77,7 @@ def _install_rag_stubs(monkeypatch, citations=None):
         constructor_calls["store"] = config
         return "store"
 
-    monkeypatch.setattr(services, "create_milvus_store", store_factory)
+    monkeypatch.setattr(services, "create_retrieval_store", store_factory)
     monkeypatch.setattr(
         services,
         "RerankClient",
@@ -119,7 +120,7 @@ def _install_closeable_rag_stubs(monkeypatch, error=None) -> list[str]:
     monkeypatch.setattr(services.RetrievalConfig, "from_env", _fake_config)
     monkeypatch.setattr(services, "QueryUnderstandingAgent", http_factory("query_agent"))
     monkeypatch.setattr(services, "EmbeddingClient", http_factory("embedding_client"))
-    monkeypatch.setattr(services, "create_milvus_store", store_factory)
+    monkeypatch.setattr(services, "create_retrieval_store", store_factory)
     monkeypatch.setattr(services, "RerankClient", http_factory("reranker"))
     monkeypatch.setattr(services, "AnswerAgent", http_factory("answer_agent"))
 
@@ -383,7 +384,7 @@ def test_answer_question_returns_retrieval_evidences_from_answer_context(
     monkeypatch.setattr(services.RetrievalConfig, "from_env", _fake_config)
     monkeypatch.setattr(services, "QueryUnderstandingAgent", lambda **kwargs: "query")
     monkeypatch.setattr(services, "EmbeddingClient", lambda **kwargs: "embedding")
-    monkeypatch.setattr(services, "create_milvus_store", lambda config: "store")
+    monkeypatch.setattr(services, "create_retrieval_store", lambda config: "store")
     monkeypatch.setattr(services, "RerankClient", lambda **kwargs: "reranker")
 
     class FakeAnswerAgent:
@@ -840,7 +841,7 @@ def test_answer_question_sanitizes_local_index_open_failure(monkeypatch) -> None
             "/Users/milan/xhbx-rag/.local/milvus/xhbx_rag.db secret-token"
         )
 
-    monkeypatch.setattr(services, "create_milvus_store", fail_store)
+    monkeypatch.setattr(services, "create_retrieval_store", fail_store)
 
     with pytest.raises(ValueError) as exc_info:
         services.answer_question(

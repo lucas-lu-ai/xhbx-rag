@@ -106,6 +106,25 @@ def test_query_understanding_drops_unknown_chunk_types() -> None:
     assert result.filters.chunk_types == ["strategy", "customer_journey"]
 
 
+def test_query_understanding_accepts_training_course_chunk_type() -> None:
+    result = QueryUnderstanding.model_validate(
+        {
+            "intent": "general_sales_qa",
+            "rewritten_query": "促成课程的标准讲法是什么？",
+            "needs_retrieval": True,
+            "filters": {"chunk_types": ["training_course"]},
+        }
+    )
+
+    assert result.filters.chunk_types == ["training_course"]
+
+
+def test_query_understanding_prompt_mentions_training_course() -> None:
+    from xhbx_rag.query_understanding import _SYSTEM_PROMPT
+
+    assert "training_course" in _SYSTEM_PROMPT
+
+
 def test_query_understanding_normalizes_empty_filter_arrays_to_blank_strings() -> None:
     result = QueryUnderstanding.model_validate(
         {

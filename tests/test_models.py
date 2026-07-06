@@ -139,3 +139,18 @@ def test_case_part_draft_models_accept_evidence_ids_and_ignore_extras() -> None:
     assert strategies.strategies[0].evidence_ids == ["E001"]
     assert scripts.scripts[0].script_id == "script_001"
     assert objections.objection_handling[0].diagnosis == "客户用投资收益率衡量保险"
+
+
+def test_rag_chunk_accepts_training_course_type() -> None:
+    from xhbx_rag.models import RagChunk
+
+    chunk = RagChunk(
+        chunk_id="course__demo__0001",
+        chunk_type="training_course",
+        text="课程内容",
+        metadata={"course_name": "促成及异议处理"},
+        citations=[],
+        source_file="课件.pptx",
+    )
+
+    assert chunk.chunk_type == "training_course"

@@ -13,6 +13,7 @@ KNOWLEDGE_TYPE_BY_CHUNK_TYPE = {
     "strategy": "销售策略",
     "script": "场景话术",
     "objection_handling": "异议处理",
+    "training_course": "培训课程",
 }
 
 _TEXT_LIST_FIELDS = (

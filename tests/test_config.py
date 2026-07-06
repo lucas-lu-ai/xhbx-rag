@@ -76,6 +76,22 @@ def test_retrieval_config_reads_docker_milvus_settings_without_exposing_token() 
     assert "root:Milvus" not in config.safe_summary()
 
 
+def test_retrieval_config_defaults_course_collection() -> None:
+    config = RetrievalConfig.from_env(env=_required_env(), env_file=None)
+
+    assert config.milvus_course_collection == "xhbx_course_chunks"
+
+
+def test_retrieval_config_reads_course_collection_override() -> None:
+    config = RetrievalConfig.from_env(
+        env=_required_env(MILVUS_COURSE_COLLECTION="my_course_chunks"),
+        env_file=None,
+    )
+
+    assert config.milvus_course_collection == "my_course_chunks"
+    assert "my_course_chunks" in config.safe_summary()
+
+
 def test_retrieval_config_rejects_unknown_milvus_mode() -> None:
     with pytest.raises(ConfigError, match="MILVUS_MODE"):
         RetrievalConfig.from_env(

@@ -23,6 +23,7 @@ _ALLOWED_CHUNK_TYPES = {
     "strategy",
     "script",
     "objection_handling",
+    "training_course",
 }
 
 
@@ -164,12 +165,13 @@ _SYSTEM_PROMPT = """你是销售洞察 RAG 的查询理解节点。
 - rewritten_query: 独立、明确、适合检索的问题；如果 needs_retrieval=false 可为空
 - needs_retrieval: boolean
 - filters: object，包含 chunk_types, stage, scenario, objection, strategy_names
-  - chunk_types 只能使用 customer_journey | strategy | script | objection_handling，不要输出 qa。
+  - chunk_types 只能使用 customer_journey | strategy | script | objection_handling | training_course，不要输出 qa。
 要求：
 1. 不要增加用户没有表达的事实约束。
 2. 不能直接回答用户问题。
-3. 如果问题不属于保险销售洞察、话术、异议、策略或客户旅程，intent=out_of_scope 且 needs_retrieval=false。
-4. 通用解释、作用、价值、原因类问题使用 general_sales_qa，chunk_types 通常留空，除非用户明确限定只查话术、策略、异议或客户旅程。
+3. 如果问题不属于保险销售知识（案例经验、话术、异议、策略、客户旅程、培训课程），intent=out_of_scope 且 needs_retrieval=false。
+4. 通用解释、作用、价值、原因类问题使用 general_sales_qa，chunk_types 通常留空，除非用户明确限定只查某类知识。
+5. 知识库同时包含绩优案例经验与制式培训课程两类：问"怎么讲这门课/课程内容/标准流程/制式话术/培训教材"倾向 chunk_types=["training_course"]；问"某位绩优如何做成/实战经验"倾向案例四类；不确定时 chunk_types 留空同时检索两类。
 """
 
 
