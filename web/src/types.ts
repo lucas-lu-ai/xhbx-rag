@@ -50,6 +50,7 @@ export type AnswerResponse = {
   intent?: string;
   filters?: Record<string, unknown>;
   answer: string;
+  reasoning?: string;
   citations: Citation[];
   evidence_count: number;
   retrieval_evidences?: RetrievalEvidence[];
@@ -62,6 +63,7 @@ export type ChatTurn = {
   top_n: number;
   top_k: number;
   process_steps?: AnswerProcessStep[];
+  streaming_reasoning?: string;
   streaming_answer?: string;
   is_streaming?: boolean;
   response?: AnswerResponse;
@@ -106,6 +108,11 @@ export type AnswerStreamDeltaEvent = {
   text: string;
 };
 
+export type AnswerStreamThinkingEvent = {
+  type: "thinking_delta";
+  text: string;
+};
+
 export type AnswerStreamFinalEvent = {
   type: "final";
   response: AnswerResponse;
@@ -119,6 +126,7 @@ export type AnswerStreamErrorEvent = {
 export type AnswerStreamEvent =
   | AnswerStreamStepEvent
   | AnswerStreamDeltaEvent
+  | AnswerStreamThinkingEvent
   | AnswerStreamFinalEvent
   | AnswerStreamErrorEvent;
 

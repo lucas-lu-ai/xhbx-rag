@@ -9,7 +9,8 @@ import {
   deferredResponse,
   installFetchStub,
   installStorageStub,
-  runRegisteredCleanups
+  runRegisteredCleanups,
+  sseResponse
 } from "./test-utils";
 
 beforeEach(() => {
@@ -297,6 +298,51 @@ test("streams answer text before final metadata arrives", async () => {
     await screen.findByText("先承接预算，再讨论缴费期和保障缺口。")
   ).toBeInTheDocument();
   expect(screen.getByText("处理过程")).toBeInTheDocument();
+});
+
+test("streams thinking deltas and collapses them after the answer arrives", async () => {
+  const user = userEvent.setup();
+  installFetchStub((url) => {
+    if (url.endsWith("/api/answer/stream")) {
+      return sseResponse([
+        {
+          event: "thinking_delta",
+          data: { type: "thinking_delta", text: "先分析预算约束，" }
+        },
+        {
+          event: "thinking_delta",
+          data: { type: "thinking_delta", text: "再匹配可行方案。" }
+        },
+        {
+          event: "answer_delta",
+          data: { type: "answer_delta", text: "先承接预算，再讨论缴费期和保障缺口。" }
+        },
+        {
+          event: "final",
+          data: {
+            type: "final",
+            response: {
+              ...answerPayload,
+              reasoning: "先分析预算约束，再匹配可行方案。"
+            }
+          }
+        }
+      ]);
+    }
+    return null;
+  });
+  render(<App />);
+
+  await user.type(screen.getByLabelText("输入问题"), "客户说每年不能超过80万怎么办？");
+  await user.click(screen.getByRole("button", { name: "发送" }));
+
+  const toggle = await screen.findByRole("button", { name: /思考过程/ });
+  // 回答完成后思考块自动折叠，点击可重新展开完整推理。
+  expect(toggle).toHaveAttribute("aria-expanded", "false");
+  await user.click(toggle);
+  expect(
+    screen.getByText("先分析预算约束，再匹配可行方案。")
+  ).toBeInTheDocument();
 });
 
 test("selects an evidence source and reveals the source file", async () => {

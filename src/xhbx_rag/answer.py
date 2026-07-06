@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from typing import Any, Protocol
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .http_retry import post_json_with_retry
+from .http_retry import (
+    RETRYABLE_TRANSPORT_ERRORS,
+    is_retryable_status_code,
+    sleep_before_retry,
+)
 from .observability import TraceSink, emit_trace
 from .search import search_evidence
 
@@ -16,16 +21,17 @@ class AnswerGenerationError(RuntimeError):
     """Raised when answer generation cannot produce a valid grounded answer."""
 
 
-class _HttpClient(Protocol):
-    def post(
+class _SseHttpClient(Protocol):
+    def stream(
         self,
+        method: str,
         url: str,
         *,
         headers: dict,
         json: dict,
         timeout: float,
-    ) -> object:
-        """Post JSON to an API endpoint."""
+    ) -> Any:
+        """打开流式 HTTP 请求，返回可迭代 SSE 行的响应上下文管理器。"""
 
 
 class _QueryAgent(Protocol):
@@ -58,6 +64,8 @@ class GeneratedAnswer(BaseModel):
 
     answer: str
     citation_indexes: list[int] = Field(default_factory=list)
+    # 思考模型的推理过程，由 AnswerAgent 从流式响应收集后回填，不来自模型 JSON 输出。
+    reasoning: str = ""
 
     @field_validator("citation_indexes", mode="before")
     @classmethod
@@ -83,16 +91,24 @@ class GeneratedAnswer(BaseModel):
         return self
 
 
+class _StreamStatusError(RuntimeError):
+    def __init__(self, status_code: int) -> None:
+        super().__init__(f"chat/completions 流式响应状态码异常: {status_code}")
+        self.status_code = status_code
+
+
 class AnswerAgent:
     def __init__(
         self,
         base_url: str,
         api_key: str,
         model: str,
-        http_client: _HttpClient | None = None,
+        http_client: _SseHttpClient | None = None,
         timeout: float = 60.0,
         retry_attempts: int = 3,
         retry_base_delay: float = 0.5,
+        enable_thinking: bool = True,
+        on_thinking_delta: Callable[[str], None] | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -101,35 +117,109 @@ class AnswerAgent:
         self.timeout = timeout
         self.retry_attempts = retry_attempts
         self.retry_base_delay = retry_base_delay
+        self.enable_thinking = enable_thinking
+        self.on_thinking_delta = on_thinking_delta
 
     def generate(self, search_result: dict[str, Any]) -> GeneratedAnswer:
-        response = post_json_with_retry(
-            self.http_client,
-            f"{self.base_url}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": _SYSTEM_PROMPT},
-                    {"role": "user", "content": _build_user_prompt(search_result)},
-                ],
-                "temperature": 0,
-                "response_format": {"type": "json_object"},
-            },
-            timeout=self.timeout,
-            retry_attempts=self.retry_attempts,
-            retry_base_delay=self.retry_base_delay,
-        )
-        payload = response.json()  # type: ignore[attr-defined]
-        content = _extract_content(payload)
+        body = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": _build_user_prompt(search_result)},
+            ],
+            "temperature": 0,
+            "stream": True,
+            "enable_thinking": self.enable_thinking,
+            "response_format": {"type": "json_object"},
+        }
+        thinking_parts: list[str] = []
+        content = self._stream_chat_content(body, thinking_parts)
         try:
-            data = json.loads(content)
-            return GeneratedAnswer.model_validate(data)
+            data = json.loads(_strip_json_fences(content))
+            generated = GeneratedAnswer.model_validate(data)
         except Exception as exc:  # noqa: BLE001 - normalize parser/model errors
             raise AnswerGenerationError(f"answer generation 解析失败: {exc}") from exc
+        return generated.model_copy(update={"reasoning": "".join(thinking_parts)})
+
+    def _stream_chat_content(
+        self,
+        body: dict[str, Any],
+        thinking_parts: list[str],
+    ) -> str:
+        attempts = max(1, self.retry_attempts)
+        for attempt in range(1, attempts + 1):
+            content_parts: list[str] = []
+            received_delta = False
+            try:
+                with self.http_client.stream(
+                    "POST",
+                    f"{self.base_url}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=body,
+                    timeout=self.timeout,
+                ) as response:
+                    status_code = int(getattr(response, "status_code", 200))
+                    if status_code >= 400:
+                        raise _StreamStatusError(status_code)
+                    for raw_line in response.iter_lines():
+                        data = _sse_data(raw_line)
+                        if data is None:
+                            continue
+                        if data == "[DONE]":
+                            break
+                        delta = _chunk_delta(data)
+                        reasoning = delta.get("reasoning_content")
+                        if isinstance(reasoning, str) and reasoning:
+                            received_delta = True
+                            thinking_parts.append(reasoning)
+                            if self.on_thinking_delta is not None:
+                                self.on_thinking_delta(reasoning)
+                        text = delta.get("content")
+                        if isinstance(text, str) and text:
+                            received_delta = True
+                            content_parts.append(text)
+                return "".join(content_parts)
+            except _StreamStatusError as exc:
+                if attempt == attempts or not is_retryable_status_code(exc.status_code):
+                    raise AnswerGenerationError(str(exc)) from exc
+            except RETRYABLE_TRANSPORT_ERRORS:
+                # 已经向界面推送过增量时不重试，避免思考内容重复显示。
+                if received_delta or attempt == attempts:
+                    raise
+            sleep_before_retry(attempt, self.retry_base_delay)
+        raise AnswerGenerationError("chat/completions 流式重试次数耗尽")
+
+
+def _sse_data(line: object) -> str | None:
+    if isinstance(line, bytes):
+        line = line.decode("utf-8", errors="replace")
+    if not isinstance(line, str):
+        return None
+    stripped = line.strip()
+    if not stripped.startswith("data:"):
+        return None
+    return stripped.removeprefix("data:").strip()
+
+
+def _chunk_delta(data: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(data)
+    except ValueError:
+        return {}
+    choices = payload.get("choices") if isinstance(payload, dict) else None
+    if not isinstance(choices, list) or not choices:
+        return {}
+    delta = choices[0].get("delta") if isinstance(choices[0], dict) else None
+    return delta if isinstance(delta, dict) else {}
+
+
+def _strip_json_fences(text: str) -> str:
+    stripped = text.strip()
+    match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", stripped, re.DOTALL)
+    return match.group(1) if match else stripped
 
 
 def answer_query(
@@ -179,6 +269,7 @@ def answer_from_search_result(
             answer="当前检索结果不足以确认。",
             citations=[],
             evidence_count=0,
+            reasoning="",
         )
 
     generated = answer_agent.generate(search_result)
@@ -190,6 +281,7 @@ def answer_from_search_result(
         ),
     )
     answer = _strip_inline_citation_markers(str(getattr(generated, "answer")))
+    reasoning = str(getattr(generated, "reasoning", "") or "")
     emit_trace(
         trace,
         "answer.generated",
@@ -197,6 +289,7 @@ def answer_from_search_result(
             "evidence_count": evidence_count,
             "citation_count": len(citations),
             "compliance_risks": _collect_compliance_risks(search_result),
+            "reasoning_chars": len(reasoning),
             "answer_preview": _preview(answer),
         },
     )
@@ -205,6 +298,7 @@ def answer_from_search_result(
         answer=answer,
         citations=citations,
         evidence_count=evidence_count,
+        reasoning=reasoning,
     )
 
 
@@ -214,6 +308,7 @@ def _answer_payload(
     answer: str,
     citations: list[dict[str, Any]],
     evidence_count: int,
+    reasoning: str,
 ) -> dict[str, Any]:
     return {
         "original_query": search_result.get("original_query", ""),
@@ -221,6 +316,7 @@ def _answer_payload(
         "intent": search_result.get("intent", ""),
         "filters": search_result.get("filters", {}),
         "answer": answer,
+        "reasoning": reasoning,
         "citations": citations,
         "evidence_count": evidence_count,
     }
@@ -372,17 +468,6 @@ def _citation_key(citation: dict[str, Any]) -> tuple[Any, ...]:
         json.dumps(citation.get("locator") or {}, sort_keys=True, default=str),
         citation.get("source_excerpt") or citation.get("quote"),
     )
-
-
-def _extract_content(payload: dict[str, Any]) -> str:
-    choices = payload.get("choices")
-    if not choices:
-        raise AnswerGenerationError("chat/completions 响应缺少 choices")
-    message = choices[0].get("message", {})
-    content = message.get("content")
-    if not isinstance(content, str):
-        raise AnswerGenerationError("chat/completions 响应缺少 message.content")
-    return content
 
 
 def _preview(text: str, limit: int = 120) -> str:

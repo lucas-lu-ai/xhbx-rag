@@ -246,6 +246,21 @@ export function appendAnswerDelta(
   );
 }
 
+export function appendThinkingDelta(
+  turns: ChatTurn[],
+  turnId: string,
+  text: string
+): ChatTurn[] {
+  return turns.map((turn) =>
+    turn.id === turnId
+      ? {
+          ...turn,
+          streaming_reasoning: `${turn.streaming_reasoning ?? ""}${text}`
+        }
+      : turn
+  );
+}
+
 export function completeTurn(
   turns: ChatTurn[],
   turnId: string,

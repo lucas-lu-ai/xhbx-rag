@@ -1196,6 +1196,48 @@ dd {
   line-height: 1.35;
 }
 
+.thinking-block {
+  margin: 10px 0;
+  border: 1px solid rgb(148 163 184 / 0.32);
+  border-radius: 12px;
+  background: rgb(248 250 252 / 0.75);
+  overflow: hidden;
+}
+
+.thinking-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  border: none;
+  background: transparent;
+  color: #64748b;
+  padding: 8px 12px;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.35;
+  cursor: pointer;
+  text-align: left;
+}
+
+.thinking-toggle:hover {
+  color: #475569;
+}
+
+.thinking-content {
+  margin: 0;
+  max-height: 220px;
+  overflow: auto;
+  border-top: 1px dashed rgb(148 163 184 / 0.36);
+  color: #64748b;
+  padding: 10px 12px;
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .evidence-tag-chip {
   border: 1px solid var(--color-border);
   border-radius: 999px;

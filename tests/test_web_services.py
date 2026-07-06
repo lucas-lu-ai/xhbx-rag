@@ -356,6 +356,7 @@ def test_answer_question_uses_existing_rag_components(
         "base_url": "https://api.example.com/v1",
         "api_key": "chat-key",
         "model": "chat-model",
+        "on_thinking_delta": None,
     }
     assert calls["query"] == "客户说每年不能超过80万怎么办？"
     assert calls["query_agent"] == "query-agent"
@@ -482,7 +483,9 @@ def test_answer_question_stream_events_emit_steps_deltas_and_final(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    def fake_answer_question(*, query, top_n, top_k, project_root=None, trace=None):
+    def fake_answer_question(
+        *, query, top_n, top_k, project_root=None, trace=None, on_thinking_delta=None
+    ):
         trace.emit("search.query_understood", {"rewritten_query": "预算不超过80万"})
         trace.emit(
             "search.tag_boosted",
@@ -498,6 +501,9 @@ def test_answer_question_stream_events_emit_steps_deltas_and_final(
                 ],
             },
         )
+        # 思考增量应实时进入 SSE 事件流，且先于回答分片。
+        on_thinking_delta("先分析预算约束，")
+        on_thinking_delta("再匹配可行方案。")
         trace.emit("search.reranked", {"result_count": 2})
         return {
             "original_query": query,
@@ -505,6 +511,7 @@ def test_answer_question_stream_events_emit_steps_deltas_and_final(
             "intent": "objection_handling",
             "filters": {},
             "answer": "先承接预算，再讨论缴费期和保障缺口。",
+            "reasoning": "先分析预算约束，再匹配可行方案。",
             "citations": [],
             "evidence_count": 2,
             "retrieval_evidences": [],
@@ -529,12 +536,15 @@ def test_answer_question_stream_events_emit_steps_deltas_and_final(
     assert events[1]["message"] == "已完成标签加权"
     assert events[1]["payload"]["query_tag_paths"] == ["客户需求/保费预算"]
     assert events[1]["payload"]["boosted"][0]["chunk_id"] == "c1"
-    assert events[2]["step"] == "search.reranked"
+    assert events[2] == {"type": "thinking_delta", "text": "先分析预算约束，"}
+    assert events[3] == {"type": "thinking_delta", "text": "再匹配可行方案。"}
+    assert events[4]["step"] == "search.reranked"
     assert "".join(
         event["text"] for event in events if event["type"] == "answer_delta"
     ) == "先承接预算，再讨论缴费期和保障缺口。"
     assert events[-1]["type"] == "final"
     assert events[-1]["response"]["evidence_count"] == 2
+    assert events[-1]["response"]["reasoning"] == "先分析预算约束，再匹配可行方案。"
 
 
 def test_answer_question_stream_events_sends_trace_to_studio_when_enabled(
@@ -561,7 +571,9 @@ def test_answer_question_stream_events_sends_trace_to_studio_when_enabled(
         created["trace"] = trace
         return trace
 
-    def fake_answer_question(*, query, top_n, top_k, project_root=None, trace=None):
+    def fake_answer_question(
+        *, query, top_n, top_k, project_root=None, trace=None, on_thinking_delta=None
+    ):
         trace.emit("search.query_understood", {"rewritten_query": "预算不超过80万"})
         trace.emit("answer.generated", {"citation_count": 0})
         return {
@@ -627,7 +639,9 @@ def test_answer_question_stream_events_closes_studio_trace_on_exception(
         created["trace"] = trace
         return trace
 
-    def fail_answer_question(*, query, top_n, top_k, project_root=None, trace=None):
+    def fail_answer_question(
+        *, query, top_n, top_k, project_root=None, trace=None, on_thinking_delta=None
+    ):
         raise RuntimeError("secret-token leaked")
 
     monkeypatch.setenv("WEB_STUDIO_TRACE", "1")
@@ -652,7 +666,9 @@ def test_answer_question_stream_events_closes_studio_trace_on_exception(
 
 
 def test_answer_question_stream_events_emit_internal_exception(monkeypatch) -> None:
-    def fail_answer_question(*, query, top_n, top_k, project_root=None, trace=None):
+    def fail_answer_question(
+        *, query, top_n, top_k, project_root=None, trace=None, on_thinking_delta=None
+    ):
         raise RuntimeError("secret-token leaked")
 
     monkeypatch.setattr(services, "answer_question", fail_answer_question)

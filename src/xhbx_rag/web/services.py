@@ -3,7 +3,7 @@ from __future__ import annotations
 from queue import Queue
 from pathlib import Path
 from threading import Lock, Thread
-from typing import Any, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 from xhbx_rag.answer import AnswerAgent, answer_query
 from xhbx_rag.config import ConfigError, RetrievalConfig, load_env_values
@@ -119,6 +119,7 @@ def answer_question(
     top_k: int,
     project_root: Path | None = None,
     trace: TraceSink | None = None,
+    on_thinking_delta: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     stripped_query = query.strip()
     if not stripped_query:
@@ -142,6 +143,7 @@ def answer_question(
                 top_k=top_k,
                 project_root=project_root,
                 trace=trace,
+                on_thinking_delta=on_thinking_delta,
             )
     return _answer_question_with_config(
         config=config,
@@ -150,6 +152,7 @@ def answer_question(
         top_k=top_k,
         project_root=project_root,
         trace=trace,
+        on_thinking_delta=on_thinking_delta,
     )
 
 
@@ -161,6 +164,7 @@ def _answer_question_with_config(
     top_k: int,
     project_root: Path | None = None,
     trace: TraceSink | None = None,
+    on_thinking_delta: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     resources: list[object] = []
     try:
@@ -193,6 +197,7 @@ def _answer_question_with_config(
             base_url=config.base_url,
             api_key=config.api_key,
             model=config.model_name,
+            on_thinking_delta=on_thinking_delta,
         )
         resources.append(raw_answer_agent)
         answer_agent = _RecordingAnswerAgent(raw_answer_agent)
@@ -242,6 +247,9 @@ def answer_question_stream_events(
                 top_k=top_k,
                 project_root=project_root,
                 trace=trace,
+                on_thinking_delta=lambda text: events.put(
+                    {"type": "thinking_delta", "text": text}
+                ),
             )
             events.put({"type": "_result", "response": response})
         except Exception as exc:  # noqa: BLE001 - converted to safe SSE at route boundary

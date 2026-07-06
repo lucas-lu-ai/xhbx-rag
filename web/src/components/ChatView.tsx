@@ -11,6 +11,7 @@ import { answerQuestionStream } from "../api";
 import {
   appendAnswerDelta,
   appendProcessStep,
+  appendThinkingDelta,
   completeTurn,
   failTurn,
   makeStreamingTurn,
@@ -27,6 +28,7 @@ import type {
 import { BadCasePanel } from "./BadCasePanel";
 import { firstCitationSelection } from "./EvidenceList";
 import { ProcessTimeline } from "./ProcessTimeline";
+import { ThinkingProcess } from "./ThinkingProcess";
 
 const DEFAULT_TOP_N = 20;
 const DEFAULT_TOP_K = 5;
@@ -110,6 +112,11 @@ export function ChatView({
                   message: streamEvent.message,
                   payload: streamEvent.payload
                 })
+              );
+            }
+            if (streamEvent.type === "thinking_delta") {
+              onUpdateSession(submittedSessionId, (items) =>
+                appendThinkingDelta(items, id, streamEvent.text)
               );
             }
             if (streamEvent.type === "answer_delta") {
@@ -219,6 +226,14 @@ export function ChatView({
                   <ProcessTimeline
                     active={Boolean(turn.is_streaming && !turn.response)}
                     steps={turn.process_steps ?? []}
+                  />
+                  <ThinkingProcess
+                    reasoning={
+                      turn.response?.reasoning || turn.streaming_reasoning || ""
+                    }
+                    live={Boolean(
+                      turn.is_streaming && !turn.response && !turn.streaming_answer
+                    )}
                   />
                   <p>
                     {turn.response?.answer ||

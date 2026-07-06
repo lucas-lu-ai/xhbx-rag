@@ -1,55 +1,83 @@
+import json
+from contextlib import contextmanager
+
 import httpx
 
 from xhbx_rag.answer import AnswerAgent, answer_from_search_result
 from xhbx_rag.observability import MemoryTraceSink
 
 
-class _FakeResponse:
-    def __init__(self, payload: dict) -> None:
-        self._payload = payload
-
-    def raise_for_status(self) -> None:
-        return None
-
-    def json(self) -> dict:
-        return self._payload
+def _delta_chunk(**delta: object) -> str:
+    return json.dumps({"choices": [{"delta": delta}]}, ensure_ascii=False)
 
 
-class _FakeHttpClient:
-    def __init__(self, payload: dict) -> None:
-        self.payload = payload
+def _sse_lines(*data_items: str) -> list[str]:
+    lines = [f"data: {item}" for item in data_items]
+    lines.append("data: [DONE]")
+    return lines
+
+
+def _answer_sse_lines(
+    answer: str,
+    citation_indexes: list[int],
+    *,
+    reasoning_parts: tuple[str, ...] = ("先梳理证据，", "再归纳回答要点。"),
+) -> list[str]:
+    content = json.dumps(
+        {"answer": answer, "citation_indexes": citation_indexes},
+        ensure_ascii=False,
+    )
+    middle = len(content) // 2
+    return _sse_lines(
+        *[_delta_chunk(reasoning_content=part) for part in reasoning_parts],
+        _delta_chunk(content=content[:middle]),
+        _delta_chunk(content=content[middle:]),
+    )
+
+
+class _FakeStreamResponse:
+    def __init__(self, lines: list[str], status_code: int = 200) -> None:
+        self._lines = lines
+        self.status_code = status_code
+
+    def iter_lines(self):
+        yield from self._lines
+
+
+class _FakeSseClient:
+    def __init__(
+        self,
+        lines: list[str],
+        failures: list[Exception] | None = None,
+        status_code: int = 200,
+    ) -> None:
         self.calls: list[dict] = []
+        self._lines = lines
+        self._failures = list(failures or [])
+        self._status_code = status_code
 
-    def post(self, url: str, *, headers: dict, json: dict, timeout: float) -> _FakeResponse:
+    @contextmanager
+    def stream(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict,
+        json: dict,
+        timeout: float,
+    ):
         self.calls.append(
             {
+                "method": method,
                 "url": url,
                 "headers": headers,
                 "json": json,
                 "timeout": timeout,
             }
         )
-        return _FakeResponse(self.payload)
-
-
-class _FlakyHttpClient:
-    def __init__(self, failures: list[Exception], payload: dict) -> None:
-        self.failures = failures
-        self.payload = payload
-        self.calls: list[dict] = []
-
-    def post(self, url: str, *, headers: dict, json: dict, timeout: float) -> _FakeResponse:
-        self.calls.append(
-            {
-                "url": url,
-                "headers": headers,
-                "json": json,
-                "timeout": timeout,
-            }
-        )
-        if self.failures:
-            raise self.failures.pop(0)
-        return _FakeResponse(self.payload)
+        if self._failures:
+            raise self._failures.pop(0)
+        yield _FakeStreamResponse(self._lines, self._status_code)
 
 
 def _search_result() -> dict:
@@ -96,72 +124,85 @@ def _search_result() -> dict:
     }
 
 
-def test_answer_agent_posts_evidence_context_and_parses_json_response() -> None:
-    http = _FakeHttpClient(
-        {
-            "choices": [
-                {
-                    "message": {
-                        "content": (
-                            '{"answer":"保单整理能帮助客户看清保障缺口，并建立对代理人的专业信任。",'
-                            '"citation_indexes":[1,2]}'
-                        )
-                    }
-                }
-            ]
-        }
-    )
-    agent = AnswerAgent(
+def _agent(http: _FakeSseClient, **kwargs: object) -> AnswerAgent:
+    return AnswerAgent(
         base_url="https://api.example.com/v1",
         api_key="secret",
         model="chat-model",
-        http_client=http,
+        http_client=http,  # type: ignore[arg-type]
+        **kwargs,  # type: ignore[arg-type]
     )
+
+
+def test_answer_agent_streams_thinking_and_parses_json_response() -> None:
+    http = _FakeSseClient(
+        _answer_sse_lines(
+            "保单整理能帮助客户看清保障缺口，并建立对代理人的专业信任。",
+            [1, 2],
+        )
+    )
+    thinking: list[str] = []
+    agent = _agent(http, on_thinking_delta=thinking.append)
 
     result = agent.generate(_search_result())
 
     assert result.answer == "保单整理能帮助客户看清保障缺口，并建立对代理人的专业信任。"
     assert result.citation_indexes == [1, 2]
+    assert result.reasoning == "先梳理证据，再归纳回答要点。"
+    # 思考增量按到达顺序实时回调，而不是收尾时一次性给出。
+    assert thinking == ["先梳理证据，", "再归纳回答要点。"]
     call = http.calls[0]
+    assert call["method"] == "POST"
     assert call["url"] == "https://api.example.com/v1/chat/completions"
     assert call["headers"]["Authorization"] == "Bearer secret"
-    assert call["json"]["model"] == "chat-model"
-    assert call["json"]["response_format"] == {"type": "json_object"}
-    user_content = call["json"]["messages"][-1]["content"]
+    body = call["json"]
+    assert body["model"] == "chat-model"
+    assert body["stream"] is True
+    assert body["enable_thinking"] is True
+    assert body["response_format"] == {"type": "json_object"}
+    user_content = body["messages"][-1]["content"]
     assert "保单整理对客户有什么作用？" in user_content
     assert "[证据1]" in user_content
     assert "[引用1]" in user_content
     assert "原文：客户自己看表后说，原来这里还有这么大的缺口。" in user_content
 
 
-def test_answer_agent_retries_transient_http_errors() -> None:
-    http = _FlakyHttpClient(
-        failures=[httpx.RemoteProtocolError("Server disconnected without sending a response.")],
-        payload={
-            "choices": [
-                {
-                    "message": {
-                        "content": (
-                            '{"answer":"保单整理能帮助客户看清保障缺口。",'
-                            '"citation_indexes":[1]}'
-                        )
-                    }
-                }
-            ]
-        },
+def test_answer_agent_can_disable_thinking() -> None:
+    http = _FakeSseClient(
+        _answer_sse_lines("保单整理能帮助客户看清保障缺口。", [1], reasoning_parts=())
     )
-    agent = AnswerAgent(
-        base_url="https://api.example.com/v1",
-        api_key="secret",
-        model="chat-model",
-        http_client=http,
-        retry_base_delay=0,
+    agent = _agent(http, enable_thinking=False)
+
+    result = agent.generate(_search_result())
+
+    assert http.calls[0]["json"]["enable_thinking"] is False
+    assert result.reasoning == ""
+
+
+def test_answer_agent_retries_stream_open_failures() -> None:
+    http = _FakeSseClient(
+        _answer_sse_lines("保单整理能帮助客户看清保障缺口。", [1]),
+        failures=[
+            httpx.RemoteProtocolError("Server disconnected without sending a response.")
+        ],
     )
+    agent = _agent(http, retry_base_delay=0)
 
     result = agent.generate(_search_result())
 
     assert result.answer == "保单整理能帮助客户看清保障缺口。"
     assert len(http.calls) == 2
+
+
+def test_answer_agent_parses_fenced_json_content() -> None:
+    content = '```json\n{"answer":"稳健的沟通建议。","citation_indexes":[1]}\n```'
+    http = _FakeSseClient(_sse_lines(_delta_chunk(content=content)))
+    agent = _agent(http)
+
+    result = agent.generate(_search_result())
+
+    assert result.answer == "稳健的沟通建议。"
+    assert result.citation_indexes == [1]
 
 
 def test_answer_from_search_result_maps_selected_citations_and_emits_trace() -> None:
@@ -223,28 +264,34 @@ def test_answer_from_search_result_supplements_underselected_citations_with_evid
     assert [citation["evidence_index"] for citation in result["citations"]] == [1, 2]
 
 
-def _answer_http_client() -> _FakeHttpClient:
-    return _FakeHttpClient(
-        {
-            "choices": [
+def test_answer_from_search_result_returns_reasoning_in_payload() -> None:
+    class _ThinkingAnswerAgent:
+        def generate(self, search_result: dict):
+            return type(
+                "Answer",
+                (),
                 {
-                    "message": {
-                        "content": '{"answer":"稳健的沟通建议。","citation_indexes":[1]}'
-                    }
-                }
-            ]
-        }
+                    "answer": "稳健的沟通建议。",
+                    "citation_indexes": [1],
+                    "reasoning": "先梳理证据，再归纳回答要点。",
+                },
+            )()
+
+    result = answer_from_search_result(
+        _search_result(),
+        answer_agent=_ThinkingAnswerAgent(),
     )
+
+    assert result["reasoning"] == "先梳理证据，再归纳回答要点。"
+
+
+def _answer_sse_client() -> _FakeSseClient:
+    return _FakeSseClient(_answer_sse_lines("稳健的沟通建议。", [1]))
 
 
 def test_answer_agent_injects_compliance_guidance_for_risky_evidence() -> None:
-    http = _answer_http_client()
-    agent = AnswerAgent(
-        base_url="https://api.example.com/v1",
-        api_key="secret",
-        model="chat-model",
-        http_client=http,
-    )
+    http = _answer_sse_client()
+    agent = _agent(http)
     search_result = _search_result()
     search_result["results"][0]["metadata"]["compliance_risks"] = [
         "收益承诺风险",
@@ -260,13 +307,8 @@ def test_answer_agent_injects_compliance_guidance_for_risky_evidence() -> None:
 
 
 def test_answer_agent_omits_compliance_block_without_risky_evidence() -> None:
-    http = _answer_http_client()
-    agent = AnswerAgent(
-        base_url="https://api.example.com/v1",
-        api_key="secret",
-        model="chat-model",
-        http_client=http,
-    )
+    http = _answer_sse_client()
+    agent = _agent(http)
 
     agent.generate(_search_result())
 
@@ -320,3 +362,4 @@ def test_answer_from_search_result_skips_model_when_no_results() -> None:
     assert result["answer"] == "当前检索结果不足以确认。"
     assert result["citations"] == []
     assert result["evidence_count"] == 0
+    assert result["reasoning"] == ""

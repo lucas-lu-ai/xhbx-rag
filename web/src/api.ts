@@ -373,6 +373,9 @@ function toAnswerStreamEvent(
   if (type === "answer_delta" && typeof value.text === "string") {
     return { type, text: value.text };
   }
+  if (type === "thinking_delta" && typeof value.text === "string") {
+    return { type, text: value.text };
+  }
   if (type === "final" && isObject(value.response)) {
     return { type, response: value.response as AnswerResponse };
   }
