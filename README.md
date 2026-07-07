@@ -42,7 +42,7 @@ uv run xhbx-rag ingest \
 
 ```bash
 uv run xhbx-rag generate-insights \
-  --case-dir "uploads/【郭春渝】专注保单整理，达成百万业绩" \
+  --case-dir "uploads/xxx案例" \
   --out generated \
   --trace
 ```
@@ -123,8 +123,8 @@ uv run xhbx-rag generate-insights \
 
 ```bash
 uv run xhbx-rag parse \
-  --insights generated/郭春渝_专注保单整理_达成百万业绩/case.sales_insights.json \
-  --playbook generated/郭春渝_专注保单整理_达成百万业绩/case.sales_playbook.md \
+  --insights generated/xxxx/case.sales_insights.json \
+  --playbook generated/xxxx/case.sales_playbook.md \
   --out parsed
 ```
 
@@ -149,10 +149,10 @@ uv run xhbx-rag answer --query "客户说每年不能超过80万怎么办？" --
 
 ```bash
 # 一键：解析切块 → 写入课程库（MILVUS_COURSE_COLLECTION）
-uv run xhbx-rag ingest-course --course-dir "data/新华培训数据" --trace
+uv run xhbx-rag ingest-course --course-dir "data/培训数据" --trace
 
 # 分步：先看切块产物，再入库
-uv run xhbx-rag parse-course --course-dir "data/新华培训数据" --out parsed_courses --no-enrich
+uv run xhbx-rag parse-course --course-dir "data/培训数据" --out parsed_courses --no-enrich
 uv run xhbx-rag index --chunks parsed_courses/chunks.jsonl --collection course
 ```
 
@@ -162,8 +162,8 @@ uv run xhbx-rag index --chunks parsed_courses/chunks.jsonl --collection course
 - doc/ppt/wps 老格式需先转换（依赖本机 LibreOffice）：
 
 ```bash
-uv run python scripts/convert_legacy_formats.py --dir "data/新华培训数据" --dry-run   # 先看计划
-uv run python scripts/convert_legacy_formats.py --dir "data/新华培训数据"             # 执行转换
+uv run python scripts/convert_legacy_formats.py --dir "data/培训数据" --dry-run   # 先看计划
+uv run python scripts/convert_legacy_formats.py --dir "data/培训数据"             # 执行转换
 ```
 
 检索时案例库与课程库**聚合召回**：向量召回按分数跨库合并，BM25 关键词召回把两库候选合池后统一打分，聚合后走同一条 RRF 融合 → 标签软加权 → rerank 链路。`search / answer` / Web / MCP 无需额外参数。
