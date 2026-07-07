@@ -16,8 +16,10 @@ def test_docker_deployment_files_exist() -> None:
         "web/Dockerfile",
         "web/nginx.conf",
         "docker-compose.yml",
+        "docker-compose.mcp.yml",
         ".dockerignore",
         ".env.docker.example",
+        ".env.mcp.example",
         "docs/docker-compose部署.md",
     ]
 
@@ -94,3 +96,32 @@ def test_docker_docs_cover_startup_and_one_off_ingestion_tasks() -> None:
     assert "docker compose run --rm cli xhbx-rag index" in docs
     assert "MILVUS_URI=http://localhost:19530" in docs
     assert "http://standalone:19530" in docs
+
+
+def test_mcp_compose_defines_only_mcp_and_milvus_stack() -> None:
+    compose = read_repo_file("docker-compose.mcp.yml")
+
+    for service_name in ("mcp", "etcd", "minio", "standalone"):
+        assert f"  {service_name}:" in compose
+
+    assert "  api:" not in compose
+    assert "  web:" not in compose
+    assert "  cli:" not in compose
+    assert "dockerfile: Dockerfile.api" in compose
+    assert "xhbx-rag-mcp" in compose
+    assert "streamable-http" in compose
+    assert "--path" in compose
+    assert "/mcp" in compose
+    assert "http://standalone:19530" in compose
+    assert '"${MCP_BIND:-127.0.0.1}:${MCP_PORT:-9331}:9331"' in compose
+
+
+def test_mcp_env_template_documents_server_binding_and_collections() -> None:
+    env_template = read_repo_file(".env.mcp.example")
+
+    assert "MCP_BIND=127.0.0.1" in env_template
+    assert "MCP_PORT=9331" in env_template
+    assert "MILVUS_MODE=docker" in env_template
+    assert "MILVUS_URI=http://localhost:19530" in env_template
+    assert "MILVUS_COLLECTION=xhbx_sales_chunks" in env_template
+    assert "MILVUS_COURSE_COLLECTION=xhbx_course_chunks" in env_template
