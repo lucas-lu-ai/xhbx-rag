@@ -113,6 +113,8 @@ def test_mcp_compose_defines_only_mcp_and_milvus_stack() -> None:
     assert "--path" in compose
     assert "/mcp" in compose
     assert "http://standalone:19530" in compose
+    assert "./parsed:/app/parsed" in compose
+    assert "./scripts:/app/scripts:ro" in compose
     assert '"${MCP_BIND:-127.0.0.1}:${MCP_PORT:-9331}:9331"' in compose
 
 
@@ -125,3 +127,13 @@ def test_mcp_env_template_documents_server_binding_and_collections() -> None:
     assert "MILVUS_URI=http://localhost:19530" in env_template
     assert "MILVUS_COLLECTION=xhbx_sales_chunks" in env_template
     assert "MILVUS_COURSE_COLLECTION=xhbx_course_chunks" in env_template
+
+
+def test_index_parsed_script_indexes_every_chunks_jsonl_under_parsed() -> None:
+    script = read_repo_file("scripts/index_parsed.sh")
+
+    assert 'PARSED_DIR="${PARSED_DIR:-parsed}"' in script
+    assert 'RESET_COLLECTION="${RESET_COLLECTION:-false}"' in script
+    assert 'find "$PARSED_DIR" -type f -name "chunks.jsonl"' in script
+    assert 'current_mode="rebuild"' in script
+    assert 'xhbx-rag index --chunks "$chunks_file" --mode "$current_mode"' in script
