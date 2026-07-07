@@ -1,6 +1,5 @@
 .idea/
-docs/*
-!docs/docker-compose部署.md
+docs/
 .venv/
 node_modules/
 __pycache__/
