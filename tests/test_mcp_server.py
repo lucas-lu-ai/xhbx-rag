@@ -4,12 +4,17 @@ import json
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
 
+import xhbx_rag.mcp_server as mcp_server
 from xhbx_rag.config import ConfigError
+from xhbx_rag.milvus_store import MilvusSearchHit
 from xhbx_rag.mcp_server import (
+    ConfiguredEvidenceSearcher,
     LOCAL_INDEX_UNAVAILABLE_ERROR,
     UNAVAILABLE_SEARCH_ERROR,
     create_mcp_server,
 )
+from xhbx_rag.models import RagChunk
+from xhbx_rag.rerank import RerankResult
 
 
 class FakeSearcher:
@@ -38,6 +43,17 @@ def test_server_registers_expected_tools():
     assert tool_names == {"search_knowledge", "retrieval_status"}
 
 
+def test_search_knowledge_only_exposes_query_argument():
+    server = create_mcp_server(searcher=FakeSearcher())
+    tools = asyncio.run(server.list_tools())
+    search_tool = next(tool for tool in tools if tool.name == "search_knowledge")
+
+    assert search_tool.inputSchema["properties"] == {
+        "query": {"title": "Query", "type": "string"}
+    }
+    assert search_tool.inputSchema["required"] == ["query"]
+
+
 def test_search_knowledge_returns_searcher_result():
     expected = {
         "original_query": "怎么处理客户异议",
@@ -51,12 +67,12 @@ def test_search_knowledge_returns_searcher_result():
     payload = _call_tool(
         server,
         "search_knowledge",
-        {"query": "怎么处理客户异议", "top_n": 10, "top_k": 3},
+        {"query": "怎么处理客户异议"},
     )
 
     assert payload == expected
     assert searcher.calls == [
-        {"query": "怎么处理客户异议", "top_n": 10, "top_k": 3}
+        {"query": "怎么处理客户异议", "top_n": 20, "top_k": 5}
     ]
 
 
@@ -75,30 +91,6 @@ def test_search_knowledge_rejects_empty_query():
 
     with pytest.raises(ToolError, match="问题不能为空"):
         asyncio.run(server.call_tool("search_knowledge", {"query": "   "}))
-    assert searcher.calls == []
-
-
-@pytest.mark.parametrize(
-    ("top_n", "top_k", "message"),
-    [
-        (0, 5, "top_n 必须在 1 到 100 之间"),
-        (101, 5, "top_n 必须在 1 到 100 之间"),
-        (20, 0, "top_k 必须在 1 到 20 之间"),
-        (20, 21, "top_k 必须在 1 到 20 之间"),
-        (5, 10, "top_k 不能大于 top_n"),
-    ],
-)
-def test_search_knowledge_rejects_bad_limits(top_n, top_k, message):
-    searcher = FakeSearcher()
-    server = create_mcp_server(searcher=searcher)
-
-    with pytest.raises(ToolError, match=message):
-        asyncio.run(
-            server.call_tool(
-                "search_knowledge",
-                {"query": "客户经营", "top_n": top_n, "top_k": top_k},
-            )
-        )
     assert searcher.calls == []
 
 
@@ -182,6 +174,35 @@ def test_retrieval_status_masks_provider_error():
     assert "secret" not in message
 
 
+def test_default_retrieval_status_does_not_require_chat_config(monkeypatch):
+    calls = []
+    config = type(
+        "Config",
+        (),
+        {
+            "milvus_mode": "docker",
+            "milvus_uri": "http://localhost:19530",
+            "milvus_lite_path": "",
+            "milvus_collection": "xhbx_sales_chunks",
+            "milvus_course_collection": "xhbx_course_chunks",
+        },
+    )()
+
+    monkeypatch.setattr(
+        mcp_server.RetrievalConfig,
+        "from_env",
+        classmethod(
+            lambda cls, *, require_chat=True: calls.append(require_chat) or config
+        ),
+    )
+
+    payload = mcp_server._default_status_provider()
+
+    assert calls == [False]
+    assert payload["ok"] is True
+    assert payload["milvus_collection"] == "xhbx_sales_chunks"
+
+
 def test_create_default_server_without_injection():
     server = create_mcp_server()
     tools = asyncio.run(server.list_tools())
@@ -214,3 +235,92 @@ def test_create_server_accepts_custom_endpoint_paths():
     )
     assert server.settings.sse_path == "/mcp/sse"
     assert server.settings.streamable_http_path == "/knowledge"
+
+
+def test_configured_searcher_skips_chat_model_and_uses_embedding_and_rerank(monkeypatch):
+    calls = {"embedding": [], "vector": [], "keyword": [], "rerank": []}
+
+    class FakeEmbeddingClient:
+        def __init__(self, *, base_url, api_key, model):
+            assert base_url == "https://embedding.example.com/v1"
+            assert api_key == "embedding-key"
+            assert model == "embedding-model"
+
+        def embed_query(self, text):
+            calls["embedding"].append(text)
+            return [0.1, 0.2, 0.3]
+
+    class FakeRerankClient:
+        def __init__(self, *, base_url, api_key, model):
+            assert base_url == "https://rerank.example.com/v1"
+            assert api_key == "rerank-key"
+            assert model == "rerank-model"
+
+        def rerank(self, query, documents, top_k):
+            calls["rerank"].append(
+                {"query": query, "documents": documents, "top_k": top_k}
+            )
+            return [RerankResult(index=1, relevance_score=0.98, text=documents[1])]
+
+    def chunk(chunk_id: str, text: str) -> RagChunk:
+        return RagChunk(
+            chunk_id=chunk_id,
+            chunk_type="script",
+            text=text,
+            metadata={"case_name": "案例A", "stage": "售前"},
+            citations=[],
+            source_file="case.sales_insights.json",
+        )
+
+    class FakeStore:
+        def search(self, *, vector, top_k, filters):
+            calls["vector"].append({"vector": vector, "top_k": top_k, "filters": filters})
+            return [MilvusSearchHit(chunk=chunk("v1", "向量命中"), score=0.9)]
+
+        def keyword_search(self, *, query, top_k, filters):
+            calls["keyword"].append({"query": query, "top_k": top_k, "filters": filters})
+            return [MilvusSearchHit(chunk=chunk("k1", "关键词命中"), score=2.0)]
+
+    config = type(
+        "Config",
+        (),
+        {
+            "milvus_mode": "docker",
+            "embedding_base_url": "https://embedding.example.com/v1",
+            "embedding_api_key": "embedding-key",
+            "embedding_model_name": "embedding-model",
+            "rerank_base_url": "https://rerank.example.com/v1",
+            "rerank_api_key": "rerank-key",
+            "rerank_model_name": "rerank-model",
+        },
+    )()
+
+    monkeypatch.setattr(
+        mcp_server.RetrievalConfig,
+        "from_env",
+        classmethod(lambda cls, *, require_chat=True: config),
+    )
+    monkeypatch.setattr(mcp_server, "EmbeddingClient", FakeEmbeddingClient)
+    monkeypatch.setattr(mcp_server, "RerankClient", FakeRerankClient)
+    monkeypatch.setattr(mcp_server, "create_retrieval_store", lambda config: FakeStore())
+
+    result = ConfiguredEvidenceSearcher().search(query="客户异议怎么处理", top_n=20, top_k=5)
+
+    assert not hasattr(mcp_server, "QueryUnderstandingAgent")
+    assert result["original_query"] == "客户异议怎么处理"
+    assert result["rewritten_query"] == "客户异议怎么处理"
+    assert result["intent"] == "direct_retrieval"
+    assert result["filters"] == {}
+    assert result["results"][0]["chunk_id"] == "k1"
+    assert calls == {
+        "embedding": ["客户异议怎么处理"],
+        "vector": [{"vector": [0.1, 0.2, 0.3], "top_k": 20, "filters": {}}],
+        "keyword": [{"query": "客户异议怎么处理", "top_k": 20, "filters": {}}],
+        "rerank": [
+            {
+                "query": "客户异议怎么处理",
+                "documents": ["向量命中", "关键词命中"],
+                "top_k": 5,
+            }
+        ],
+    }

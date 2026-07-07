@@ -135,3 +135,24 @@ def test_retrieval_config_requires_embedding_and_rerank_keys() -> None:
             },
             env_file=None,
         )
+
+
+def test_retrieval_config_can_skip_chat_keys_for_mcp_retrieval() -> None:
+    config = RetrievalConfig.from_env(
+        env={
+            "EMBEDDING_BASE_URL": "https://api.siliconflow.com/v1",
+            "EMBEDDING_MODEL_NAME": "embed",
+            "EMBEDDING_API_KEY": "embedding-key",
+            "RERANK_BASE_URL": "https://api.siliconflow.com/v1",
+            "RERANK_MODEL_NAME": "rerank",
+            "RERANK_API_KEY": "rerank-key",
+        },
+        env_file=None,
+        require_chat=False,
+    )
+
+    assert config.api_key == ""
+    assert config.base_url == ""
+    assert config.model_name == ""
+    assert config.embedding_model_name == "embed"
+    assert config.rerank_model_name == "rerank"

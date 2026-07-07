@@ -1,8 +1,7 @@
 """基于 MCP 协议对外暴露销售知识检索能力。
 
-复用与 CLI/Web 完全相同的检索链（query understanding → 向量 + 关键词
-混合召回 → RRF 融合 → rerank），通过 stdio（默认）或 streamable-http
-供 MCP 客户端（Claude Code、Claude Desktop 等）调用。
+MCP 侧只做检索：原始 query → embedding → 向量 + 关键词混合召回
+→ RRF 融合 → rerank。不会调用 chat/completions 做 query understanding。
 
 对外错误文案走白名单归一（与 web/safe_errors.py 同构），
 未知异常不泄漏内部路径与堆栈。
@@ -18,16 +17,14 @@ from mcp.server.fastmcp import FastMCP
 
 from .config import RetrievalConfig
 from .embedding import EmbeddingClient
-from .milvus_store import create_milvus_store, create_retrieval_store
-from .query_understanding import QueryUnderstandingAgent
+from .milvus_store import MilvusSearchHit, create_retrieval_store
 from .rerank import RerankClient
 from .resource_utils import close_resources, is_local_index_open_failure
-from .search import search_evidence
 
 SERVER_NAME = "xhbx-rag"
 SERVER_INSTRUCTIONS = (
     "保险绩优案例销售知识检索服务。"
-    "用 search_knowledge 输入自然语言问题，返回经混合召回与重排的证据 chunk"
+    "用 search_knowledge 输入自然语言问题，返回经 embedding 检索与重排的证据 chunk"
     "（含知识类型、原文引用与定位）；用 retrieval_status 查看索引与配置状态。"
 )
 
@@ -49,9 +46,6 @@ _MISSING_CONFIG_ERROR_PREFIX = "缺少必要环境变量:"
 _SAFE_ERROR_MESSAGES = frozenset(
     {
         "问题不能为空",
-        "top_n 必须在 1 到 100 之间",
-        "top_k 必须在 1 到 20 之间",
-        "top_k 不能大于 top_n",
         SAFE_CONFIG_PARSE_ERROR,
         LOCAL_INDEX_UNAVAILABLE_ERROR,
     }
@@ -80,10 +74,10 @@ class EvidenceSearcher(Protocol):
 
 
 class ConfiguredEvidenceSearcher:
-    """按调用构建检索资源并在结束后关闭，与 CLI/Web 共用同一条检索链。"""
+    """按调用构建检索资源并在结束后关闭；MCP 不调用 chat 大模型。"""
 
     def search(self, *, query: str, top_n: int, top_k: int) -> dict:
-        config = RetrievalConfig.from_env()
+        config = RetrievalConfig.from_env(require_chat=False)
         if config.milvus_mode == "lite":
             with _LITE_SEARCH_LOCK:
                 return self._search_with_config(
@@ -101,12 +95,6 @@ class ConfiguredEvidenceSearcher:
     ) -> dict:
         resources: list[object] = []
         try:
-            query_agent = QueryUnderstandingAgent(
-                base_url=config.base_url,
-                api_key=config.api_key,
-                model=config.model_name,
-            )
-            resources.append(query_agent)
             embedding_client = EmbeddingClient(
                 base_url=config.embedding_base_url,
                 api_key=config.embedding_api_key,
@@ -126,9 +114,8 @@ class ConfiguredEvidenceSearcher:
                 model=config.rerank_model_name,
             )
             resources.append(reranker)
-            return search_evidence(
+            return _direct_search_evidence(
                 query=query,
-                query_agent=query_agent,
                 embedding_client=embedding_client,
                 store=store,
                 reranker=reranker,
@@ -165,24 +152,18 @@ def create_mcp_server(
         name="search_knowledge",
         description=(
             "从保险绩优案例知识库检索销售证据。输入自然语言问题，"
-            "经问题理解、向量+关键词混合召回、RRF 融合与重排后，"
-            "返回 top_k 条证据 chunk（含知识类型、原文引用与定位）。"
-            "top_n 为召回候选数（1-100，默认 20），top_k 为最终返回数"
-            "（1-20，默认 5），top_k 不能大于 top_n。"
+            "经 embedding、向量+关键词混合召回、RRF 融合与重排后，"
+            "返回证据 chunk（含知识类型、原文引用与定位）。"
+            "MCP 服务不会调用 chat/completions 做 query understanding。"
         ),
     )
-    def search_knowledge(
-        query: str,
-        top_n: int = DEFAULT_TOP_N,
-        top_k: int = DEFAULT_TOP_K,
-    ) -> dict:
+    def search_knowledge(query: str) -> dict:
         stripped_query = query.strip()
         if not stripped_query:
             raise ValueError("问题不能为空")
-        _validate_limits(top_n=top_n, top_k=top_k)
         try:
             return active_searcher.search(
-                query=stripped_query, top_n=top_n, top_k=top_k
+                query=stripped_query, top_n=DEFAULT_TOP_N, top_k=DEFAULT_TOP_K
             )
         except Exception as exc:
             raise ValueError(_safe_error_message(exc)) from exc
@@ -203,9 +184,108 @@ def create_mcp_server(
     return server
 
 
+def _direct_search_evidence(
+    *,
+    query: str,
+    embedding_client: Any,
+    store: Any,
+    reranker: Any,
+    top_n: int,
+    top_k: int,
+) -> dict:
+    vector = embedding_client.embed_query(query)
+    vector_hits = store.search(vector=vector, top_k=top_n, filters={})
+    keyword_hits = _keyword_search_if_available(
+        store,
+        query=query,
+        top_k=top_n,
+        filters={},
+    )
+    candidates = (
+        _rrf_fuse(vector_hits, keyword_hits, limit=top_n)
+        if keyword_hits is not None
+        else vector_hits[:top_n]
+    )
+    reranked = reranker.rerank(
+        query,
+        [hit.chunk.text for hit in candidates],
+        top_k=top_k,
+    )
+    return {
+        "original_query": query,
+        "rewritten_query": query,
+        "intent": "direct_retrieval",
+        "filters": {},
+        "results": [
+            _serialize_hit(candidates[item.index], item.relevance_score)
+            for item in reranked
+        ],
+    }
+
+
+def _keyword_search_if_available(
+    store: Any,
+    *,
+    query: str,
+    top_k: int,
+    filters: dict,
+) -> list[MilvusSearchHit] | None:
+    keyword_search = getattr(store, "keyword_search", None)
+    if keyword_search is None:
+        return None
+    return keyword_search(query=query, top_k=top_k, filters=filters)
+
+
+def _rrf_fuse(
+    vector_hits: list[MilvusSearchHit],
+    keyword_hits: list[MilvusSearchHit],
+    *,
+    limit: int,
+) -> list[MilvusSearchHit]:
+    scores: dict[str, float] = {}
+    hits_by_id: dict[str, MilvusSearchHit] = {}
+    first_seen: dict[str, int] = {}
+    seen_order = 0
+    rrf_k = 60
+
+    for hit_list in (vector_hits, keyword_hits):
+        for rank, hit in enumerate(hit_list, start=1):
+            chunk_id = hit.chunk.chunk_id
+            if chunk_id not in hits_by_id:
+                hits_by_id[chunk_id] = hit
+                first_seen[chunk_id] = seen_order
+                seen_order += 1
+            scores[chunk_id] = scores.get(chunk_id, 0.0) + 1 / (rrf_k + rank)
+
+    ranked_ids = sorted(
+        scores,
+        key=lambda chunk_id: (-scores[chunk_id], first_seen[chunk_id]),
+    )
+    return [
+        MilvusSearchHit(chunk=hits_by_id[chunk_id].chunk, score=scores[chunk_id])
+        for chunk_id in ranked_ids[:limit]
+    ]
+
+
+def _serialize_hit(hit: MilvusSearchHit, rerank_score: float) -> dict:
+    return {
+        "chunk_id": hit.chunk.chunk_id,
+        "chunk_type": hit.chunk.chunk_type,
+        "text": hit.chunk.text,
+        "score": hit.score,
+        "rerank_score": rerank_score,
+        "matched_tag_paths": [],
+        "tag_boost_factor": 1.0,
+        "metadata": hit.chunk.metadata,
+        "citations": [
+            citation.model_dump(mode="json") for citation in hit.chunk.citations
+        ],
+    }
+
+
 def _default_status_provider() -> dict[str, Any]:
     try:
-        config = RetrievalConfig.from_env()
+        config = RetrievalConfig.from_env(require_chat=False)
     except ValueError as exc:
         return {
             "ok": False,
@@ -228,15 +308,6 @@ def _default_status_provider() -> dict[str, Any]:
         "milvus_course_collection": config.milvus_course_collection,
         "errors": [],
     }
-
-
-def _validate_limits(*, top_n: int, top_k: int) -> None:
-    if not isinstance(top_n, int) or isinstance(top_n, bool) or not 1 <= top_n <= 100:
-        raise ValueError("top_n 必须在 1 到 100 之间")
-    if not isinstance(top_k, int) or isinstance(top_k, bool) or not 1 <= top_k <= 20:
-        raise ValueError("top_k 必须在 1 到 20 之间")
-    if top_k > top_n:
-        raise ValueError("top_k 不能大于 top_n")
 
 
 def _safe_error_message(exc: Exception) -> str:

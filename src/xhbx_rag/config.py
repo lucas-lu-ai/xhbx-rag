@@ -35,13 +35,12 @@ class RetrievalConfig:
         cls,
         env: Mapping[str, str] | None = None,
         env_file: Path | None = Path(".env"),
+        *,
+        require_chat: bool = True,
     ) -> "RetrievalConfig":
         values = load_env_values(env=env, env_file=env_file)
 
         required = [
-            "API_KEY",
-            "BASE_URL",
-            "MODEL_NAME",
             "EMBEDDING_BASE_URL",
             "EMBEDDING_MODEL_NAME",
             "EMBEDDING_API_KEY",
@@ -49,6 +48,8 @@ class RetrievalConfig:
             "RERANK_MODEL_NAME",
             "RERANK_API_KEY",
         ]
+        if require_chat:
+            required = ["API_KEY", "BASE_URL", "MODEL_NAME", *required]
         missing = [key for key in required if not values.get(key, "").strip()]
         if missing:
             raise ConfigError(f"缺少必要环境变量: {', '.join(missing)}")
@@ -58,9 +59,9 @@ class RetrievalConfig:
         if milvus_mode not in {"lite", "docker"}:
             raise ConfigError("MILVUS_MODE 仅支持 lite 或 docker")
         return cls(
-            api_key=values["API_KEY"].strip(),
-            base_url=values["BASE_URL"].strip(),
-            model_name=values["MODEL_NAME"].strip(),
+            api_key=values.get("API_KEY", "").strip(),
+            base_url=values.get("BASE_URL", "").strip(),
+            model_name=values.get("MODEL_NAME", "").strip(),
             vision_model_name=values.get("VISION_MODEL_NAME", "").strip(),
             embedding_base_url=values["EMBEDDING_BASE_URL"].strip(),
             embedding_model_name=values["EMBEDDING_MODEL_NAME"].strip(),

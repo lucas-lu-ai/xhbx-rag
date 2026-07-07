@@ -9,6 +9,7 @@ build/
 *.egg-info/
 data/
 .env
+.env.mcp
 output/
 .local/
 parsed/
