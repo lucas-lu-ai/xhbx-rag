@@ -23,8 +23,34 @@ class FakeSearcher:
         self.error = error
         self.calls: list[dict] = []
 
-    def search(self, *, query: str, top_n: int, top_k: int) -> dict:
-        self.calls.append({"query": query, "top_n": top_n, "top_k": top_k})
+    def search(
+        self,
+        *,
+        query: str,
+        top_n: int,
+        top_k: int,
+        filters: dict | None = None,
+    ) -> dict:
+        self.calls.append(
+            {"query": query, "top_n": top_n, "top_k": top_k, "filters": filters or {}}
+        )
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+class FakeFilterOptionsProvider:
+    def __init__(self, result: dict | None = None, error: Exception | None = None):
+        self.result = result or {
+            "chunk_types": [{"value": "script", "label": "场景话术"}],
+            "stages": ["售前"],
+            "case_names": ["案例A"],
+        }
+        self.error = error
+        self.calls = 0
+
+    def filter_options(self) -> dict:
+        self.calls += 1
         if self.error is not None:
             raise self.error
         return self.result
@@ -40,17 +66,19 @@ def test_server_registers_expected_tools():
     server = create_mcp_server(searcher=FakeSearcher())
     tools = asyncio.run(server.list_tools())
     tool_names = {tool.name for tool in tools}
-    assert tool_names == {"search_knowledge", "retrieval_status"}
+    assert tool_names == {"search_knowledge", "retrieval_status", "list_filter_options"}
 
 
-def test_search_knowledge_only_exposes_query_argument():
+def test_search_knowledge_exposes_query_and_optional_filters():
     server = create_mcp_server(searcher=FakeSearcher())
     tools = asyncio.run(server.list_tools())
     search_tool = next(tool for tool in tools if tool.name == "search_knowledge")
 
-    assert search_tool.inputSchema["properties"] == {
-        "query": {"title": "Query", "type": "string"}
-    }
+    properties = search_tool.inputSchema["properties"]
+    assert properties["query"] == {"title": "Query", "type": "string"}
+    assert properties["chunk_types"]["default"] is None
+    assert properties["stage"]["default"] == ""
+    assert properties["case_name"]["default"] == ""
     assert search_tool.inputSchema["required"] == ["query"]
 
 
@@ -72,7 +100,7 @@ def test_search_knowledge_returns_searcher_result():
 
     assert payload == expected
     assert searcher.calls == [
-        {"query": "怎么处理客户异议", "top_n": 20, "top_k": 5}
+        {"query": "怎么处理客户异议", "top_n": 20, "top_k": 5, "filters": {}}
     ]
 
 
@@ -82,7 +110,38 @@ def test_search_knowledge_uses_default_limits_and_strips_query():
 
     _call_tool(server, "search_knowledge", {"query": "  高净值客户开拓  "})
 
-    assert searcher.calls == [{"query": "高净值客户开拓", "top_n": 20, "top_k": 5}]
+    assert searcher.calls == [
+        {"query": "高净值客户开拓", "top_n": 20, "top_k": 5, "filters": {}}
+    ]
+
+
+def test_search_knowledge_passes_optional_filters():
+    searcher = FakeSearcher()
+    server = create_mcp_server(searcher=searcher)
+
+    _call_tool(
+        server,
+        "search_knowledge",
+        {
+            "query": "预算异议",
+            "chunk_types": ["script", "", "objection_handling"],
+            "stage": " 异议处理 ",
+            "case_name": " 案例A ",
+        },
+    )
+
+    assert searcher.calls == [
+        {
+            "query": "预算异议",
+            "top_n": 20,
+            "top_k": 5,
+            "filters": {
+                "chunk_types": ["script", "objection_handling"],
+                "stage": "异议处理",
+                "case_name": "案例A",
+            },
+        }
+    ]
 
 
 def test_search_knowledge_rejects_empty_query():
@@ -174,6 +233,42 @@ def test_retrieval_status_masks_provider_error():
     assert "secret" not in message
 
 
+def test_list_filter_options_returns_provider_payload():
+    expected = {
+        "chunk_types": [
+            {"value": "script", "label": "场景话术"},
+            {"value": "objection_handling", "label": "异议处理"},
+        ],
+        "stages": ["售前", "异议处理"],
+        "case_names": ["案例A", "案例B"],
+    }
+    provider = FakeFilterOptionsProvider(result=expected)
+    server = create_mcp_server(
+        searcher=FakeSearcher(),
+        filter_options_provider=provider,
+    )
+
+    payload = _call_tool(server, "list_filter_options", {})
+
+    assert payload == expected
+    assert provider.calls == 1
+
+
+def test_list_filter_options_masks_provider_error():
+    provider = FakeFilterOptionsProvider(error=RuntimeError("内部堆栈 /Users/secret"))
+    server = create_mcp_server(
+        searcher=FakeSearcher(),
+        filter_options_provider=provider,
+    )
+
+    with pytest.raises(ToolError) as exc_info:
+        asyncio.run(server.call_tool("list_filter_options", {}))
+
+    message = str(exc_info.value)
+    assert UNAVAILABLE_SEARCH_ERROR in message
+    assert "secret" not in message
+
+
 def test_default_retrieval_status_does_not_require_chat_config(monkeypatch):
     calls = []
     config = type(
@@ -206,7 +301,11 @@ def test_default_retrieval_status_does_not_require_chat_config(monkeypatch):
 def test_create_default_server_without_injection():
     server = create_mcp_server()
     tools = asyncio.run(server.list_tools())
-    assert {tool.name for tool in tools} == {"search_knowledge", "retrieval_status"}
+    assert {tool.name for tool in tools} == {
+        "search_knowledge",
+        "retrieval_status",
+        "list_filter_options",
+    }
 
 
 def test_create_server_uses_default_http_binding():
@@ -304,18 +403,47 @@ def test_configured_searcher_skips_chat_model_and_uses_embedding_and_rerank(monk
     monkeypatch.setattr(mcp_server, "RerankClient", FakeRerankClient)
     monkeypatch.setattr(mcp_server, "create_retrieval_store", lambda config: FakeStore())
 
-    result = ConfiguredEvidenceSearcher().search(query="客户异议怎么处理", top_n=20, top_k=5)
+    result = ConfiguredEvidenceSearcher().search(
+        query="客户异议怎么处理",
+        top_n=20,
+        top_k=5,
+        filters={"chunk_types": ["script"], "stage": "售前", "case_name": "案例A"},
+    )
 
     assert not hasattr(mcp_server, "QueryUnderstandingAgent")
     assert result["original_query"] == "客户异议怎么处理"
     assert result["rewritten_query"] == "客户异议怎么处理"
     assert result["intent"] == "direct_retrieval"
-    assert result["filters"] == {}
+    assert result["filters"] == {
+        "chunk_types": ["script"],
+        "stage": "售前",
+        "case_name": "案例A",
+    }
     assert result["results"][0]["chunk_id"] == "k1"
     assert calls == {
         "embedding": ["客户异议怎么处理"],
-        "vector": [{"vector": [0.1, 0.2, 0.3], "top_k": 20, "filters": {}}],
-        "keyword": [{"query": "客户异议怎么处理", "top_k": 20, "filters": {}}],
+        "vector": [
+            {
+                "vector": [0.1, 0.2, 0.3],
+                "top_k": 20,
+                "filters": {
+                    "chunk_types": ["script"],
+                    "stage": "售前",
+                    "case_name": "案例A",
+                },
+            }
+        ],
+        "keyword": [
+            {
+                "query": "客户异议怎么处理",
+                "top_k": 20,
+                "filters": {
+                    "chunk_types": ["script"],
+                    "stage": "售前",
+                    "case_name": "案例A",
+                },
+            }
+        ],
         "rerank": [
             {
                 "query": "客户异议怎么处理",

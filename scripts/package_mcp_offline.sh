@@ -22,6 +22,23 @@ compose() {
   docker compose "$@"
 }
 
+EXPECTED_OS="${DOCKER_PLATFORM%%/*}"
+EXPECTED_ARCH="${DOCKER_PLATFORM#*/}"
+EXPECTED_ARCH="${EXPECTED_ARCH%%/*}"
+
+validate_image_platform() {
+  image="$1"
+  actual="$(
+    docker image inspect --platform "$DOCKER_PLATFORM" "$image" \
+      --format '{{.Os}}/{{.Architecture}}'
+  )"
+  expected="$EXPECTED_OS/$EXPECTED_ARCH"
+  if [ "$actual" != "$expected" ]; then
+    echo "镜像平台不匹配: $image expected=$expected actual=$actual" >&2
+    exit 1
+  fi
+}
+
 cleanup() {
   if [ "$ENV_CREATED" = "true" ]; then
     rm -f .env.mcp
@@ -42,8 +59,15 @@ fi
 rm -rf "$PACKAGE_DIR"
 mkdir -p "$PACKAGE_DIR/scripts"
 
-compose -f "$COMPOSE_FILE" build mcp
-compose -f "$COMPOSE_FILE" pull etcd minio standalone
+docker buildx build --platform "$DOCKER_PLATFORM" --load -t xhbx-rag-mcp:latest -f Dockerfile.api .
+
+for image in \
+  quay.io/coreos/etcd:v3.5.25 \
+  minio/minio:RELEASE.2024-12-18T13-15-44Z \
+  milvusdb/milvus:v2.6.19
+do
+  docker pull --platform "$DOCKER_PLATFORM" "$image"
+done
 
 IMAGES="$(compose -f "$COMPOSE_FILE" config --images 2>/dev/null | sort -u || true)"
 if [ -z "$IMAGES" ]; then
@@ -57,7 +81,11 @@ if [ -z "$IMAGES" ]; then
   exit 1
 fi
 
-docker save -o "$PACKAGE_DIR/images.tar" $IMAGES
+for image in $IMAGES; do
+  validate_image_platform "$image"
+done
+
+docker save --platform "$DOCKER_PLATFORM" -o "$PACKAGE_DIR/images.tar" $IMAGES
 
 cp "$COMPOSE_FILE" "$PACKAGE_DIR/docker-compose.mcp.yml"
 cp .env.mcp.example "$PACKAGE_DIR/.env.mcp.example"

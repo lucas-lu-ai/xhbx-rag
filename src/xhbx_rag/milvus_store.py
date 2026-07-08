@@ -29,9 +29,11 @@ _CHUNK_OUTPUT_FIELDS = [
     "citations_json",
 ]
 _KEYWORD_CANDIDATE_OUTPUT_FIELDS = ["chunk_id", "text"]
+_FILTER_OPTION_OUTPUT_FIELDS = ["case_name", "chunk_type", "stage"]
 _KEYWORD_MIN_CANDIDATES = 50
 _KEYWORD_MAX_CANDIDATES = 200
 _KEYWORD_CANDIDATE_MULTIPLIER = 10
+_FILTER_OPTION_QUERY_LIMIT = 10_000
 
 
 class MilvusStoreError(RuntimeError):
@@ -232,6 +234,18 @@ class MilvusStore:
             )
         )
 
+    def filter_options(self) -> dict[str, list[str]]:
+        if not self.client.has_collection(self.collection_name):
+            raise MilvusStoreError("Milvus collection 不存在，请先运行 index")
+        self.client.load_collection(self.collection_name)
+        rows = self.client.query(
+            collection_name=self.collection_name,
+            filter="",
+            limit=_FILTER_OPTION_QUERY_LIMIT,
+            output_fields=_FILTER_OPTION_OUTPUT_FIELDS,
+        )
+        return _filter_options_from_rows(rows)
+
     def fetch_chunks_by_ids(self, chunk_ids: list[str]) -> dict[str, dict[str, Any]]:
         if not chunk_ids:
             return {}
@@ -326,6 +340,11 @@ class MultiCollectionStore:
                     MilvusSearchHit(chunk=_chunk_from_entity(detail_row), score=score)
                 )
         return hits
+
+    def filter_options(self) -> dict[str, list[str]]:
+        return _merge_filter_options(
+            [store.filter_options() for store in self._available_stores()]
+        )
 
     def close(self) -> None:
         for store in self.stores:
@@ -433,6 +452,41 @@ def _build_filter_expr(filters: dict[str, Any]) -> str:
     if filters.get("case_name"):
         parts.append(f'case_name == "{_escape(str(filters["case_name"]))}"')
     return " and ".join(parts)
+
+
+def _filter_options_from_rows(rows: list[dict[str, Any]]) -> dict[str, list[str]]:
+    return {
+        "chunk_types": _distinct_sorted(row.get("chunk_type") for row in rows),
+        "stages": _distinct_sorted(row.get("stage") for row in rows),
+        "case_names": _distinct_sorted(row.get("case_name") for row in rows),
+    }
+
+
+def _merge_filter_options(
+    options_by_store: list[dict[str, list[str]]],
+) -> dict[str, list[str]]:
+    return {
+        "chunk_types": _distinct_sorted(
+            value
+            for options in options_by_store
+            for value in options.get("chunk_types", [])
+        ),
+        "stages": _distinct_sorted(
+            value
+            for options in options_by_store
+            for value in options.get("stages", [])
+        ),
+        "case_names": _distinct_sorted(
+            value
+            for options in options_by_store
+            for value in options.get("case_names", [])
+        ),
+    }
+
+
+def _distinct_sorted(values: Any) -> list[str]:
+    normalized = {str(value).strip() for value in values if str(value).strip()}
+    return sorted(normalized)
 
 
 def _escape(value: str) -> str:

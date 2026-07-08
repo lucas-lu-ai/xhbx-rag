@@ -36,6 +36,13 @@ DEFAULT_HTTP_HOST = "127.0.0.1"
 DEFAULT_HTTP_PORT = 8000
 DEFAULT_STREAMABLE_HTTP_PATH = "/mcp"
 DEFAULT_SSE_PATH = "/sse"
+CHUNK_TYPE_LABELS = {
+    "customer_journey": "客户旅程",
+    "strategy": "销售策略",
+    "script": "场景话术",
+    "objection_handling": "异议处理",
+    "training_course": "培训课程",
+}
 
 UNAVAILABLE_SEARCH_ERROR = "检索服务暂时不可用"
 SAFE_CONFIG_PARSE_ERROR = "配置解析失败，请检查 .env 中的数值配置。"
@@ -69,21 +76,42 @@ _LITE_SEARCH_LOCK = Lock()
 
 
 class EvidenceSearcher(Protocol):
-    def search(self, *, query: str, top_n: int, top_k: int) -> dict:
+    def search(
+        self,
+        *,
+        query: str,
+        top_n: int,
+        top_k: int,
+        filters: dict | None = None,
+    ) -> dict:
         """执行完整检索链并返回 search_evidence 结果。"""
+
+
+class FilterOptionsProvider(Protocol):
+    def filter_options(self) -> dict:
+        """返回当前索引中可用的过滤条件合法值。"""
 
 
 class ConfiguredEvidenceSearcher:
     """按调用构建检索资源并在结束后关闭；MCP 不调用 chat 大模型。"""
 
-    def search(self, *, query: str, top_n: int, top_k: int) -> dict:
+    def search(
+        self,
+        *,
+        query: str,
+        top_n: int,
+        top_k: int,
+        filters: dict | None = None,
+    ) -> dict:
         config = RetrievalConfig.from_env(require_chat=False)
         if config.milvus_mode == "lite":
             with _LITE_SEARCH_LOCK:
                 return self._search_with_config(
-                    config, query=query, top_n=top_n, top_k=top_k
+                    config, query=query, top_n=top_n, top_k=top_k, filters=filters
                 )
-        return self._search_with_config(config, query=query, top_n=top_n, top_k=top_k)
+        return self._search_with_config(
+            config, query=query, top_n=top_n, top_k=top_k, filters=filters
+        )
 
     def _search_with_config(
         self,
@@ -92,6 +120,7 @@ class ConfiguredEvidenceSearcher:
         query: str,
         top_n: int,
         top_k: int,
+        filters: dict | None = None,
     ) -> dict:
         resources: list[object] = []
         try:
@@ -121,7 +150,33 @@ class ConfiguredEvidenceSearcher:
                 reranker=reranker,
                 top_n=top_n,
                 top_k=top_k,
+                filters=filters or {},
             )
+        finally:
+            close_resources(resources)
+
+
+class ConfiguredFilterOptionsProvider:
+    """按调用读取当前索引中的可用过滤值；不调用 chat 大模型。"""
+
+    def filter_options(self) -> dict:
+        config = RetrievalConfig.from_env(require_chat=False)
+        if config.milvus_mode == "lite":
+            with _LITE_SEARCH_LOCK:
+                return self._filter_options_with_config(config)
+        return self._filter_options_with_config(config)
+
+    def _filter_options_with_config(self, config: RetrievalConfig) -> dict:
+        resources: list[object] = []
+        try:
+            try:
+                store = create_retrieval_store(config)
+            except Exception as exc:
+                if config.milvus_mode == "lite" and is_local_index_open_failure(exc):
+                    raise ValueError(LOCAL_INDEX_UNAVAILABLE_ERROR) from exc
+                raise
+            resources.append(store)
+            return _format_filter_options(store.filter_options())
         finally:
             close_resources(resources)
 
@@ -129,6 +184,7 @@ class ConfiguredEvidenceSearcher:
 def create_mcp_server(
     searcher: EvidenceSearcher | None = None,
     status_provider: Callable[[], dict[str, Any]] | None = None,
+    filter_options_provider: FilterOptionsProvider | None = None,
     *,
     host: str = DEFAULT_HTTP_HOST,
     port: int = DEFAULT_HTTP_PORT,
@@ -138,6 +194,11 @@ def create_mcp_server(
     active_searcher = searcher if searcher is not None else ConfiguredEvidenceSearcher()
     active_status = (
         status_provider if status_provider is not None else _default_status_provider
+    )
+    active_filter_options_provider = (
+        filter_options_provider
+        if filter_options_provider is not None
+        else ConfiguredFilterOptionsProvider()
     )
     server = FastMCP(
         SERVER_NAME,
@@ -154,16 +215,29 @@ def create_mcp_server(
             "从保险绩优案例知识库检索销售证据。输入自然语言问题，"
             "经 embedding、向量+关键词混合召回、RRF 融合与重排后，"
             "返回证据 chunk（含知识类型、原文引用与定位）。"
-            "MCP 服务不会调用 chat/completions 做 query understanding。"
+            "可选传入 chunk_types、stage、case_name 做精确过滤；"
         ),
     )
-    def search_knowledge(query: str) -> dict:
+    def search_knowledge(
+        query: str,
+        chunk_types: list[str] | None = None,
+        stage: str = "",
+        case_name: str = "",
+    ) -> dict:
         stripped_query = query.strip()
         if not stripped_query:
             raise ValueError("问题不能为空")
+        filters = _build_optional_filters(
+            chunk_types=chunk_types,
+            stage=stage,
+            case_name=case_name,
+        )
         try:
             return active_searcher.search(
-                query=stripped_query, top_n=DEFAULT_TOP_N, top_k=DEFAULT_TOP_K
+                query=stripped_query,
+                top_n=DEFAULT_TOP_N,
+                top_k=DEFAULT_TOP_K,
+                filters=filters,
             )
         except Exception as exc:
             raise ValueError(_safe_error_message(exc)) from exc
@@ -181,6 +255,19 @@ def create_mcp_server(
         except Exception as exc:
             raise ValueError(_safe_error_message(exc)) from exc
 
+    @server.tool(
+        name="list_filter_options",
+        description=(
+            "列出 search_knowledge 可用的精确过滤值：知识类型、销售阶段、案例名称。"
+            "客户端应先读取这些合法值，再决定是否传入过滤参数。"
+        ),
+    )
+    def list_filter_options() -> dict:
+        try:
+            return active_filter_options_provider.filter_options()
+        except Exception as exc:
+            raise ValueError(_safe_error_message(exc)) from exc
+
     return server
 
 
@@ -192,14 +279,15 @@ def _direct_search_evidence(
     reranker: Any,
     top_n: int,
     top_k: int,
+    filters: dict,
 ) -> dict:
     vector = embedding_client.embed_query(query)
-    vector_hits = store.search(vector=vector, top_k=top_n, filters={})
+    vector_hits = store.search(vector=vector, top_k=top_n, filters=filters)
     keyword_hits = _keyword_search_if_available(
         store,
         query=query,
         top_k=top_n,
-        filters={},
+        filters=filters,
     )
     candidates = (
         _rrf_fuse(vector_hits, keyword_hits, limit=top_n)
@@ -215,12 +303,55 @@ def _direct_search_evidence(
         "original_query": query,
         "rewritten_query": query,
         "intent": "direct_retrieval",
-        "filters": {},
+        "filters": filters,
         "results": [
             _serialize_hit(candidates[item.index], item.relevance_score)
             for item in reranked
         ],
     }
+
+
+def _build_optional_filters(
+    *,
+    chunk_types: list[str] | None,
+    stage: str,
+    case_name: str,
+) -> dict:
+    filters: dict[str, Any] = {}
+    normalized_chunk_types = [
+        str(chunk_type).strip()
+        for chunk_type in chunk_types or []
+        if str(chunk_type).strip()
+    ]
+    if normalized_chunk_types:
+        filters["chunk_types"] = normalized_chunk_types
+    stripped_stage = stage.strip()
+    if stripped_stage:
+        filters["stage"] = stripped_stage
+    stripped_case_name = case_name.strip()
+    if stripped_case_name:
+        filters["case_name"] = stripped_case_name
+    return filters
+
+
+def _format_filter_options(options: dict[str, Any]) -> dict:
+    chunk_type_values = [
+        str(value).strip()
+        for value in options.get("chunk_types", [])
+        if str(value).strip()
+    ]
+    return {
+        "chunk_types": [
+            {"value": value, "label": CHUNK_TYPE_LABELS.get(value, value)}
+            for value in chunk_type_values
+        ],
+        "stages": _str_values(options.get("stages", [])),
+        "case_names": _str_values(options.get("case_names", [])),
+    }
+
+
+def _str_values(values: Any) -> list[str]:
+    return [str(value).strip() for value in values if str(value).strip()]
 
 
 def _keyword_search_if_available(

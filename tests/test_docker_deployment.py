@@ -156,10 +156,12 @@ def test_package_mcp_offline_script_exports_images_and_deploy_files() -> None:
     assert "COMPOSE_DOCKER_CLI_BUILD" in script
     assert "docker-compose \"$@\"" in script
     assert "docker compose \"$@\"" in script
-    assert 'compose -f "$COMPOSE_FILE" build mcp' in script
-    assert 'compose -f "$COMPOSE_FILE" pull etcd minio standalone' in script
+    assert 'docker buildx build --platform "$DOCKER_PLATFORM" --load -t xhbx-rag-mcp:latest -f Dockerfile.api .' in script
+    assert 'docker pull --platform "$DOCKER_PLATFORM" "$image"' in script
+    assert 'validate_image_platform "$image"' in script
+    assert 'docker image inspect --platform "$DOCKER_PLATFORM" "$image"' in script
     assert 'compose -f "$COMPOSE_FILE" config --images' in script
-    assert 'docker save -o "$PACKAGE_DIR/images.tar" $IMAGES' in script
+    assert 'docker save --platform "$DOCKER_PLATFORM" -o "$PACKAGE_DIR/images.tar" $IMAGES' in script
     assert 'cp "$COMPOSE_FILE" "$PACKAGE_DIR/docker-compose.mcp.yml"' in script
     assert 'cp .env.mcp.example "$PACKAGE_DIR/.env.mcp.example"' in script
     assert 'cp scripts/index_parsed.sh "$PACKAGE_DIR/scripts/index_parsed.sh"' in script

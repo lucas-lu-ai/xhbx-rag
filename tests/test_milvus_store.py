@@ -439,3 +439,106 @@ def test_keyword_candidates_and_fetch_chunks_by_ids(tmp_path) -> None:
 
     assert set(rows_by_id) == {"chunk-1"}
     assert rows_by_id["chunk-1"]["chunk_type"] == "strategy"
+
+
+def test_milvus_store_lists_distinct_filter_options(tmp_path) -> None:
+    store = MilvusLiteStore(
+        db_path=tmp_path / "rag.db",
+        collection_name="test_chunks",
+    )
+    chunks = [
+        RagChunk(
+            chunk_id="chunk-1",
+            chunk_type="script",
+            text="售前话术",
+            metadata={"case_name": "案例B", "stage": "售前"},
+            citations=[],
+            source_file="case.sales_insights.json",
+        ),
+        RagChunk(
+            chunk_id="chunk-2",
+            chunk_type="script",
+            text="重复类型与案例",
+            metadata={"case_name": "案例B", "stage": "售前"},
+            citations=[],
+            source_file="case.sales_insights.json",
+        ),
+        RagChunk(
+            chunk_id="chunk-3",
+            chunk_type="objection_handling",
+            text="异议处理",
+            metadata={"case_name": "案例A", "stage": "异议处理"},
+            citations=[],
+            source_file="case.sales_insights.json",
+        ),
+        RagChunk(
+            chunk_id="chunk-4",
+            chunk_type="training_course",
+            text="课程内容",
+            metadata={"course_name": "促成课程"},
+            citations=[],
+            source_file="course.pptx",
+        ),
+    ]
+
+    store.ensure_collection(vector_dim=3)
+    store.upsert(
+        [
+            MilvusChunkRecord.from_chunk(chunk, vector=[0.1, 0.2, 0.3])
+            for chunk in chunks
+        ]
+    )
+
+    options = store.filter_options()
+
+    assert options == {
+        "chunk_types": ["objection_handling", "script", "training_course"],
+        "stages": ["售前", "异议处理"],
+        "case_names": ["案例A", "案例B"],
+    }
+
+
+def test_multi_collection_store_merges_filter_options(tmp_path) -> None:
+    case_store = _lite_store_with_chunks(
+        tmp_path,
+        "case_chunks",
+        [
+            (
+                RagChunk(
+                    chunk_id="case-1",
+                    chunk_type="script",
+                    text="售前话术",
+                    metadata={"case_name": "案例A", "stage": "售前"},
+                    citations=[],
+                    source_file="case.sales_insights.json",
+                ),
+                [1.0, 0.0, 0.0],
+            )
+        ],
+    )
+    course_store = _lite_store_with_chunks(
+        tmp_path,
+        "course_chunks",
+        [
+            (
+                RagChunk(
+                    chunk_id="course-1",
+                    chunk_type="training_course",
+                    text="课程内容",
+                    metadata={"course_name": "促成课程"},
+                    citations=[],
+                    source_file="course.pptx",
+                ),
+                [0.9, 0.1, 0.0],
+            )
+        ],
+    )
+    store = milvus_store.MultiCollectionStore([case_store, course_store])
+
+    options = store.filter_options()
+
+    assert options == {
+        "chunk_types": ["script", "training_course"],
+        "stages": ["售前"],
+        "case_names": ["案例A"],
+    }
