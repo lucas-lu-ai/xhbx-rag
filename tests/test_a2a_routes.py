@@ -146,7 +146,7 @@ def test_tasks_send_generates_task_and_session_ids(monkeypatch) -> None:
     assert task["status"]["message"]["parts"][0]["text"] == "已回答。"
 
 
-def test_tasks_send_rejects_unsupported_method(monkeypatch) -> None:
+def test_tasks_send_rejects_unsupported_method_legacy(monkeypatch) -> None:
     called = False
 
     def fake_answer_question(*, query: str, top_n: int, top_k: int) -> dict:
@@ -228,3 +228,163 @@ def test_extract_query_concatens_text_parts(monkeypatch) -> None:
     task = response.json()["result"]
     assert task["status"]["message"]["parts"][0]["text"] == "已回答。"
     assert calls["query"] == "第一行\n第二行"
+
+
+def test_tasks_send_rejects_empty_query(monkeypatch) -> None:
+    calls = 0
+
+    def fake_answer_question(*, query: str, top_n: int, top_k: int) -> dict:
+        nonlocal calls
+        calls += 1
+        return {"answer": "不会调用", "citations": [], "evidence_count": 0}
+
+    monkeypatch.setattr(a2a_routes, "answer_question", fake_answer_question)
+    client = TestClient(web_app.create_app())
+
+    response = client.post(
+        "/a2a/xhbx-rag-answer",
+        json={
+            "jsonrpc": "2.0",
+            "method": "tasks/send",
+            "params": {
+                "message": {
+                    "role": "user",
+                    "parts": [{"type": "text", "text": "   "}],
+                }
+            },
+            "id": 1,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": {"code": -32602, "message": "问题不能为空"},
+    }
+    assert calls == 0
+
+
+def test_tasks_send_rejects_unsupported_method(monkeypatch) -> None:
+    calls = 0
+
+    def fake_answer_question(*, query: str, top_n: int, top_k: int) -> dict:
+        nonlocal calls
+        calls += 1
+        return {"answer": "不会调用", "citations": [], "evidence_count": 0}
+
+    monkeypatch.setattr(a2a_routes, "answer_question", fake_answer_question)
+    client = TestClient(web_app.create_app())
+
+    response = client.post(
+        "/a2a/xhbx-rag-answer",
+        json={
+            "jsonrpc": "2.0",
+            "method": "tasks/sendSubscribe",
+            "params": {
+                "message": {
+                    "role": "user",
+                    "parts": [{"type": "text", "text": "问题"}],
+                }
+            },
+            "id": "rpc-unsupported",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "jsonrpc": "2.0",
+        "id": "rpc-unsupported",
+        "error": {"code": -32601, "message": "不支持的 A2A 方法: tasks/sendSubscribe"},
+    }
+    assert calls == 0
+
+
+def test_tasks_send_rejects_invalid_jsonrpc_request() -> None:
+    client = TestClient(web_app.create_app())
+
+    response = client.post(
+        "/a2a/xhbx-rag-answer",
+        json={
+            "jsonrpc": "2.0",
+            "method": "tasks/send",
+            "params": {
+                "message": {
+                    "role": "user",
+                    "parts": [{"type": "text", "text": "问题"}],
+                }
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "jsonrpc": "2.0",
+        "id": None,
+        "error": {"code": -32600, "message": "JSON-RPC 请求格式不合法"},
+    }
+
+
+def test_tasks_send_masks_internal_error(monkeypatch) -> None:
+    def fail_answer_question(*, query: str, top_n: int, top_k: int) -> dict:
+        raise RuntimeError("secret-token leaked from /Users/milan/.env")
+
+    monkeypatch.setattr(a2a_routes, "answer_question", fail_answer_question)
+    client = TestClient(web_app.create_app())
+
+    response = client.post(
+        "/a2a/xhbx-rag-answer",
+        json={
+            "jsonrpc": "2.0",
+            "method": "tasks/send",
+            "params": {
+                "message": {
+                    "role": "user",
+                    "parts": [{"type": "text", "text": "保单整理有什么作用？"}],
+                }
+            },
+            "id": 1,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload == {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": {"code": -32000, "message": "问答服务暂时不可用"},
+    }
+    assert "secret-token" not in response.text
+    assert "/Users/milan" not in response.text
+
+
+def test_tasks_send_passes_safe_answer_error(monkeypatch) -> None:
+    detail = "本地 Milvus 索引暂时不可用，请关闭其他正在使用索引的进程后重试。"
+
+    def fail_answer_question(*, query: str, top_n: int, top_k: int) -> dict:
+        raise ValueError(detail)
+
+    monkeypatch.setattr(a2a_routes, "answer_question", fail_answer_question)
+    client = TestClient(web_app.create_app())
+
+    response = client.post(
+        "/a2a/xhbx-rag-answer",
+        json={
+            "jsonrpc": "2.0",
+            "method": "tasks/send",
+            "params": {
+                "message": {
+                    "role": "user",
+                    "parts": [{"type": "text", "text": "保单整理有什么作用？"}],
+                }
+            },
+            "id": 1,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": {"code": -32000, "message": detail},
+    }

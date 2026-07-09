@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Request
 
+from .safe_errors import answer_exception_detail
 from .services import answer_question
+
+logger = logging.getLogger(__name__)
 
 AGENT_CODE = "xhbx-rag-answer"
 AGENT_PATH = f"/a2a/{AGENT_CODE}"
@@ -14,8 +18,6 @@ AGENT_DESCRIPTION = (
     "保险销售知识库问答智能体，接收主控传入的 query，"
     "完成检索、排序、证据约束回答和引用返回。"
 )
-
-router = APIRouter(prefix=AGENT_PATH)
 DEFAULT_TOP_N = 20
 DEFAULT_TOP_K = 5
 JSONRPC_VERSION = "2.0"
@@ -26,6 +28,12 @@ PASSTHROUGH_METADATA_KEYS = {
     "tenant_no",
     "parent_session_code",
 }
+INVALID_REQUEST = -32600
+METHOD_NOT_FOUND = -32601
+INVALID_PARAMS = -32602
+SERVER_ERROR = -32000
+
+router = APIRouter(prefix=AGENT_PATH)
 
 
 @router.get("/.well-known/agent.json")
@@ -51,24 +59,38 @@ def agent_card(request: Request) -> dict[str, Any]:
 
 @router.post("")
 def handle_jsonrpc(payload: dict[str, Any]) -> dict[str, Any]:
-    if payload.get("method") != SUPPORTED_METHOD:
-        return {
-            "jsonrpc": JSONRPC_VERSION,
-            "id": payload.get("id"),
-            "error": {
-                "code": -32601,
-                "message": f"不支持的 A2A 方法: {payload.get('method')}",
-            },
-        }
+    request_id = payload.get("id") if isinstance(payload, dict) else None
+    if not _is_valid_jsonrpc_envelope(payload):
+        return _jsonrpc_error(request_id, INVALID_REQUEST, "JSON-RPC 请求格式不合法")
 
-    params = payload["params"]
-    query = _extract_query(params["message"])
-    result = answer_question(query=query, top_n=DEFAULT_TOP_N, top_k=DEFAULT_TOP_K)
+    method = payload.get("method")
+    if method != SUPPORTED_METHOD:
+        return _jsonrpc_error(
+            request_id,
+            METHOD_NOT_FOUND,
+            f"不支持的 A2A 方法: {method}",
+        )
+
+    params = payload.get("params")
+    if not isinstance(params, dict):
+        return _jsonrpc_error(request_id, INVALID_PARAMS, "A2A 参数格式不合法")
+
+    try:
+        query = _extract_query(params.get("message"))
+    except ValueError as exc:
+        return _jsonrpc_error(request_id, INVALID_PARAMS, str(exc))
+
+    try:
+        result = answer_question(query=query, top_n=DEFAULT_TOP_N, top_k=DEFAULT_TOP_K)
+    except Exception as exc:  # noqa: BLE001 - A2A boundary returns safe error only
+        logger.exception("A2A tasks/send failed")
+        return _jsonrpc_error(request_id, SERVER_ERROR, answer_exception_detail(exc))
+
     task_id = str(params.get("id") or uuid4())
     session_id = str(params.get("sessionId") or uuid4())
     return {
         "jsonrpc": JSONRPC_VERSION,
-        "id": payload["id"],
+        "id": request_id,
         "result": _completed_task(
             task_id=task_id,
             session_id=session_id,
@@ -79,18 +101,32 @@ def handle_jsonrpc(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _agent_url(request: Request) -> str:
-    return f"{str(request.base_url).rstrip('/')}{AGENT_PATH}"
+def _is_valid_jsonrpc_envelope(payload: Any) -> bool:
+    return (
+        isinstance(payload, dict)
+        and payload.get("jsonrpc") == JSONRPC_VERSION
+        and "id" in payload
+        and isinstance(payload.get("method"), str)
+    )
+
+
+def _jsonrpc_error(request_id: Any, code: int, message: str) -> dict[str, Any]:
+    return {
+        "jsonrpc": JSONRPC_VERSION,
+        "id": request_id,
+        "error": {"code": code, "message": message},
+    }
 
 
 def _completed_task(
     *,
     task_id: str,
     session_id: str,
-    answer: str,
-    request_metadata: dict[str, Any] | None,
+    answer: Any,
+    request_metadata: Any,
     answer_result: dict[str, Any],
 ) -> dict[str, Any]:
+    metadata = _response_metadata(request_metadata, answer_result)
     return {
         "id": task_id,
         "sessionId": session_id,
@@ -98,22 +134,48 @@ def _completed_task(
             "state": "completed",
             "message": {
                 "role": "agent",
-                "parts": [{"type": "text", "text": answer}],
+                "parts": [{"type": "text", "text": str(answer)}],
             },
         },
-        "metadata": {
-            **{k: v for k, v in (request_metadata or {}).items() if k in PASSTHROUGH_METADATA_KEYS},
-            "citations": answer_result.get("citations", []),
-            "evidence_count": answer_result.get("evidence_count", 0),
-            "retrieval_evidences": answer_result.get("retrieval_evidences", []),
-        },
+        "metadata": metadata,
     }
 
 
-def _extract_query(message: dict[str, Any]) -> str:
-    parts = message.get("parts", [])
-    query_parts = []
-    for part in parts:
-        if part.get("type") == "text":
-            query_parts.append(str(part.get("text", "")))
-    return "\n".join(query_parts).strip()
+def _response_metadata(
+    request_metadata: Any,
+    answer_result: dict[str, Any],
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    if isinstance(request_metadata, dict):
+        metadata.update(
+            {
+                key: request_metadata[key]
+                for key in PASSTHROUGH_METADATA_KEYS
+                if key in request_metadata
+            }
+        )
+    metadata["evidence_count"] = answer_result.get("evidence_count", 0)
+    metadata["citations"] = answer_result.get("citations", [])
+    metadata["retrieval_evidences"] = answer_result.get("retrieval_evidences", [])
+    return metadata
+
+
+def _extract_query(message: Any) -> str:
+    if not isinstance(message, dict):
+        raise ValueError("A2A message 格式不合法")
+    parts = message.get("parts")
+    if not isinstance(parts, list):
+        raise ValueError("A2A message.parts 格式不合法")
+    text_parts = [
+        str(part.get("text", ""))
+        for part in parts
+        if isinstance(part, dict) and part.get("type") == "text"
+    ]
+    query = "\n".join(text_parts).strip()
+    if not query:
+        raise ValueError("问题不能为空")
+    return query
+
+
+def _agent_url(request: Request) -> str:
+    return f"{str(request.base_url).rstrip('/')}{AGENT_PATH}"
