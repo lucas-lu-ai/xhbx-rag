@@ -533,3 +533,44 @@ def test_tasks_send_preserves_zero_ids(monkeypatch) -> None:
     assert task["sessionId"] == 0
     assert task["status"]["message"]["parts"][0]["text"] == "已回答。"
     assert calls["query"] == "保单整理有什么作用？"
+
+
+def test_tasks_send_generates_ids_for_blank_task_and_session_ids(monkeypatch) -> None:
+    calls = 0
+
+    def fake_answer_question(*, query: str, top_n: int, top_k: int) -> dict:
+        nonlocal calls
+        calls += 1
+        return {
+            "answer": "已回答。",
+            "citations": [],
+            "evidence_count": 0,
+            "retrieval_evidences": [],
+        }
+
+    monkeypatch.setattr(a2a_routes, "answer_question", fake_answer_question)
+    client = TestClient(web_app.create_app())
+
+    response = client.post(
+        "/a2a/xhbx-rag-answer",
+        json={
+            "jsonrpc": "2.0",
+            "method": "tasks/send",
+            "params": {
+                "id": "   ",
+                "sessionId": "",
+                "message": {
+                    "role": "user",
+                    "parts": [{"type": "text", "text": "保单整理有什么作用？"}],
+                },
+            },
+            "id": "rpc-blank-ids",
+        },
+    )
+
+    assert response.status_code == 200
+    task = response.json()["result"]
+    UUID(task["id"])
+    UUID(task["sessionId"])
+    assert task["status"]["message"]["parts"][0]["text"] == "已回答。"
+    assert calls == 1

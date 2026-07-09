@@ -85,10 +85,10 @@ async def handle_jsonrpc(request: Request) -> dict[str, Any]:
     except ValueError as exc:
         return _jsonrpc_error(request_id, INVALID_PARAMS, str(exc))
 
+    task_id = _normalize_task_identifier(params.get("id"))
+    session_id = _normalize_task_identifier(params.get("sessionId"))
     try:
         result = answer_question(query=query, top_n=DEFAULT_TOP_N, top_k=DEFAULT_TOP_K)
-        task_id = _normalize_task_identifier(params.get("id"), "id")
-        session_id = _normalize_task_identifier(params.get("sessionId"), "sessionId")
         return {
             "jsonrpc": JSONRPC_VERSION,
             "id": request_id,
@@ -184,11 +184,9 @@ def _extract_query(message: Any) -> str:
     return query
 
 
-def _normalize_task_identifier(value: Any, field_name: str) -> Any:
-    if value is None:
+def _normalize_task_identifier(value: Any) -> Any:
+    if value is None or (isinstance(value, str) and not value.strip()):
         return str(uuid4())
-    if isinstance(value, str) and not value.strip():
-        raise ValueError(f"A2A {field_name} 不能为空")
     return value
 
 
