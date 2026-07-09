@@ -19,6 +19,7 @@ router = APIRouter(prefix=AGENT_PATH)
 DEFAULT_TOP_N = 20
 DEFAULT_TOP_K = 5
 JSONRPC_VERSION = "2.0"
+SUPPORTED_METHOD = "tasks/send"
 PASSTHROUGH_METADATA_KEYS = {
     "traceparent",
     "user_id",
@@ -50,6 +51,16 @@ def agent_card(request: Request) -> dict[str, Any]:
 
 @router.post("")
 def handle_jsonrpc(payload: dict[str, Any]) -> dict[str, Any]:
+    if payload.get("method") != SUPPORTED_METHOD:
+        return {
+            "jsonrpc": JSONRPC_VERSION,
+            "id": payload.get("id"),
+            "error": {
+                "code": -32601,
+                "message": f"不支持的 A2A 方法: {payload.get('method')}",
+            },
+        }
+
     params = payload["params"]
     query = _extract_query(params["message"])
     result = answer_question(query=query, top_n=DEFAULT_TOP_N, top_k=DEFAULT_TOP_K)
@@ -100,8 +111,9 @@ def _completed_task(
 
 
 def _extract_query(message: dict[str, Any]) -> str:
-    parts = message["parts"]
+    parts = message.get("parts", [])
+    query_parts = []
     for part in parts:
         if part.get("type") == "text":
-            return str(part["text"])
-    return ""
+            query_parts.append(str(part.get("text", "")))
+    return "\n".join(query_parts).strip()

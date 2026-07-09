@@ -144,3 +144,87 @@ def test_tasks_send_generates_task_and_session_ids(monkeypatch) -> None:
     UUID(task["id"])
     UUID(task["sessionId"])
     assert task["status"]["message"]["parts"][0]["text"] == "已回答。"
+
+
+def test_tasks_send_rejects_unsupported_method(monkeypatch) -> None:
+    called = False
+
+    def fake_answer_question(*, query: str, top_n: int, top_k: int) -> dict:
+        nonlocal called
+        called = True
+        return {
+            "answer": "不会返回。",
+            "citations": [],
+            "evidence_count": 0,
+            "retrieval_evidences": [],
+        }
+
+    monkeypatch.setattr(a2a_routes, "answer_question", fake_answer_question)
+    client = TestClient(web_app.create_app())
+
+    response = client.post(
+        "/a2a/xhbx-rag-answer",
+        json={
+            "jsonrpc": "2.0",
+            "method": "tasks/sendSubscribe",
+            "params": {
+                "message": {
+                    "role": "user",
+                    "parts": [{"type": "text", "text": "这个不会触发检索"}],
+                }
+            },
+            "id": 2,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload == {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "error": {
+            "code": -32601,
+            "message": "不支持的 A2A 方法: tasks/sendSubscribe",
+        },
+    }
+    assert called is False
+
+
+def test_extract_query_concatens_text_parts(monkeypatch) -> None:
+    calls = {}
+
+    def fake_answer_question(*, query: str, top_n: int, top_k: int) -> dict:
+        calls["query"] = query
+        return {
+            "answer": "已回答。",
+            "citations": [],
+            "evidence_count": 0,
+            "retrieval_evidences": [],
+        }
+
+    monkeypatch.setattr(a2a_routes, "answer_question", fake_answer_question)
+    client = TestClient(web_app.create_app())
+
+    response = client.post(
+        "/a2a/xhbx-rag-answer",
+        json={
+            "jsonrpc": "2.0",
+            "method": "tasks/send",
+            "params": {
+                "message": {
+                    "role": "user",
+                    "parts": [
+                        {"type": "text", "text": "第一行"},
+                        {"type": "image", "image": "..."},  # 不应计入
+                        {"type": "text", "text": "第二行"},
+                    ],
+                }
+            },
+            "id": 3,
+        },
+    )
+
+    assert response.status_code == 200
+    task = response.json()["result"]
+    assert task["status"]["message"]["parts"][0]["text"] == "已回答。"
+    assert calls["query"] == "第一行\n第二行"
