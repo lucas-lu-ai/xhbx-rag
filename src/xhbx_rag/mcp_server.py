@@ -10,23 +10,34 @@ MCP 侧只做检索：原始 query → embedding → 向量 + 关键词混合召
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 from threading import Lock
-from typing import Any, Callable, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from mcp.server.fastmcp import FastMCP
 
-from .config import RetrievalConfig
+from .config import RetrievalConfig, load_env_values
 from .embedding import EmbeddingClient
 from .milvus_store import MilvusSearchHit, create_retrieval_store
 from .rerank import RerankClient
 from .resource_utils import close_resources, is_local_index_open_failure
 
 SERVER_NAME = "xhbx-rag"
-SERVER_INSTRUCTIONS = (
+KB_SERVER_INSTRUCTIONS = (
+    "保险绩优案例销售知识检索服务。"
+    "用 kb_list_knowledge_bases 查看可用知识库；用 kb_search_knowledge "
+    "输入自然语言问题和知识库 ID，返回统一 McpResponse 包装的知识切片结果。"
+)
+LEGACY_SERVER_INSTRUCTIONS = (
     "保险绩优案例销售知识检索服务。"
     "用 search_knowledge 输入自然语言问题，返回经 embedding 检索与重排的证据 chunk"
     "（含知识类型、原文引用与定位）；用 retrieval_status 查看索引与配置状态。"
 )
+BOTH_SERVER_INSTRUCTIONS = (
+    "保险绩优案例销售知识检索服务。默认建议使用 kb_list_knowledge_bases 和 "
+    "kb_search_knowledge；旧客户端也可继续使用 search_knowledge。"
+)
+SERVER_INSTRUCTIONS = KB_SERVER_INSTRUCTIONS
 
 DEFAULT_TOP_N = 20
 DEFAULT_TOP_K = 5
@@ -42,6 +53,41 @@ CHUNK_TYPE_LABELS = {
     "script": "场景话术",
     "objection_handling": "异议处理",
     "training_course": "培训课程",
+}
+KB_CASE_ID = 1
+KB_COURSE_ID = 2
+VISIBLE_KNOWLEDGE_BASES = [
+    {
+        "kbId": KB_CASE_ID,
+        "name": "保险绩优案例库",
+        "description": "保险绩优案例销售知识，包含客户旅程、销售策略、场景话术和异议处理。",
+    },
+    {
+        "kbId": KB_COURSE_ID,
+        "name": "培训课程库",
+        "description": "保险销售培训课程知识，包含课件、讲师备注和课程切片。",
+    },
+]
+CASE_KB_CHUNK_TYPES = [
+    "customer_journey",
+    "strategy",
+    "script",
+    "objection_handling",
+]
+COURSE_KB_CHUNK_TYPES = ["training_course"]
+DEFAULT_KB_TOP_K = 10
+MAX_KB_TOP_K = 50
+SLICE_PREVIEW_CHARS = 240
+DEFAULT_KNOWLEDGE_TYPES = ["QA", "SLICE", "KNOWLEDGE_POINT"]
+SUPPORTED_KB_RETRIEVAL_MODE = "HYBRID"
+MCP_TOOL_PROFILE_ENV = "MCP_TOOL_PROFILE"
+TOOL_PROFILE_KB = "kb"
+TOOL_PROFILE_LEGACY = "legacy"
+TOOL_PROFILE_BOTH = "both"
+SUPPORTED_TOOL_PROFILES = {
+    TOOL_PROFILE_KB,
+    TOOL_PROFILE_LEGACY,
+    TOOL_PROFILE_BOTH,
 }
 
 UNAVAILABLE_SEARCH_ERROR = "检索服务暂时不可用"
@@ -190,7 +236,12 @@ def create_mcp_server(
     port: int = DEFAULT_HTTP_PORT,
     sse_path: str = DEFAULT_SSE_PATH,
     streamable_http_path: str = DEFAULT_STREAMABLE_HTTP_PATH,
+    expose_legacy_tools: bool = False,
+    tool_profile: str = TOOL_PROFILE_KB,
 ) -> FastMCP:
+    active_tool_profile = _normalize_tool_profile(tool_profile)
+    if expose_legacy_tools:
+        active_tool_profile = TOOL_PROFILE_BOTH
     active_searcher = searcher if searcher is not None else ConfiguredEvidenceSearcher()
     active_status = (
         status_provider if status_provider is not None else _default_status_provider
@@ -202,22 +253,60 @@ def create_mcp_server(
     )
     server = FastMCP(
         SERVER_NAME,
-        instructions=SERVER_INSTRUCTIONS,
+        instructions=_server_instructions(active_tool_profile),
         host=host,
         port=port,
         sse_path=sse_path,
         streamable_http_path=streamable_http_path,
     )
 
-    @server.tool(
-        name="search_knowledge",
-        description=(
-            "从保险绩优案例知识库检索销售证据。输入自然语言问题，"
-            "经 embedding、向量+关键词混合召回、RRF 融合与重排后，"
-            "返回证据 chunk（含知识类型、原文引用与定位）。"
-            "可选传入 chunk_types、stage、case_name 做精确过滤；"
-        ),
-    )
+    def kb_list_knowledge_bases() -> dict:
+        return _mcp_success([dict(item) for item in VISIBLE_KNOWLEDGE_BASES])
+
+    def kb_search_knowledge(
+        query: str,
+        kbId: int,
+        knowledgeTypes: list[str] | None = None,
+        retrievalMode: str = SUPPORTED_KB_RETRIEVAL_MODE,
+        hybridWeights: dict[str, Any] | None = None,
+        topK: int = DEFAULT_KB_TOP_K,
+    ) -> dict:
+        stripped_query = str(query or "").strip()
+        if not stripped_query:
+            return _mcp_error("10004", "参数错误: query 不能为空")
+
+        filters = _kb_filters(kbId)
+        if filters is None:
+            return _mcp_error("10003", "当前用户对指定知识库无访问权限")
+
+        try:
+            top_k = _normalize_kb_top_k(topK)
+            retrieval_mode = str(retrievalMode or "").strip().upper()
+            if retrieval_mode != SUPPORTED_KB_RETRIEVAL_MODE:
+                return _mcp_error(
+                    "10004",
+                    "参数错误: retrievalMode 暂时仅支持 HYBRID",
+                )
+            if hybridWeights is not None and not isinstance(hybridWeights, dict):
+                return _mcp_error("10004", "参数错误: hybridWeights 必须为对象")
+            knowledge_types = _normalize_knowledge_types(knowledgeTypes)
+        except (TypeError, ValueError) as exc:
+            return _mcp_error("10004", str(exc))
+
+        if "SLICE" not in knowledge_types:
+            return _mcp_success([])
+
+        try:
+            result = active_searcher.search(
+                query=stripped_query,
+                top_n=max(DEFAULT_TOP_N, top_k),
+                top_k=top_k,
+                filters=filters,
+            )
+        except Exception as exc:
+            return _mcp_error("500", _safe_error_message(exc))
+        return _mcp_success(_format_kb_search_results(result))
+
     def search_knowledge(
         query: str,
         chunk_types: list[str] | None = None,
@@ -242,33 +331,168 @@ def create_mcp_server(
         except Exception as exc:
             raise ValueError(_safe_error_message(exc)) from exc
 
-    @server.tool(
-        name="retrieval_status",
-        description=(
-            "查看检索服务状态：Milvus 模式与目标、collection 名称、"
-            "必要配置是否齐全。不返回任何密钥内容。"
-        ),
-    )
     def retrieval_status() -> dict:
         try:
             return active_status()
         except Exception as exc:
             raise ValueError(_safe_error_message(exc)) from exc
 
-    @server.tool(
-        name="list_filter_options",
-        description=(
-            "列出 search_knowledge 可用的精确过滤值：知识类型、销售阶段、案例名称。"
-            "客户端应先读取这些合法值，再决定是否传入过滤参数。"
-        ),
-    )
     def list_filter_options() -> dict:
         try:
             return active_filter_options_provider.filter_options()
         except Exception as exc:
             raise ValueError(_safe_error_message(exc)) from exc
 
+    if active_tool_profile in {TOOL_PROFILE_KB, TOOL_PROFILE_BOTH}:
+        server.tool(
+            name="kb_list_knowledge_bases",
+            description="列出当前用户有权限查阅的知识库。",
+        )(kb_list_knowledge_bases)
+        server.tool(
+            name="kb_search_knowledge",
+            description=(
+                "在指定知识库中统一检索 QA、文档切片、知识点。调用前应先使用 "
+                "kb_list_knowledge_bases 获取可见知识库 ID。"
+            ),
+        )(kb_search_knowledge)
+
+    if active_tool_profile in {TOOL_PROFILE_LEGACY, TOOL_PROFILE_BOTH}:
+        server.tool(
+            name="search_knowledge",
+            description=(
+                "从保险绩优案例知识库检索销售证据。输入自然语言问题，"
+                "经 embedding、向量+关键词混合召回、RRF 融合与重排后，"
+                "返回证据 chunk（含知识类型、原文引用与定位）。"
+                "可选传入 chunk_types、stage、case_name 做精确过滤；"
+            ),
+        )(search_knowledge)
+        server.tool(
+            name="retrieval_status",
+            description=(
+                "查看检索服务状态：Milvus 模式与目标、collection 名称、"
+                "必要配置是否齐全。不返回任何密钥内容。"
+            ),
+        )(retrieval_status)
+        server.tool(
+            name="list_filter_options",
+            description=(
+                "列出 search_knowledge 可用的精确过滤值：知识类型、销售阶段、案例名称。"
+                "客户端应先读取这些合法值，再决定是否传入过滤参数。"
+            ),
+        )(list_filter_options)
+
     return server
+
+
+def _tool_profile_from_env(
+    *,
+    env: Mapping[str, str] | None = None,
+    env_file: Path | None = Path(".env"),
+) -> str:
+    values = load_env_values(env=env, env_file=env_file)
+    return _normalize_tool_profile(values.get(MCP_TOOL_PROFILE_ENV, TOOL_PROFILE_KB))
+
+
+def _normalize_tool_profile(value: str | None) -> str:
+    profile = str(value or TOOL_PROFILE_KB).strip().lower() or TOOL_PROFILE_KB
+    if profile not in SUPPORTED_TOOL_PROFILES:
+        raise ValueError("MCP_TOOL_PROFILE 仅支持 kb、legacy 或 both")
+    return profile
+
+
+def _server_instructions(tool_profile: str) -> str:
+    if tool_profile == TOOL_PROFILE_LEGACY:
+        return LEGACY_SERVER_INSTRUCTIONS
+    if tool_profile == TOOL_PROFILE_BOTH:
+        return BOTH_SERVER_INSTRUCTIONS
+    return KB_SERVER_INSTRUCTIONS
+
+
+def _mcp_success(data: Any) -> dict[str, Any]:
+    return {
+        "success": True,
+        "data": data,
+        "errorCode": None,
+        "errorMessage": None,
+    }
+
+
+def _mcp_error(error_code: str, error_message: str) -> dict[str, Any]:
+    return {
+        "success": False,
+        "data": None,
+        "errorCode": error_code,
+        "errorMessage": error_message,
+    }
+
+
+def _kb_filters(kb_id: int) -> dict[str, Any] | None:
+    if kb_id == KB_CASE_ID:
+        return {"chunk_types": CASE_KB_CHUNK_TYPES}
+    if kb_id == KB_COURSE_ID:
+        return {"chunk_types": COURSE_KB_CHUNK_TYPES}
+    return None
+
+
+def _normalize_kb_top_k(top_k: int | None) -> int:
+    try:
+        value = DEFAULT_KB_TOP_K if top_k is None else int(top_k)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("参数错误: topK 必须在 1 到 50 之间") from exc
+    if value < 1 or value > MAX_KB_TOP_K:
+        raise ValueError("参数错误: topK 必须在 1 到 50 之间")
+    return value
+
+
+def _normalize_knowledge_types(knowledge_types: list[str] | None) -> list[str]:
+    if knowledge_types is None:
+        return list(DEFAULT_KNOWLEDGE_TYPES)
+    return [
+        str(knowledge_type).strip().upper()
+        for knowledge_type in knowledge_types
+        if str(knowledge_type).strip()
+    ]
+
+
+def _format_kb_search_results(result: dict[str, Any]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    raw_results = result.get("results", [])
+    if not isinstance(raw_results, list):
+        return items
+    for raw in raw_results:
+        if not isinstance(raw, dict):
+            continue
+        full_content = str(raw.get("text") or "")
+        content, content_truncated = _preview_slice_content(full_content)
+        metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+        citations = raw.get("citations") if isinstance(raw.get("citations"), list) else []
+        items.append(
+            {
+                "id": raw.get("chunk_id"),
+                "knowledgeType": "SLICE",
+                "score": raw.get("rerank_score", raw.get("score")),
+                "tags": metadata.get("tag_paths") or None,
+                "qa": None,
+                "slice": {
+                    "content": content,
+                    "fullContent": full_content,
+                    "contentTruncated": content_truncated,
+                    "sliceType": raw.get("chunk_type"),
+                    "parentId": metadata.get("parent_id"),
+                    "titlePath": metadata.get("title_path"),
+                    "parentSliceContext": metadata.get("parent_slice_context"),
+                    "citations": citations,
+                },
+                "knowledgePoint": None,
+            }
+        )
+    return items
+
+
+def _preview_slice_content(content: str) -> tuple[str, bool]:
+    if len(content) <= SLICE_PREVIEW_CHARS:
+        return content, False
+    return content[:SLICE_PREVIEW_CHARS].rstrip() + "...", True
 
 
 def _direct_search_evidence(
@@ -504,11 +728,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.transport == "streamable-http" and args.path
         else DEFAULT_STREAMABLE_HTTP_PATH
     )
+    try:
+        tool_profile = _tool_profile_from_env()
+    except ValueError as exc:
+        parser.error(str(exc))
     create_mcp_server(
         host=args.host,
         port=args.port,
         sse_path=sse_path,
         streamable_http_path=streamable_http_path,
+        tool_profile=tool_profile,
     ).run(transport=args.transport)
     return 0
 

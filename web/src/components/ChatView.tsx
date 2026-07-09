@@ -36,9 +36,14 @@ type ChatViewProps = {
     updater: (turns: ChatTurn[]) => ChatTurn[],
     title?: string
   ) => void;
+  selectedCollections?: string[];
 };
 
-export function ChatView({ session, onUpdateSession }: ChatViewProps) {
+export function ChatView({
+  session,
+  onUpdateSession,
+  selectedCollections
+}: ChatViewProps) {
   const { onSelectEvidence } = useEvidenceDetail();
   const [query, setQuery] = useState("");
   const [topN, setTopN] = useState(DEFAULT_TOP_N);
@@ -87,7 +92,10 @@ export function ChatView({ session, onUpdateSession }: ChatViewProps) {
         {
           query: trimmed,
           top_n: topN,
-          top_k: topK
+          top_k: topK,
+          ...(selectedCollections && selectedCollections.length > 0
+            ? { collections: selectedCollections }
+            : {})
         },
         {
           onEvent: (streamEvent) => {

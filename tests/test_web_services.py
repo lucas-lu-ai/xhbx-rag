@@ -694,6 +694,49 @@ def test_answer_question_strips_query_before_rag_call(monkeypatch) -> None:
     assert calls["query"] == "q"
 
 
+def test_answer_question_passes_selected_collections_to_retrieval_store(
+    monkeypatch,
+) -> None:
+    constructor_calls = {}
+    answer_calls = {}
+
+    monkeypatch.setattr(services.RetrievalConfig, "from_env", _fake_config)
+    monkeypatch.setattr(services, "QueryUnderstandingAgent", lambda **kwargs: "query")
+    monkeypatch.setattr(services, "EmbeddingClient", lambda **kwargs: "embedding")
+    monkeypatch.setattr(services, "RerankClient", lambda **kwargs: "reranker")
+    monkeypatch.setattr(services, "AnswerAgent", lambda **kwargs: "answer-agent")
+
+    def store_factory(config, collection_names=None):
+        constructor_calls["store_collections"] = collection_names
+        return "store"
+
+    monkeypatch.setattr(services, "create_retrieval_store", store_factory)
+
+    def fake_answer_query(**kwargs):
+        answer_calls.update(kwargs)
+        return {
+            "original_query": kwargs["query"],
+            "rewritten_query": "q",
+            "intent": "general_sales_qa",
+            "filters": {},
+            "answer": "answer",
+            "citations": [],
+            "evidence_count": 0,
+        }
+
+    monkeypatch.setattr(services, "answer_query", fake_answer_query)
+
+    services.answer_question(
+        query="q",
+        top_n=20,
+        top_k=5,
+        collections=["xhbx_course_chunks"],
+    )
+
+    assert constructor_calls["store_collections"] == ["xhbx_course_chunks"]
+    assert answer_calls["store"] == "store"
+
+
 def test_answer_question_preserves_config_error(monkeypatch) -> None:
     def fail_from_env():
         raise ConfigError("缺少必要环境变量: API_KEY")

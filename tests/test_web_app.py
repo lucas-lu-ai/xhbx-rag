@@ -261,6 +261,52 @@ def test_answer_stream_route_streams_sse_events(monkeypatch) -> None:
     assert "event: final" in body
 
 
+def test_answer_stream_route_passes_selected_collections(monkeypatch) -> None:
+    calls = {}
+
+    def fake_answer_question_stream_events(*, query, top_n, top_k, collections):
+        calls["query"] = query
+        calls["top_n"] = top_n
+        calls["top_k"] = top_k
+        calls["collections"] = collections
+        yield {
+            "type": "final",
+            "response": {
+                "answer": "只检索课程库。",
+                "citations": [],
+                "evidence_count": 0,
+                "retrieval_evidences": [],
+            },
+        }
+
+    monkeypatch.setattr(
+        web_app,
+        "answer_question_stream_events",
+        fake_answer_question_stream_events,
+    )
+    client = TestClient(web_app.create_app())
+
+    with client.stream(
+        "POST",
+        "/api/answer/stream",
+        json={
+            "query": "促成课程怎么讲？",
+            "top_n": 20,
+            "top_k": 5,
+            "collections": ["xhbx_course_chunks"],
+        },
+    ) as response:
+        response.read()
+
+    assert response.status_code == 200
+    assert calls == {
+        "query": "促成课程怎么讲？",
+        "top_n": 20,
+        "top_k": 5,
+        "collections": ["xhbx_course_chunks"],
+    }
+
+
 def test_answer_stream_route_hides_internal_error_detail_and_logs(monkeypatch) -> None:
     log_messages = []
 

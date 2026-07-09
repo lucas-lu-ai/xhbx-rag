@@ -8,6 +8,7 @@ import {
   answerStreamResponse,
   deferredResponse,
   installFetchStub,
+  jsonResponse,
   installStorageStub,
   runRegisteredCleanups,
   sseResponse
@@ -220,7 +221,7 @@ test("loads status and submits a question", async () => {
   const { requests } = installFetchStub();
   render(<App />);
 
-  expect(await screen.findByText("xhbx_sales_chunks")).toBeInTheDocument();
+  expect(await screen.findByText("案例知识库")).toBeInTheDocument();
 
   await user.type(screen.getByLabelText("输入问题"), "客户说每年不能超过80万怎么办？");
   await user.click(screen.getByRole("button", { name: "发送" }));
@@ -243,6 +244,50 @@ test("loads status and submits a question", async () => {
       body: { query: "客户说每年不能超过80万怎么办？", top_n: 20, top_k: 5 }
     })
   );
+});
+
+test("submits selected collections from the status dropdown", async () => {
+  const user = userEvent.setup();
+  const { requests } = installFetchStub((url) => {
+    if (url.endsWith("/api/status")) {
+      return jsonResponse({
+        ok: true,
+        data_dir: "data",
+        milvus_mode: "lite",
+        milvus_target: ".local/milvus/xhbx_rag.db",
+        milvus_lite_path: ".local/milvus/xhbx_rag.db",
+        milvus_collection: "xhbx_sales_chunks",
+        milvus_course_collection: "xhbx_course_chunks",
+        milvus_collections: ["xhbx_sales_chunks", "xhbx_course_chunks"],
+        batch_concurrency: 1,
+        config: { API_KEY: true },
+        errors: []
+      });
+    }
+    return null;
+  });
+  render(<App />);
+
+  await user.click(await screen.findByRole("button", { name: "选择 Collection" }));
+  expect(screen.getAllByText("案例知识库").length).toBeGreaterThan(0);
+  expect(screen.getByText("课程知识库")).toBeInTheDocument();
+  await user.click(screen.getByLabelText("案例知识库"));
+  await user.type(screen.getByLabelText("输入问题"), "促成课程怎么讲？");
+  await user.click(screen.getByRole("button", { name: "发送" }));
+
+  await waitFor(() => {
+    expect(requests).toContainEqual(
+      expect.objectContaining({
+        url: "/api/answer/stream",
+        body: expect.objectContaining({
+          query: "促成课程怎么讲？",
+          top_n: 20,
+          top_k: 5,
+          collections: ["xhbx_course_chunks"]
+        })
+      })
+    );
+  });
 });
 
 test("submits the question when pressing Enter in the input", async () => {

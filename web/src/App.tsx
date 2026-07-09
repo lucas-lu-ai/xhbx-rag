@@ -1,4 +1,4 @@
-import { AlertCircle, Database, FileText } from "lucide-react";
+import { AlertCircle, ChevronDown, Database, FileText } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { ApiError, deleteBatchRun, getStatus, listBatchRuns } from "./api";
@@ -39,6 +39,12 @@ import type {
 const DEFAULT_BATCH_POLL_INTERVAL_MS = 2000;
 const DEFAULT_LIST_POLL_INTERVAL_MS = 5000;
 const BATCH_RUNS_LOAD_ERROR = "批量会话列表加载失败，仅显示聊天会话。";
+const CASE_COLLECTION_LABEL = "案例知识库";
+const COURSE_COLLECTION_LABEL = "课程知识库";
+const COLLECTION_LABELS: Record<string, string> = {
+  xhbx_sales_chunks: CASE_COLLECTION_LABEL,
+  xhbx_course_chunks: COURSE_COLLECTION_LABEL
+};
 
 const emptyStatus: StatusResponse = {
   ok: false,
@@ -47,6 +53,8 @@ const emptyStatus: StatusResponse = {
   milvus_target: "",
   milvus_lite_path: "",
   milvus_collection: "",
+  milvus_course_collection: "",
+  milvus_collections: [],
   batch_concurrency: 1,
   config: {},
   errors: []
@@ -63,6 +71,10 @@ export function App({
 }: AppProps = {}) {
   const [status, setStatus] = useState<StatusResponse>(emptyStatus);
   const [statusError, setStatusError] = useState("");
+  const [collectionSelection, setCollectionSelection] = useState<string[] | null>(
+    null
+  );
+  const [collectionMenuOpen, setCollectionMenuOpen] = useState(false);
   const [sessionStore, setSessionStore] = useState(loadChatSessions);
   const [batchRuns, setBatchRuns] = useState<BatchRunSummary[]>([]);
   const [batchRunsLoaded, setBatchRunsLoaded] = useState(false);
@@ -80,6 +92,39 @@ export function App({
   const [detailContainer, setDetailContainer] = useState<HTMLElement | null>(
     null
   );
+
+  const collectionOptions = useMemo(
+    () => collectionNamesFromStatus(status),
+    [status]
+  );
+  const selectedCollectionNames = useMemo(() => {
+    if (collectionOptions.length === 0) {
+      return [];
+    }
+    const baseSelection = collectionSelection ?? collectionOptions;
+    const selected = collectionOptions.filter((name) =>
+      baseSelection.includes(name)
+    );
+    return selected.length > 0 ? selected : collectionOptions;
+  }, [collectionOptions, collectionSelection]);
+  const requestCollections =
+    collectionSelection === null ? undefined : selectedCollectionNames;
+
+  useEffect(() => {
+    setCollectionSelection((current) => {
+      if (current === null) {
+        return null;
+      }
+      const selected = collectionOptions.filter((name) => current.includes(name));
+      if (
+        selected.length === 0 ||
+        selected.length === collectionOptions.length
+      ) {
+        return null;
+      }
+      return sameStringList(selected, current) ? current : selected;
+    });
+  }, [collectionOptions]);
 
   // 选中态归一：批量按原样保留，聊天校验会话存在性后回退。
   const effectiveSelection = useMemo<SessionSelection>(() => {
@@ -307,6 +352,25 @@ export function App({
     );
   }
 
+  function toggleCollection(collectionName: string) {
+    if (collectionOptions.length <= 1) {
+      return;
+    }
+    setCollectionSelection((current) => {
+      const nextSet = new Set(current ?? collectionOptions);
+      if (nextSet.has(collectionName)) {
+        nextSet.delete(collectionName);
+      } else {
+        nextSet.add(collectionName);
+      }
+      const next = collectionOptions.filter((name) => nextSet.has(name));
+      if (next.length === 0) {
+        return current;
+      }
+      return next.length === collectionOptions.length ? null : next;
+    });
+  }
+
   const chatLatestResponse = useMemo(
     () => latestResponseFromTurns(activeChatSession.turns),
     [activeChatSession.turns]
@@ -359,6 +423,7 @@ export function App({
             key={activeChatSession.id}
             session={activeChatSession}
             onUpdateSession={updateSessionTurns}
+            selectedCollections={requestCollections}
           />
         )}
       </main>
@@ -382,7 +447,60 @@ export function App({
             </div>
             <div>
               <dt>Collection</dt>
-              <dd>{status.milvus_collection || "未配置"}</dd>
+              <dd className="collection-cell">
+                {collectionOptions.length > 0 ? (
+                  <div className="collection-select">
+                    <button
+                      aria-expanded={collectionMenuOpen}
+                      aria-label="选择 Collection"
+                      className="collection-select-button"
+                      type="button"
+                      onClick={() => setCollectionMenuOpen((open) => !open)}
+                    >
+                      <span className="collection-primary">
+                        {collectionDisplayName(status, selectedCollectionNames[0])}
+                      </span>
+                      {selectedCollectionNames.length > 1 && (
+                        <span className="collection-count">
+                          +{selectedCollectionNames.length - 1}
+                        </span>
+                      )}
+                      <ChevronDown size={15} aria-hidden="true" />
+                    </button>
+                    {collectionMenuOpen && (
+                      <div
+                        aria-label="可用 Collection"
+                        className="collection-menu"
+                        role="group"
+                      >
+                        {collectionOptions.map((name) => {
+                          const checked = selectedCollectionNames.includes(name);
+                          const label = collectionDisplayName(status, name);
+                          return (
+                            <label className="collection-option" key={name}>
+                              <input
+                                aria-label={label}
+                                type="checkbox"
+                                checked={checked}
+                                disabled={
+                                  checked && selectedCollectionNames.length === 1
+                                }
+                                onChange={() => toggleCollection(name)}
+                              />
+                              <span className="collection-option-text">
+                                <span>{label}</span>
+                                <small>{name}</small>
+                              </span>
+                            </label>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  "未配置"
+                )}
+              </dd>
             </div>
           </dl>
         </section>
@@ -404,5 +522,41 @@ export function App({
       </aside>
     </div>
     </EvidenceDetailContext.Provider>
+  );
+}
+
+function collectionNamesFromStatus(status: StatusResponse): string[] {
+  return uniqueNonEmptyStrings([
+    ...(status.milvus_collections ?? []),
+    status.milvus_collection,
+    status.milvus_course_collection ?? ""
+  ]);
+}
+
+function collectionDisplayName(status: StatusResponse, name: string): string {
+  if (name === status.milvus_collection) {
+    return CASE_COLLECTION_LABEL;
+  }
+  if (name === status.milvus_course_collection) {
+    return COURSE_COLLECTION_LABEL;
+  }
+  return COLLECTION_LABELS[name] ?? name;
+}
+
+function uniqueNonEmptyStrings(values: string[]): string[] {
+  const result: string[] = [];
+  for (const value of values) {
+    const normalized = value.trim();
+    if (normalized && !result.includes(normalized)) {
+      result.push(normalized);
+    }
+  }
+  return result;
+}
+
+function sameStringList(left: string[], right: string[]): boolean {
+  return (
+    left.length === right.length &&
+    left.every((value, index) => value === right[index])
   );
 }

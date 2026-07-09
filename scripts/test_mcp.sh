@@ -4,8 +4,9 @@ set -eu
 MCP_URL="${MCP_URL:-http://127.0.0.1:${MCP_PORT:-9331}/mcp}"
 MCP_PROTOCOL_VERSION="${MCP_PROTOCOL_VERSION:-2025-03-26}"
 TIMEOUT="${TIMEOUT:-30}"
-TOP_N="${TOP_N:-20}"
-TOP_K="${TOP_K:-5}"
+TOOL_PROFILE="${MCP_TOOL_PROFILE:-kb}"
+KB_ID="${KB_ID:-1}"
+TOP_K="${TOP_K:-10}"
 QUERY="${1:-${QUERY:-}}"
 SESSION_ID=""
 
@@ -84,32 +85,75 @@ post_rpc "tools/list" '{
   "params":{}
 }'
 
-post_rpc "retrieval_status" '{
-  "jsonrpc":"2.0",
-  "id":3,
-  "method":"tools/call",
-  "params":{
-    "name":"retrieval_status",
-    "arguments":{}
-  }
-}'
+case "$TOOL_PROFILE" in
+  kb|both)
+    post_rpc "kb_list_knowledge_bases" '{
+      "jsonrpc":"2.0",
+      "id":3,
+      "method":"tools/call",
+      "params":{
+        "name":"kb_list_knowledge_bases",
+        "arguments":{}
+      }
+    }'
+    ;;
+  legacy)
+    post_rpc "retrieval_status" '{
+      "jsonrpc":"2.0",
+      "id":3,
+      "method":"tools/call",
+      "params":{
+        "name":"retrieval_status",
+        "arguments":{}
+      }
+    }'
+    ;;
+  *)
+    echo "MCP_TOOL_PROFILE 仅支持 kb、legacy 或 both，当前为: $TOOL_PROFILE" >&2
+    exit 1
+    ;;
+esac
 
 if [ -n "$QUERY" ]; then
   escaped_query="$(json_escape "$QUERY")"
-  post_rpc "search_knowledge" "{
-    \"jsonrpc\":\"2.0\",
-    \"id\":4,
-    \"method\":\"tools/call\",
-    \"params\":{
-      \"name\":\"search_knowledge\",
-      \"arguments\":{
-        \"query\":\"$escaped_query\",
-        \"top_n\":$TOP_N,
-        \"top_k\":$TOP_K
-      }
-    }
-  }"
+  case "$TOOL_PROFILE" in
+    kb|both)
+      post_rpc "kb_search_knowledge" "{
+        \"jsonrpc\":\"2.0\",
+        \"id\":4,
+        \"method\":\"tools/call\",
+        \"params\":{
+          \"name\":\"kb_search_knowledge\",
+          \"arguments\":{
+            \"query\":\"$escaped_query\",
+            \"kbId\":$KB_ID,
+            \"topK\":$TOP_K
+          }
+        }
+      }"
+      ;;
+    legacy)
+      post_rpc "search_knowledge" "{
+        \"jsonrpc\":\"2.0\",
+        \"id\":4,
+        \"method\":\"tools/call\",
+        \"params\":{
+          \"name\":\"search_knowledge\",
+          \"arguments\":{
+            \"query\":\"$escaped_query\"
+          }
+        }
+      }"
+      ;;
+  esac
 else
-  echo "未提供检索问题，跳过 search_knowledge。"
+  case "$TOOL_PROFILE" in
+    legacy)
+      echo "未提供检索问题，跳过 search_knowledge。"
+      ;;
+    *)
+      echo "未提供检索问题，跳过 kb_search_knowledge。"
+      ;;
+  esac
   echo "如需检索测试：QUERY='客户说预算不够怎么办？' $0"
 fi

@@ -132,6 +132,9 @@ def test_mcp_env_template_documents_server_binding_and_collections() -> None:
 
     assert "MCP_BIND=127.0.0.1" in env_template
     assert "MCP_PORT=9331" in env_template
+    assert "MCP_TOOL_PROFILE=kb" in env_template
+    assert "legacy = 只暴露旧" in env_template
+    assert "both   = 新旧 tool 都暴露" in env_template
     assert "MILVUS_MODE=docker" in env_template
     assert "MILVUS_URI=http://localhost:19530" in env_template
     assert "MILVUS_COLLECTION=xhbx_sales_chunks" in env_template
@@ -170,6 +173,8 @@ def test_package_mcp_offline_script_exports_images_and_deploy_files() -> None:
     assert 'cp scripts/test_mcp.sh "$PACKAGE_DIR/scripts/test_mcp.sh"' in script
     assert 'cp scripts/debug_mcp_search.sh "$PACKAGE_DIR/scripts/debug_mcp_search.sh"' in script
     assert 'cp scripts/load_mcp_offline.sh "$PACKAGE_DIR/load_mcp_offline.sh"' in script
+    assert "MCP_TOOL_PROFILE=legacy" in script
+    assert "MCP_TOOL_PROFILE=both" in script
     assert 'INCLUDE_PARSED="${INCLUDE_PARSED:-true}"' in script
 
 
@@ -184,15 +189,20 @@ def test_load_mcp_offline_script_loads_images_and_starts_without_build() -> None
     assert 'compose -f docker-compose.mcp.yml up -d --no-build' in script
 
 
-def test_mcp_test_script_covers_status_and_optional_search() -> None:
+def test_mcp_test_script_covers_kb_list_and_optional_search() -> None:
     script = read_repo_file("scripts/test_mcp.sh")
 
     assert 'MCP_URL="${MCP_URL:-http://127.0.0.1:${MCP_PORT:-9331}/mcp}"' in script
     assert "Accept: application/json, text/event-stream" in script
     assert '"method":"initialize"' in script
     assert '"method":"tools/list"' in script
+    assert 'TOOL_PROFILE="${MCP_TOOL_PROFILE:-kb}"' in script
+    assert '"name":"kb_list_knowledge_bases"' in script
+    assert '\\"name\\":\\"kb_search_knowledge\\"' in script
     assert '"name":"retrieval_status"' in script
     assert '\\"name\\":\\"search_knowledge\\"' in script
+    assert '\\"kbId\\":$KB_ID' in script
+    assert '\\"topK\\":$TOP_K' in script
     assert 'QUERY="${1:-${QUERY:-}}"' in script
     assert "curl -fsS -N" in script
 

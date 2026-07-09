@@ -1078,6 +1078,125 @@ dd {
   overflow-wrap: anywhere;
 }
 
+.collection-cell {
+  flex: 1;
+  overflow: visible;
+}
+
+.collection-select {
+  position: relative;
+  display: inline-block;
+  max-width: 100%;
+}
+
+.collection-select-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  max-width: 100%;
+  min-height: 38px;
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  background: rgb(255 255 255 / 0.72);
+  color: var(--color-foreground);
+  padding: 7px 9px;
+  font-size: 13px;
+  font-weight: 800;
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.68);
+}
+
+.collection-select-button:hover {
+  border-color: var(--color-border-strong);
+  background: rgb(255 255 255 / 0.9);
+}
+
+.collection-primary {
+  min-width: 0;
+  max-width: 230px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.collection-count {
+  flex: 0 0 auto;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 999px;
+  background: var(--color-accent-soft);
+  color: var(--color-accent-hover);
+  padding: 1px 6px;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.collection-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 30;
+  display: grid;
+  gap: 4px;
+  min-width: min(300px, calc(100vw - 48px));
+  max-width: 340px;
+  border: 1px solid var(--color-border);
+  border-radius: 12px;
+  background: rgb(255 255 255 / 0.96);
+  box-shadow: 0 18px 44px rgb(31 48 82 / 0.16);
+  padding: 6px;
+  text-align: left;
+}
+
+.collection-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 40px;
+  border-radius: 9px;
+  color: var(--color-foreground);
+  padding: 7px 8px;
+  cursor: pointer;
+}
+
+.collection-option:hover {
+  background: var(--color-accent-soft);
+}
+
+.collection-option input {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  accent-color: var(--color-accent);
+}
+
+.collection-option input:disabled {
+  cursor: not-allowed;
+}
+
+.collection-option-text {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.collection-option-text span {
+  min-width: 0;
+  color: var(--color-foreground);
+  font-size: 13px;
+  font-weight: 750;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.collection-option-text small {
+  min-width: 0;
+  color: var(--color-muted);
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
 .ok-text {
   color: var(--color-success);
 }

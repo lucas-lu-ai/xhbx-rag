@@ -15,6 +15,8 @@ export const statusPayload = {
   milvus_target: ".local/milvus/xhbx_rag.db",
   milvus_lite_path: ".local/milvus/xhbx_rag.db",
   milvus_collection: "xhbx_sales_chunks",
+  milvus_course_collection: "xhbx_course_chunks",
+  milvus_collections: ["xhbx_sales_chunks", "xhbx_course_chunks"],
   batch_concurrency: 1,
   config: { API_KEY: true },
   errors: []

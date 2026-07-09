@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from queue import Queue
 from pathlib import Path
 from threading import Lock, Thread
@@ -8,7 +9,7 @@ from typing import Any, Callable, Iterator, Mapping
 from xhbx_rag.answer import AnswerAgent, answer_query
 from xhbx_rag.config import ConfigError, RetrievalConfig, load_env_values
 from xhbx_rag.embedding import EmbeddingClient
-from xhbx_rag.milvus_store import create_retrieval_store
+from xhbx_rag.milvus_store import configured_collection_names, create_retrieval_store
 from xhbx_rag.observability import (
     CompositeTraceSink,
     TraceSink,
@@ -65,6 +66,7 @@ def get_status() -> dict[str, Any]:
             "milvus_lite_path": "",
             "milvus_collection": "",
             "milvus_course_collection": "",
+            "milvus_collections": [],
             "batch_concurrency": SERIAL_BATCH_CONCURRENCY,
             "config": _missing_config_map(str(exc)),
             "errors": [str(exc)],
@@ -78,6 +80,7 @@ def get_status() -> dict[str, Any]:
             "milvus_lite_path": "",
             "milvus_collection": "",
             "milvus_course_collection": "",
+            "milvus_collections": [],
             "batch_concurrency": SERIAL_BATCH_CONCURRENCY,
             "config": _missing_config_map(SAFE_CONFIG_PARSE_ERROR),
             "errors": [SAFE_CONFIG_PARSE_ERROR],
@@ -91,6 +94,7 @@ def get_status() -> dict[str, Any]:
         "milvus_lite_path": str(config.milvus_lite_path),
         "milvus_collection": config.milvus_collection,
         "milvus_course_collection": config.milvus_course_collection,
+        "milvus_collections": configured_collection_names(config),
         "batch_concurrency": batch_concurrency(config),
         "config": {key: True for key in REQUIRED_CONFIG_KEYS},
         "errors": [],
@@ -120,6 +124,7 @@ def answer_question(
     query: str,
     top_n: int,
     top_k: int,
+    collections: Sequence[str] | None = None,
     project_root: Path | None = None,
     trace: TraceSink | None = None,
     on_thinking_delta: Callable[[str], None] | None = None,
@@ -144,6 +149,7 @@ def answer_question(
                 query=stripped_query,
                 top_n=top_n,
                 top_k=top_k,
+                collections=collections,
                 project_root=project_root,
                 trace=trace,
                 on_thinking_delta=on_thinking_delta,
@@ -153,6 +159,7 @@ def answer_question(
         query=stripped_query,
         top_n=top_n,
         top_k=top_k,
+        collections=collections,
         project_root=project_root,
         trace=trace,
         on_thinking_delta=on_thinking_delta,
@@ -165,6 +172,7 @@ def _answer_question_with_config(
     query: str,
     top_n: int,
     top_k: int,
+    collections: Sequence[str] | None = None,
     project_root: Path | None = None,
     trace: TraceSink | None = None,
     on_thinking_delta: Callable[[str], None] | None = None,
@@ -184,7 +192,11 @@ def _answer_question_with_config(
         )
         resources.append(embedding_client)
         try:
-            store = create_retrieval_store(config)
+            store = (
+                create_retrieval_store(config, collection_names=collections)
+                if collections
+                else create_retrieval_store(config)
+            )
         except Exception as exc:
             if config.milvus_mode == "lite" and _is_local_index_open_failure(exc):
                 raise ValueError(LOCAL_INDEX_UNAVAILABLE_ERROR) from exc
@@ -235,6 +247,7 @@ def answer_question_stream_events(
     query: str,
     top_n: int,
     top_k: int,
+    collections: Sequence[str] | None = None,
     project_root: Path | None = None,
 ) -> Iterator[dict[str, Any]]:
     events: Queue[dict[str, Any] | object] = Queue()
@@ -244,16 +257,19 @@ def answer_question_stream_events(
         trace: TraceSink | None = None
         try:
             trace = _web_stream_trace_sink(events)
-            response = answer_question(
-                query=query,
-                top_n=top_n,
-                top_k=top_k,
-                project_root=project_root,
-                trace=trace,
-                on_thinking_delta=lambda text: events.put(
+            kwargs: dict[str, Any] = {
+                "query": query,
+                "top_n": top_n,
+                "top_k": top_k,
+                "project_root": project_root,
+                "trace": trace,
+                "on_thinking_delta": lambda text: events.put(
                     {"type": "thinking_delta", "text": text}
                 ),
-            )
+            }
+            if collections:
+                kwargs["collections"] = collections
+            response = answer_question(**kwargs)
             events.put({"type": "_result", "response": response})
         except Exception as exc:  # noqa: BLE001 - converted to safe SSE at route boundary
             events.put({"type": "_exception", "exception": exc})

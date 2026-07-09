@@ -66,11 +66,315 @@ def test_server_registers_expected_tools():
     server = create_mcp_server(searcher=FakeSearcher())
     tools = asyncio.run(server.list_tools())
     tool_names = {tool.name for tool in tools}
+    assert tool_names == {"kb_list_knowledge_bases", "kb_search_knowledge"}
+
+
+def test_server_can_expose_legacy_tools_for_rollback():
+    server = create_mcp_server(searcher=FakeSearcher(), expose_legacy_tools=True)
+    tools = asyncio.run(server.list_tools())
+    tool_names = {tool.name for tool in tools}
+    assert tool_names == {
+        "kb_list_knowledge_bases",
+        "kb_search_knowledge",
+        "search_knowledge",
+        "retrieval_status",
+        "list_filter_options",
+    }
+
+
+def test_server_can_use_legacy_tool_profile():
+    server = create_mcp_server(searcher=FakeSearcher(), tool_profile="legacy")
+    tools = asyncio.run(server.list_tools())
+    tool_names = {tool.name for tool in tools}
     assert tool_names == {"search_knowledge", "retrieval_status", "list_filter_options"}
 
 
-def test_search_knowledge_exposes_query_and_optional_filters():
+def test_server_can_use_both_tool_profile():
+    server = create_mcp_server(searcher=FakeSearcher(), tool_profile="both")
+    tools = asyncio.run(server.list_tools())
+    tool_names = {tool.name for tool in tools}
+    assert tool_names == {
+        "kb_list_knowledge_bases",
+        "kb_search_knowledge",
+        "search_knowledge",
+        "retrieval_status",
+        "list_filter_options",
+    }
+
+
+def test_server_instructions_follow_tool_profile():
+    legacy_server = create_mcp_server(searcher=FakeSearcher(), tool_profile="legacy")
+    both_server = create_mcp_server(searcher=FakeSearcher(), tool_profile="both")
+
+    assert "search_knowledge" in legacy_server.instructions
+    assert "kb_search_knowledge" not in legacy_server.instructions
+    assert "kb_search_knowledge" in both_server.instructions
+    assert "search_knowledge" in both_server.instructions
+
+
+def test_tool_profile_from_env_file(tmp_path, monkeypatch):
+    monkeypatch.delenv("MCP_TOOL_PROFILE", raising=False)
+    env_file = tmp_path / ".env"
+    env_file.write_text("MCP_TOOL_PROFILE=legacy\n", encoding="utf-8")
+
+    assert mcp_server._tool_profile_from_env(env_file=env_file) == "legacy"
+
+
+def test_tool_profile_env_overrides_env_file(tmp_path, monkeypatch):
+    env_file = tmp_path / ".env"
+    env_file.write_text("MCP_TOOL_PROFILE=legacy\n", encoding="utf-8")
+    monkeypatch.setenv("MCP_TOOL_PROFILE", "both")
+
+    assert mcp_server._tool_profile_from_env(env_file=env_file) == "both"
+
+
+def test_tool_profile_rejects_invalid_value(tmp_path, monkeypatch):
+    monkeypatch.delenv("MCP_TOOL_PROFILE", raising=False)
+    env_file = tmp_path / ".env"
+    env_file.write_text("MCP_TOOL_PROFILE=old\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="MCP_TOOL_PROFILE"):
+        mcp_server._tool_profile_from_env(env_file=env_file)
+
+
+def test_kb_list_knowledge_bases_returns_wrapped_visible_kbs():
     server = create_mcp_server(searcher=FakeSearcher())
+
+    payload = _call_tool(server, "kb_list_knowledge_bases", {})
+
+    assert payload == {
+        "success": True,
+        "data": [
+            {
+                "kbId": 1,
+                "name": "保险绩优案例库",
+                "description": (
+                    "保险绩优案例销售知识，包含客户旅程、销售策略、"
+                    "场景话术和异议处理。"
+                ),
+            },
+            {
+                "kbId": 2,
+                "name": "培训课程库",
+                "description": "保险销售培训课程知识，包含课件、讲师备注和课程切片。",
+            },
+        ],
+        "errorCode": None,
+        "errorMessage": None,
+    }
+
+
+def test_kb_search_knowledge_exposes_documented_parameters():
+    server = create_mcp_server(searcher=FakeSearcher())
+    tools = asyncio.run(server.list_tools())
+    search_tool = next(tool for tool in tools if tool.name == "kb_search_knowledge")
+
+    properties = search_tool.inputSchema["properties"]
+    assert properties["query"] == {"title": "Query", "type": "string"}
+    assert properties["kbId"] == {"title": "Kbid", "type": "integer"}
+    assert properties["knowledgeTypes"]["default"] is None
+    assert properties["retrievalMode"]["default"] == "HYBRID"
+    assert properties["hybridWeights"]["default"] is None
+    assert properties["topK"]["default"] == 10
+    assert search_tool.inputSchema["required"] == ["query", "kbId"]
+
+
+def test_kb_search_knowledge_returns_wrapped_slice_results():
+    searcher = FakeSearcher(
+        result={
+            "results": [
+                {
+                    "chunk_id": "c1",
+                    "chunk_type": "script",
+                    "text": "先共情再澄清客户预算异议",
+                    "score": 0.4,
+                    "rerank_score": 0.98,
+                    "metadata": {
+                        "tag_paths": ["异议处理/预算"],
+                        "parent_id": "p1",
+                        "title_path": ["案例A", "预算异议"],
+                    },
+                    "citations": [{"source_path": "案例A/a.txt"}],
+                }
+            ]
+        }
+    )
+    server = create_mcp_server(searcher=searcher)
+
+    payload = _call_tool(
+        server,
+        "kb_search_knowledge",
+        {"query": "预算异议怎么处理", "kbId": 1, "topK": 5},
+    )
+
+    assert payload["success"] is True
+    assert payload["errorCode"] is None
+    assert payload["errorMessage"] is None
+    assert payload["data"] == [
+        {
+            "id": "c1",
+            "knowledgeType": "SLICE",
+            "score": 0.98,
+            "tags": ["异议处理/预算"],
+            "qa": None,
+            "slice": {
+                "content": "先共情再澄清客户预算异议",
+                "fullContent": "先共情再澄清客户预算异议",
+                "contentTruncated": False,
+                "sliceType": "script",
+                "parentId": "p1",
+                "titlePath": ["案例A", "预算异议"],
+                "parentSliceContext": None,
+                "citations": [{"source_path": "案例A/a.txt"}],
+            },
+            "knowledgePoint": None,
+        }
+    ]
+    assert searcher.calls == [
+        {
+            "query": "预算异议怎么处理",
+            "top_n": 20,
+            "top_k": 5,
+            "filters": {
+                "chunk_types": [
+                    "customer_journey",
+                    "strategy",
+                    "script",
+                    "objection_handling",
+                ]
+            },
+        }
+    ]
+
+
+def test_kb_search_knowledge_maps_course_kb_to_training_course_filter():
+    searcher = FakeSearcher()
+    server = create_mcp_server(searcher=searcher)
+
+    payload = _call_tool(
+        server,
+        "kb_search_knowledge",
+        {"query": "促成课程", "kbId": 2},
+    )
+
+    assert payload["success"] is True
+    assert searcher.calls == [
+        {
+            "query": "促成课程",
+            "top_n": 20,
+            "top_k": 10,
+            "filters": {"chunk_types": ["training_course"]},
+        }
+    ]
+
+
+def test_kb_search_knowledge_returns_empty_data_when_slice_not_requested():
+    searcher = FakeSearcher()
+    server = create_mcp_server(searcher=searcher)
+
+    payload = _call_tool(
+        server,
+        "kb_search_knowledge",
+        {"query": "预算异议", "kbId": 1, "knowledgeTypes": ["QA"]},
+    )
+
+    assert payload == {
+        "success": True,
+        "data": [],
+        "errorCode": None,
+        "errorMessage": None,
+    }
+    assert searcher.calls == []
+
+
+def test_kb_search_knowledge_returns_parameter_error_for_empty_query():
+    searcher = FakeSearcher()
+    server = create_mcp_server(searcher=searcher)
+
+    payload = _call_tool(
+        server,
+        "kb_search_knowledge",
+        {"query": "   ", "kbId": 1},
+    )
+
+    assert payload["success"] is False
+    assert payload["data"] is None
+    assert payload["errorCode"] == "10004"
+    assert payload["errorMessage"] == "参数错误: query 不能为空"
+    assert searcher.calls == []
+
+
+def test_kb_search_knowledge_returns_permission_error_for_unknown_kb():
+    searcher = FakeSearcher()
+    server = create_mcp_server(searcher=searcher)
+
+    payload = _call_tool(
+        server,
+        "kb_search_knowledge",
+        {"query": "客户经营", "kbId": 999},
+    )
+
+    assert payload == {
+        "success": False,
+        "data": None,
+        "errorCode": "10003",
+        "errorMessage": "当前用户对指定知识库无访问权限",
+    }
+    assert searcher.calls == []
+
+
+def test_kb_search_knowledge_returns_parameter_error_for_unsupported_mode():
+    server = create_mcp_server(searcher=FakeSearcher())
+
+    payload = _call_tool(
+        server,
+        "kb_search_knowledge",
+        {"query": "客户经营", "kbId": 1, "retrievalMode": "VECTOR"},
+    )
+
+    assert payload["success"] is False
+    assert payload["data"] is None
+    assert payload["errorCode"] == "10004"
+    assert payload["errorMessage"] == (
+        "参数错误: retrievalMode 暂时仅支持 HYBRID"
+    )
+
+
+def test_kb_search_knowledge_returns_parameter_error_for_invalid_top_k():
+    server = create_mcp_server(searcher=FakeSearcher())
+
+    payload = _call_tool(
+        server,
+        "kb_search_knowledge",
+        {"query": "客户经营", "kbId": 1, "topK": 51},
+    )
+
+    assert payload["success"] is False
+    assert payload["data"] is None
+    assert payload["errorCode"] == "10004"
+    assert payload["errorMessage"] == "参数错误: topK 必须在 1 到 50 之间"
+
+
+def test_kb_search_knowledge_masks_internal_error_in_wrapped_response():
+    searcher = FakeSearcher(
+        error=RuntimeError("Traceback /Users/secret/xhbx.db connection refused")
+    )
+    server = create_mcp_server(searcher=searcher)
+
+    payload = _call_tool(
+        server,
+        "kb_search_knowledge",
+        {"query": "客户经营", "kbId": 1},
+    )
+
+    assert payload["success"] is False
+    assert payload["data"] is None
+    assert payload["errorCode"] == "500"
+    assert payload["errorMessage"] == UNAVAILABLE_SEARCH_ERROR
+
+
+def test_search_knowledge_exposes_query_and_optional_filters():
+    server = create_mcp_server(searcher=FakeSearcher(), expose_legacy_tools=True)
     tools = asyncio.run(server.list_tools())
     search_tool = next(tool for tool in tools if tool.name == "search_knowledge")
 
@@ -90,7 +394,7 @@ def test_search_knowledge_returns_searcher_result():
         "results": [{"chunk_id": "c1", "text": "先共情再澄清"}],
     }
     searcher = FakeSearcher(result=expected)
-    server = create_mcp_server(searcher=searcher)
+    server = create_mcp_server(searcher=searcher, expose_legacy_tools=True)
 
     payload = _call_tool(
         server,
@@ -106,7 +410,7 @@ def test_search_knowledge_returns_searcher_result():
 
 def test_search_knowledge_uses_default_limits_and_strips_query():
     searcher = FakeSearcher()
-    server = create_mcp_server(searcher=searcher)
+    server = create_mcp_server(searcher=searcher, expose_legacy_tools=True)
 
     _call_tool(server, "search_knowledge", {"query": "  高净值客户开拓  "})
 
@@ -117,7 +421,7 @@ def test_search_knowledge_uses_default_limits_and_strips_query():
 
 def test_search_knowledge_passes_optional_filters():
     searcher = FakeSearcher()
-    server = create_mcp_server(searcher=searcher)
+    server = create_mcp_server(searcher=searcher, expose_legacy_tools=True)
 
     _call_tool(
         server,
@@ -146,7 +450,7 @@ def test_search_knowledge_passes_optional_filters():
 
 def test_search_knowledge_rejects_empty_query():
     searcher = FakeSearcher()
-    server = create_mcp_server(searcher=searcher)
+    server = create_mcp_server(searcher=searcher, expose_legacy_tools=True)
 
     with pytest.raises(ToolError, match="问题不能为空"):
         asyncio.run(server.call_tool("search_knowledge", {"query": "   "}))
@@ -157,7 +461,7 @@ def test_search_knowledge_masks_internal_error():
     searcher = FakeSearcher(
         error=RuntimeError("Traceback /Users/secret/xhbx.db connection refused")
     )
-    server = create_mcp_server(searcher=searcher)
+    server = create_mcp_server(searcher=searcher, expose_legacy_tools=True)
 
     with pytest.raises(ToolError) as exc_info:
         asyncio.run(server.call_tool("search_knowledge", {"query": "客户经营"}))
@@ -170,7 +474,7 @@ def test_search_knowledge_masks_internal_error():
 
 def test_search_knowledge_passes_through_safe_config_error():
     searcher = FakeSearcher(error=ConfigError("缺少必要环境变量: API_KEY, BASE_URL"))
-    server = create_mcp_server(searcher=searcher)
+    server = create_mcp_server(searcher=searcher, expose_legacy_tools=True)
 
     with pytest.raises(ToolError, match="缺少必要环境变量: API_KEY, BASE_URL"):
         asyncio.run(server.call_tool("search_knowledge", {"query": "客户经营"}))
@@ -180,7 +484,7 @@ def test_search_knowledge_masks_tampered_config_error():
     searcher = FakeSearcher(
         error=ConfigError("缺少必要环境变量: /etc/passwd 泄漏内容")
     )
-    server = create_mcp_server(searcher=searcher)
+    server = create_mcp_server(searcher=searcher, expose_legacy_tools=True)
 
     with pytest.raises(ToolError) as exc_info:
         asyncio.run(server.call_tool("search_knowledge", {"query": "客户经营"}))
@@ -192,7 +496,7 @@ def test_search_knowledge_masks_tampered_config_error():
 
 def test_search_knowledge_passes_through_local_index_error():
     searcher = FakeSearcher(error=ValueError(LOCAL_INDEX_UNAVAILABLE_ERROR))
-    server = create_mcp_server(searcher=searcher)
+    server = create_mcp_server(searcher=searcher, expose_legacy_tools=True)
 
     with pytest.raises(ToolError, match="本地 Milvus 索引暂时不可用"):
         asyncio.run(server.call_tool("search_knowledge", {"query": "客户经营"}))
@@ -209,6 +513,7 @@ def test_retrieval_status_returns_provider_payload():
     server = create_mcp_server(
         searcher=FakeSearcher(),
         status_provider=lambda: expected,
+        expose_legacy_tools=True,
     )
 
     payload = _call_tool(server, "retrieval_status", {})
@@ -223,6 +528,7 @@ def test_retrieval_status_masks_provider_error():
     server = create_mcp_server(
         searcher=FakeSearcher(),
         status_provider=broken_provider,
+        expose_legacy_tools=True,
     )
 
     with pytest.raises(ToolError) as exc_info:
@@ -246,6 +552,7 @@ def test_list_filter_options_returns_provider_payload():
     server = create_mcp_server(
         searcher=FakeSearcher(),
         filter_options_provider=provider,
+        expose_legacy_tools=True,
     )
 
     payload = _call_tool(server, "list_filter_options", {})
@@ -259,6 +566,7 @@ def test_list_filter_options_masks_provider_error():
     server = create_mcp_server(
         searcher=FakeSearcher(),
         filter_options_provider=provider,
+        expose_legacy_tools=True,
     )
 
     with pytest.raises(ToolError) as exc_info:
@@ -302,9 +610,8 @@ def test_create_default_server_without_injection():
     server = create_mcp_server()
     tools = asyncio.run(server.list_tools())
     assert {tool.name for tool in tools} == {
-        "search_knowledge",
-        "retrieval_status",
-        "list_filter_options",
+        "kb_list_knowledge_bases",
+        "kb_search_knowledge",
     }
 
 

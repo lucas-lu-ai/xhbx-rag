@@ -5,6 +5,7 @@ import logging
 import math
 import re
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -431,14 +432,51 @@ def create_milvus_store(config: Any, collection_name: str | None = None) -> Milv
     )
 
 
-def create_retrieval_store(config: Any) -> MultiCollectionStore:
-    """构建生产读路径的聚合检索视图：案例库 + 课程库。"""
+def create_retrieval_store(
+    config: Any,
+    collection_names: Sequence[str] | None = None,
+) -> MultiCollectionStore:
+    """构建生产读路径的聚合检索视图，可按请求选择 collection。"""
+    selected_names = _selected_collection_names(config, collection_names)
     return MultiCollectionStore(
         [
-            create_milvus_store(config),
-            create_milvus_store(config, collection_name=config.milvus_course_collection),
+            create_milvus_store(
+                config,
+                collection_name=(
+                    None if name == config.milvus_collection else name
+                ),
+            )
+            for name in selected_names
         ]
     )
+
+
+def configured_collection_names(config: Any) -> list[str]:
+    return _dedupe_collection_names(
+        [
+            getattr(config, "milvus_collection", ""),
+            getattr(config, "milvus_course_collection", ""),
+        ]
+    )
+
+
+def _selected_collection_names(
+    config: Any,
+    collection_names: Sequence[str] | None,
+) -> list[str]:
+    if collection_names is None:
+        return configured_collection_names(config)
+    selected = _dedupe_collection_names(collection_names)
+    return selected or configured_collection_names(config)
+
+
+def _dedupe_collection_names(collection_names: Sequence[str]) -> list[str]:
+    selected: list[str] = []
+    for collection_name in collection_names:
+        normalized = str(collection_name).strip()
+        if normalized and normalized not in selected:
+            selected.append(normalized)
+    return selected
 
 
 def _build_filter_expr(filters: dict[str, Any]) -> str:

@@ -7,6 +7,8 @@ export type StatusResponse = {
   milvus_target: string;
   milvus_lite_path: string;
   milvus_collection: string;
+  milvus_course_collection?: string;
+  milvus_collections?: string[];
   batch_concurrency: number;
   config: ConfigStatus;
   errors: string[];
@@ -88,6 +90,7 @@ export type AnswerRequest = {
   query: string;
   top_n?: number;
   top_k?: number;
+  collections?: string[];
 };
 
 export type AnswerProcessStep = {

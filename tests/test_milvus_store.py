@@ -141,6 +141,34 @@ def test_create_milvus_store_uses_docker_uri_and_token(monkeypatch) -> None:
     assert calls == [{"uri": "http://127.0.0.1:19530", "kwargs": {"token": "root:Milvus"}}]
 
 
+def test_create_retrieval_store_uses_selected_collection_names(monkeypatch) -> None:
+    created = []
+
+    def fake_create_milvus_store(config, collection_name=None):
+        resolved = collection_name or config.milvus_collection
+        created.append(resolved)
+        return SimpleNamespace(
+            collection_name=resolved,
+            client=SimpleNamespace(has_collection=lambda name: True),
+        )
+
+    monkeypatch.setattr(milvus_store, "create_milvus_store", fake_create_milvus_store)
+
+    store = milvus_store.create_retrieval_store(
+        SimpleNamespace(
+            milvus_collection="case_chunks",
+            milvus_course_collection="course_chunks",
+        ),
+        collection_names=["course_chunks", "case_chunks", "course_chunks"],
+    )
+
+    assert created == ["course_chunks", "case_chunks"]
+    assert [item.collection_name for item in store.stores] == [
+        "course_chunks",
+        "case_chunks",
+    ]
+
+
 def test_milvus_lite_store_round_trips_records(tmp_path) -> None:
     store = MilvusLiteStore(
         db_path=tmp_path / "rag.db",

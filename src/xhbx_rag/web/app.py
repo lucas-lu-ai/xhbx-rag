@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
@@ -77,6 +78,7 @@ _ALLOWED_BAD_CASE_PROBLEM_TAGS = {
     "other",
 }
 _ALLOWED_EVIDENCE_FEEDBACK_JUDGEMENTS = {"should_use", "should_not_use", "ranking_low"}
+_COLLECTION_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 class AnswerRequest(BaseModel):
@@ -85,6 +87,7 @@ class AnswerRequest(BaseModel):
     query: str = Field(min_length=1)
     top_n: int = Field(default=20, ge=1, le=100, strict=True)
     top_k: int = Field(default=5, ge=1, le=20, strict=True)
+    collections: list[str] = Field(default_factory=list, max_length=20)
 
     @field_validator("query")
     @classmethod
@@ -92,6 +95,22 @@ class AnswerRequest(BaseModel):
         if not value.strip():
             raise ValueError("问题不能为空")
         return value
+
+    @field_validator("collections")
+    @classmethod
+    def _collections_valid(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for value in values:
+            collection = value.strip()
+            if (
+                not collection
+                or len(collection) > 255
+                or not _COLLECTION_NAME_RE.fullmatch(collection)
+            ):
+                raise ValueError("collection 名称不支持")
+            if collection not in normalized:
+                normalized.append(collection)
+        return normalized
 
     @model_validator(mode="after")
     def _top_k_not_greater_than_top_n(self) -> AnswerRequest:
@@ -226,11 +245,14 @@ def create_app(
     @web_app.post("/api/answer")
     def answer(request: AnswerRequest) -> dict[str, Any]:
         try:
-            return answer_question(
-                query=request.query,
-                top_n=request.top_n,
-                top_k=request.top_k,
-            )
+            kwargs: dict[str, Any] = {
+                "query": request.query,
+                "top_n": request.top_n,
+                "top_k": request.top_k,
+            }
+            if request.collections:
+                kwargs["collections"] = request.collections
+            return answer_question(**kwargs)
         except ValueError as exc:
             message = str(exc)
             if message == LOCAL_INDEX_UNAVAILABLE_ERROR:
@@ -245,11 +267,14 @@ def create_app(
 
     @web_app.post("/api/answer/stream")
     def answer_stream(request: AnswerRequest) -> StreamingResponse:
-        events = answer_question_stream_events(
-            query=request.query,
-            top_n=request.top_n,
-            top_k=request.top_k,
-        )
+        kwargs: dict[str, Any] = {
+            "query": request.query,
+            "top_n": request.top_n,
+            "top_k": request.top_k,
+        }
+        if request.collections:
+            kwargs["collections"] = request.collections
+        events = answer_question_stream_events(**kwargs)
         return StreamingResponse(
             _sse_answer_events(events),
             media_type="text/event-stream",
