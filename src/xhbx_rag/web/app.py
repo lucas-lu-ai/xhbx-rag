@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from .bad_cases import save_bad_case
 from .batch_routes import router as batch_router
+from .a2a_routes import router as a2a_router
 from .batch_runner import BatchRunner
 from .batch_store import BatchRunStore
 from .safe_errors import (
@@ -305,6 +306,7 @@ def create_app(
             raise HTTPException(status_code=500, detail=BAD_CASE_SAVE_ERROR_DETAIL) from exc
         return {"ok": True, "bad_case_id": result["bad_case_id"]}
 
+    web_app.include_router(a2a_router)
     web_app.include_router(batch_router)
 
     return web_app
