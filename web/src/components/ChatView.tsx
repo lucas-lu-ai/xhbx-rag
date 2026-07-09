@@ -19,14 +19,10 @@ import {
   sessionTitleForQuestion,
   validateLimits
 } from "../chatSessions";
-import type {
-  AnswerResponse,
-  ChatSession,
-  ChatTurn,
-  Citation
-} from "../types";
+import type { AnswerResponse, ChatSession, ChatTurn } from "../types";
 import { BadCasePanel } from "./BadCasePanel";
-import { firstCitationSelection } from "./EvidenceList";
+import { firstEvidenceKey, useEvidenceDetail } from "./EvidenceDetailContext";
+import { MarkdownMessage } from "./MarkdownMessage";
 import { ProcessTimeline } from "./ProcessTimeline";
 import { ThinkingProcess } from "./ThinkingProcess";
 
@@ -40,20 +36,10 @@ type ChatViewProps = {
     updater: (turns: ChatTurn[]) => ChatTurn[],
     title?: string
   ) => void;
-  selectedCitationKey: string | null;
-  onSelectCitation: (
-    citation: Citation | null,
-    key: string | null,
-    response: AnswerResponse | null
-  ) => void;
 };
 
-export function ChatView({
-  session,
-  onUpdateSession,
-  selectedCitationKey,
-  onSelectCitation
-}: ChatViewProps) {
+export function ChatView({ session, onUpdateSession }: ChatViewProps) {
+  const { onSelectEvidence } = useEvidenceDetail();
   const [query, setQuery] = useState("");
   const [topN, setTopN] = useState(DEFAULT_TOP_N);
   const [topK, setTopK] = useState(DEFAULT_TOP_K);
@@ -128,7 +114,7 @@ export function ChatView({
               onUpdateSession(submittedSessionId, (items) =>
                 completeTurn(items, id, streamEvent.response)
               );
-              selectFirstCitation(id, streamEvent.response);
+              selectFirstEvidence(id, streamEvent.response);
             }
           }
         }
@@ -136,27 +122,25 @@ export function ChatView({
       onUpdateSession(submittedSessionId, (items) =>
         completeTurn(items, id, response)
       );
-      selectFirstCitation(id, response);
+      selectFirstEvidence(id, response);
     } catch (error) {
       const message = error instanceof Error ? error.message : "问答失败";
       onUpdateSession(submittedSessionId, (items) => failTurn(items, id, message));
     }
   }
 
-  function selectFirstCitation(turnId: string, response: AnswerResponse) {
+  // 回答完成后自动选中第一条证据（优先答案引用的），右侧直接出明细。
+  function selectFirstEvidence(turnId: string, response: AnswerResponse) {
     if (!mountedRef.current) {
       return;
     }
-    const first = firstCitationSelection(
-      turnId,
-      response.citations,
-      response.retrieval_evidences ?? []
+    onSelectEvidence(
+      firstEvidenceKey(
+        turnId,
+        response.citations,
+        response.retrieval_evidences ?? []
+      )
     );
-    if (first) {
-      onSelectCitation(first.citation, first.key, response);
-    } else {
-      onSelectCitation(null, null, response);
-    }
   }
 
   function handleQueryKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -174,7 +158,7 @@ export function ChatView({
 
   function clearTurns() {
     onUpdateSession(session.id, () => []);
-    onSelectCitation(null, null, null);
+    onSelectEvidence(null);
   }
 
   return (
@@ -235,27 +219,20 @@ export function ChatView({
                       turn.is_streaming && !turn.response && !turn.streaming_answer
                     )}
                   />
-                  <p>
-                    {turn.response?.answer ||
-                      turn.streaming_answer ||
-                      "正在生成回答..."}
-                  </p>
+                  {turn.response?.answer || turn.streaming_answer ? (
+                    <MarkdownMessage
+                      content={turn.response?.answer || turn.streaming_answer || ""}
+                    />
+                  ) : (
+                    <p>正在生成回答...</p>
+                  )}
                   {turn.response?.rewritten_query && (
                     <p className="meta-text">
                       改写问题：{turn.response.rewritten_query}
                     </p>
                   )}
                   {turn.response && (
-                    <BadCasePanel
-                      turn={turn}
-                      response={turn.response}
-                      selectedCitationKey={selectedCitationKey}
-                      onSelectCitation={(citation, key) => {
-                        if (turn.response) {
-                          onSelectCitation(citation, key, turn.response);
-                        }
-                      }}
-                    />
+                    <BadCasePanel turn={turn} response={turn.response} />
                   )}
                 </div>
               )}

@@ -23,6 +23,8 @@ def test_docker_deployment_files_exist() -> None:
         "docs/docker-compose部署.md",
         "scripts/package_mcp_offline.sh",
         "scripts/load_mcp_offline.sh",
+        "scripts/test_mcp.sh",
+        "scripts/debug_mcp_search.sh",
     ]
 
     missing = [path for path in expected_files if not (ROOT / path).is_file()]
@@ -165,6 +167,8 @@ def test_package_mcp_offline_script_exports_images_and_deploy_files() -> None:
     assert 'cp "$COMPOSE_FILE" "$PACKAGE_DIR/docker-compose.mcp.yml"' in script
     assert 'cp .env.mcp.example "$PACKAGE_DIR/.env.mcp.example"' in script
     assert 'cp scripts/index_parsed.sh "$PACKAGE_DIR/scripts/index_parsed.sh"' in script
+    assert 'cp scripts/test_mcp.sh "$PACKAGE_DIR/scripts/test_mcp.sh"' in script
+    assert 'cp scripts/debug_mcp_search.sh "$PACKAGE_DIR/scripts/debug_mcp_search.sh"' in script
     assert 'cp scripts/load_mcp_offline.sh "$PACKAGE_DIR/load_mcp_offline.sh"' in script
     assert 'INCLUDE_PARSED="${INCLUDE_PARSED:-true}"' in script
 
@@ -178,6 +182,34 @@ def test_load_mcp_offline_script_loads_images_and_starts_without_build() -> None
     assert 'docker load -i "$IMAGE_TAR"' in script
     assert 'cp .env.mcp.example .env.mcp' in script
     assert 'compose -f docker-compose.mcp.yml up -d --no-build' in script
+
+
+def test_mcp_test_script_covers_status_and_optional_search() -> None:
+    script = read_repo_file("scripts/test_mcp.sh")
+
+    assert 'MCP_URL="${MCP_URL:-http://127.0.0.1:${MCP_PORT:-9331}/mcp}"' in script
+    assert "Accept: application/json, text/event-stream" in script
+    assert '"method":"initialize"' in script
+    assert '"method":"tools/list"' in script
+    assert '"name":"retrieval_status"' in script
+    assert '\\"name\\":\\"search_knowledge\\"' in script
+    assert 'QUERY="${1:-${QUERY:-}}"' in script
+    assert "curl -fsS -N" in script
+
+
+def test_debug_mcp_search_script_runs_direct_search_in_container() -> None:
+    script = read_repo_file("scripts/debug_mcp_search.sh")
+
+    assert 'COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.mcp.yml}"' in script
+    assert 'QUERY="${1:-${QUERY:-客户说预算不够怎么办？}}"' in script
+    assert "docker-compose \"$@\"" in script
+    assert "docker compose \"$@\"" in script
+    assert 'compose -f "$COMPOSE_FILE" exec -T' in script
+    assert 'mcp python -' in script
+    assert "RetrievalConfig.from_env(require_chat=False)" in script
+    assert "_direct_search_evidence(" in script
+    assert "EmbeddingClient(" in script
+    assert "RerankClient(" in script
 
 
 def test_gitignore_excludes_mcp_env_and_offline_packages() -> None:

@@ -90,8 +90,10 @@ docker save --platform "$DOCKER_PLATFORM" -o "$PACKAGE_DIR/images.tar" $IMAGES
 cp "$COMPOSE_FILE" "$PACKAGE_DIR/docker-compose.mcp.yml"
 cp .env.mcp.example "$PACKAGE_DIR/.env.mcp.example"
 cp scripts/index_parsed.sh "$PACKAGE_DIR/scripts/index_parsed.sh"
+cp scripts/test_mcp.sh "$PACKAGE_DIR/scripts/test_mcp.sh"
+cp scripts/debug_mcp_search.sh "$PACKAGE_DIR/scripts/debug_mcp_search.sh"
 cp scripts/load_mcp_offline.sh "$PACKAGE_DIR/load_mcp_offline.sh"
-chmod +x "$PACKAGE_DIR/load_mcp_offline.sh" "$PACKAGE_DIR/scripts/index_parsed.sh"
+chmod +x "$PACKAGE_DIR/load_mcp_offline.sh" "$PACKAGE_DIR/scripts/index_parsed.sh" "$PACKAGE_DIR/scripts/test_mcp.sh" "$PACKAGE_DIR/scripts/debug_mcp_search.sh"
 
 if [ "$INCLUDE_PARSED" = "true" ] && [ -d parsed ]; then
   cp -R parsed "$PACKAGE_DIR/parsed"
@@ -134,7 +136,27 @@ docker-compose -f docker-compose.mcp.yml exec mcp scripts/index_parsed.sh
 docker-compose -f docker-compose.mcp.yml exec -e RESET_COLLECTION=true mcp scripts/index_parsed.sh
 ```
 
-## 3. MCP 客户端地址
+## 3. 测试 MCP 服务
+
+只测服务和工具列表：
+
+```bash
+scripts/test_mcp.sh
+```
+
+带检索问题测试：
+
+```bash
+scripts/test_mcp.sh "客户说预算不够怎么办？"
+```
+
+如果 `search_knowledge` 只返回安全兜底错误，用下面命令查看容器内真实异常：
+
+```bash
+scripts/debug_mcp_search.sh "客户说预算不够怎么办？"
+```
+
+## 4. MCP 客户端地址
 
 默认监听宿主机 `127.0.0.1:9331`。如需可信内网直连，在 `.env.mcp` 中设置：
 

@@ -1,5 +1,12 @@
-import { LoaderCircle, Play, RefreshCcw } from "lucide-react";
-import { useState } from "react";
+import {
+  ArrowLeft,
+  ChevronLeft,
+  ChevronRight,
+  LoaderCircle,
+  Play,
+  RefreshCcw
+} from "lucide-react";
+import { useEffect, useState } from "react";
 import writeExcelFile from "write-excel-file/universal";
 
 import {
@@ -28,31 +35,22 @@ import {
   useBatchRunPolling
 } from "../hooks/useBatchRunPolling";
 import type {
-  AnswerResponse,
   BadCaseRequest,
   BatchRunDetail,
-  BatchRunQuestionDetail,
-  Citation
+  BatchRunQuestionDetail
 } from "../types";
 import { BadCasePanel } from "./BadCasePanel";
+import { firstEvidenceKey, useEvidenceDetail } from "./EvidenceDetailContext";
 
 type BatchRunViewProps = {
   runId: string;
   pollIntervalMs?: number;
-  selectedCitationKey: string | null;
-  onSelectCitation: (
-    citation: Citation,
-    key: string,
-    response: AnswerResponse
-  ) => void;
   onRunMutated?: () => void;
 };
 
 export function BatchRunView({
   runId,
   pollIntervalMs,
-  selectedCitationKey,
-  onSelectCitation,
   onRunMutated
 }: BatchRunViewProps) {
   const { detail, loadError, pollError, refresh, patchDetail } =
@@ -60,6 +58,9 @@ export function BatchRunView({
   const [actionError, setActionError] = useState("");
   const [resuming, setResuming] = useState(false);
   const [exporting, setExporting] = useState(false);
+  // 列表屏/详情屏切换：记录打开的行号（row_index），null 表示列表屏。
+  const [openRowIndex, setOpenRowIndex] = useState<number | null>(null);
+  const { onSelectEvidence } = useEvidenceDetail();
 
   async function handleRetry(rowIndex: number) {
     setActionError("");
@@ -169,6 +170,46 @@ export function BatchRunView({
     };
   }
 
+  const questions = detail?.questions ?? [];
+  const openPosition =
+    openRowIndex === null
+      ? -1
+      : questions.findIndex((question) => question.row_index === openRowIndex);
+  const openQuestion = openPosition >= 0 ? questions[openPosition] : undefined;
+
+  // 进入详情或轮询补全回答后，自动选中该行第一条证据联动右侧明细。
+  // 依赖用字符串 key：轮询替换 detail 对象但 key 未变时不重跑，
+  // 不会覆盖用户手动选中的证据。
+  const autoSelectKey = openQuestion?.response
+    ? firstEvidenceKey(
+        `row-${openQuestion.row_index}`,
+        openQuestion.response.citations,
+        openQuestion.response.retrieval_evidences ?? []
+      )
+    : null;
+  useEffect(() => {
+    if (openRowIndex === null) {
+      return;
+    }
+    onSelectEvidence(autoSelectKey);
+  }, [openRowIndex, autoSelectKey, onSelectEvidence]);
+
+  function openRow(rowIndex: number) {
+    setOpenRowIndex(rowIndex);
+  }
+
+  function backToList() {
+    setOpenRowIndex(null);
+    onSelectEvidence(null);
+  }
+
+  function openByPosition(position: number) {
+    const target = questions[position];
+    if (target) {
+      setOpenRowIndex(target.row_index);
+    }
+  }
+
   if (!detail) {
     return (
       <section className="batch-panel" aria-label="批量会话">
@@ -195,6 +236,105 @@ export function BatchRunView({
       ?.feedback_result;
     return Boolean(question.bad_case) && feedbackResult !== "usable";
   });
+
+  if (openQuestion) {
+    return (
+      <section className="batch-panel" aria-label="批量会话">
+        <div className="batch-detail-toolbar">
+          <button
+            className="secondary-button compact-button"
+            type="button"
+            onClick={backToList}
+          >
+            <ArrowLeft size={16} aria-hidden="true" />
+            返回列表
+          </button>
+          <span className="meta-text">
+            第 {openPosition + 1} / {questions.length} 行
+          </span>
+          <span
+            className={
+              openQuestion.status === "succeeded"
+                ? "status-chip"
+                : "status-chip muted"
+            }
+          >
+            {batchQuestionStatusLabel(openQuestion.status)}
+          </span>
+          {openQuestion.status === "failed" && (
+            <button
+              className="secondary-button compact-button"
+              type="button"
+              onClick={() => void handleRetry(openQuestion.row_index)}
+            >
+              <RefreshCcw size={16} aria-hidden="true" />
+              重试
+            </button>
+          )}
+          <div className="batch-detail-nav">
+            <button
+              className="secondary-button compact-button"
+              type="button"
+              disabled={openPosition <= 0}
+              onClick={() => openByPosition(openPosition - 1)}
+            >
+              <ChevronLeft size={16} aria-hidden="true" />
+              上一行
+            </button>
+            <button
+              className="secondary-button compact-button"
+              type="button"
+              disabled={openPosition >= questions.length - 1}
+              onClick={() => openByPosition(openPosition + 1)}
+            >
+              下一行
+              <ChevronRight size={16} aria-hidden="true" />
+            </button>
+          </div>
+        </div>
+        {actionError && (
+          <p className="form-error" role="alert">
+            {actionError}
+          </p>
+        )}
+
+        <article className="turn batch-detail-turn">
+          <div className="message user-message">{openQuestion.query}</div>
+          <div className="message answer-message">
+            {openQuestion.status === "running" && !openQuestion.response && (
+              <p className="meta-text">
+                <LoaderCircle className="spin" size={14} aria-hidden="true" />{" "}
+                正在生成回答...
+              </p>
+            )}
+            {openQuestion.status === "pending" && !openQuestion.response && (
+              <p className="meta-text">等待执行...</p>
+            )}
+            {openQuestion.error && (
+              <p className="form-error">{openQuestion.error}</p>
+            )}
+            {openQuestion.response && <p>{openQuestion.response.answer}</p>}
+            {openQuestion.response?.rewritten_query && (
+              <p className="meta-text">
+                改写问题：{openQuestion.response.rewritten_query}
+              </p>
+            )}
+            <div className="batch-original-answer">
+              <span>人工答案</span>
+              <p>{openQuestion.input_answer.trim() || "未提供"}</p>
+            </div>
+            {openQuestion.response && (
+              <BadCasePanel
+                turn={batchQuestionDetailToChatTurn(openQuestion)}
+                response={openQuestion.response}
+                submit={submitRowBadCase(openQuestion)}
+              />
+            )}
+          </div>
+        </article>
+      </section>
+    );
+  }
 
   return (
     <section className="batch-panel" aria-label="批量会话">
@@ -241,17 +381,43 @@ export function BatchRunView({
         )}
       </div>
 
-      <ol className="batch-result-list">
-        {detail.questions.map((question, index) => (
-          <li key={`row-${question.row_index}`}>
-            <BatchRunRow
-              index={index}
-              question={question}
-              selectedCitationKey={selectedCitationKey}
-              onSelectCitation={onSelectCitation}
-              onRetry={() => void handleRetry(question.row_index)}
-              submitBadCase={submitRowBadCase(question)}
-            />
+      <ol className="batch-row-list" aria-label="批量问题列表">
+        {detail.questions.map((question) => (
+          <li className="batch-row" key={`row-${question.row_index}`}>
+            <button
+              className="batch-row-main"
+              type="button"
+              onClick={() => openRow(question.row_index)}
+            >
+              <span className="batch-row-index">{question.row_index}</span>
+              <span className="batch-row-query">{question.query}</span>
+              {question.bad_case !== null && (
+                <span className="status-chip muted">已反馈</span>
+              )}
+              {question.status === "running" && (
+                <LoaderCircle className="spin" size={14} aria-hidden="true" />
+              )}
+              <span
+                className={
+                  question.status === "succeeded"
+                    ? "status-chip"
+                    : "status-chip muted"
+                }
+              >
+                {batchQuestionStatusLabel(question.status)}
+              </span>
+              <ChevronRight size={15} aria-hidden="true" />
+            </button>
+            {question.status === "failed" && (
+              <button
+                className="secondary-button compact-button"
+                type="button"
+                onClick={() => void handleRetry(question.row_index)}
+              >
+                <RefreshCcw size={16} aria-hidden="true" />
+                重试
+              </button>
+            )}
           </li>
         ))}
       </ol>
@@ -275,91 +441,5 @@ export function BatchRunView({
         </button>
       </div>
     </section>
-  );
-}
-
-function BatchRunRow({
-  index,
-  question,
-  selectedCitationKey,
-  onSelectCitation,
-  onRetry,
-  submitBadCase
-}: {
-  index: number;
-  question: BatchRunQuestionDetail;
-  selectedCitationKey: string | null;
-  onSelectCitation: (
-    citation: Citation,
-    key: string,
-    response: AnswerResponse
-  ) => void;
-  onRetry: () => void;
-  submitBadCase: (payload: BadCaseRequest) => Promise<unknown>;
-}) {
-  const response = question.response ?? undefined;
-
-  return (
-    <article className="batch-result-item">
-      <div className="batch-result-heading">
-        <strong>问题 {index + 1}</strong>
-        <div className="batch-actions">
-          <span className="status-chip muted">第 {question.row_index} 行</span>
-          <span
-            className={
-              question.status === "succeeded" ? "status-chip" : "status-chip muted"
-            }
-          >
-            {batchQuestionStatusLabel(question.status)}
-          </span>
-          {question.status === "failed" && (
-            <button
-              className="secondary-button compact-button"
-              type="button"
-              onClick={onRetry}
-            >
-              <RefreshCcw size={16} aria-hidden="true" />
-              重试
-            </button>
-          )}
-        </div>
-      </div>
-      <p>{question.query}</p>
-      <div className="batch-original-answer">
-        <span>原答案</span>
-        <p>{question.input_answer.trim() || "未提供"}</p>
-      </div>
-      {(question.status !== "pending" || response || question.error) && (
-        <div className="batch-original-answer">
-          <span>模型答案</span>
-          {question.status === "running" && !response && (
-            <p className="meta-text">
-              <LoaderCircle className="spin" size={14} aria-hidden="true" />{" "}
-              正在生成回答...
-            </p>
-          )}
-          {question.error ? (
-            <p className="form-error">{question.error}</p>
-          ) : (
-            response && <p>{response.answer}</p>
-          )}
-          {response?.rewritten_query && (
-            <p className="meta-text">改写问题：{response.rewritten_query}</p>
-          )}
-          {response && (
-            <BadCasePanel
-              turn={batchQuestionDetailToChatTurn(question)}
-              response={response}
-              submit={submitBadCase}
-              initiallySubmitted={Boolean(question.bad_case)}
-              selectedCitationKey={selectedCitationKey}
-              onSelectCitation={(citation, key) =>
-                onSelectCitation(citation, key, response)
-              }
-            />
-          )}
-        </div>
-      )}
-    </article>
   );
 }

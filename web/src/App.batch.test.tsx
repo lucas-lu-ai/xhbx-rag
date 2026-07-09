@@ -150,8 +150,12 @@ test("开始批量运行创建服务端任务并切换到批量会话", async ()
   await user.click(screen.getByRole("button", { name: "解析内容" }));
   await user.click(screen.getByRole("button", { name: "开始批量运行" }));
 
+  // 批量列表屏只显示问题与状态，答案在行详情屏。
+  const qaPanel = screen.getByRole("main", { name: "RAG 问答" });
   expect(
-    await screen.findByText("先承接预算，再讨论缴费期和保障缺口。")
+    await within(qaPanel).findByRole("button", {
+      name: /客户说每年不能超过80万怎么办？/
+    })
   ).toBeInTheDocument();
   expect(requests).toContainEqual(
     expect.objectContaining({
@@ -227,8 +231,11 @@ test("POST 进行中禁用开始批量运行按钮", async () => {
 
   createResponse.resolve(jsonResponse(summary, { status: 201 }));
 
+  const qaPanel = screen.getByRole("main", { name: "RAG 问答" });
   expect(
-    await screen.findByText("先承接预算，再讨论缴费期和保障缺口。")
+    await within(qaPanel).findByRole("button", {
+      name: /客户说每年不能超过80万怎么办？/
+    })
   ).toBeInTheDocument();
 });
 
@@ -275,13 +282,26 @@ test("批量会话轮询进度直到终态并展示行状态", async () => {
   });
   render(<App batchPollIntervalMs={5} listPollIntervalMs={5} />);
 
+  // 轮询到终态后列表屏行状态与批次统计更新。
+  expect(await screen.findByText("完成 1")).toBeInTheDocument();
+  expect(screen.getAllByText("已完成").length).toBeGreaterThan(0);
+  expect(screen.getByText("总数 1")).toBeInTheDocument();
+  expect(screen.getByText("失败 0")).toBeInTheDocument();
+
+  // 点击行进入会话式详情屏可看到模型答案。
+  const user = userEvent.setup();
+  const qaPanel = screen.getByRole("main", { name: "RAG 问答" });
+  await user.click(
+    within(qaPanel).getByRole("button", {
+      name: /客户说每年不能超过80万怎么办？/
+    })
+  );
   expect(
     await screen.findByText("先承接预算，再讨论缴费期和保障缺口。")
   ).toBeInTheDocument();
-  expect(screen.getAllByText("已完成").length).toBeGreaterThan(0);
-  expect(screen.getByText("总数 1")).toBeInTheDocument();
-  expect(screen.getByText("完成 1")).toBeInTheDocument();
-  expect(screen.getByText("失败 0")).toBeInTheDocument();
+  // “人工答案”既是区块标签又是夹具内容，允许多处命中。
+  expect(screen.getAllByText("人工答案").length).toBeGreaterThan(0);
+  expect(screen.getByText("返回列表")).toBeInTheDocument();
 });
 
 test("失败行展示错误并支持重试", async () => {
@@ -330,8 +350,15 @@ test("失败行展示错误并支持重试", async () => {
   });
   render(<App />);
 
+  // 列表屏显示失败状态与重试入口，错误详情在行详情屏。
+  expect(await screen.findByText("失败")).toBeInTheDocument();
+  const qaPanel = screen.getByRole("main", { name: "RAG 问答" });
+  await user.click(
+    within(qaPanel).getByRole("button", {
+      name: /客户说每年不能超过80万怎么办？/
+    })
+  );
   expect(await screen.findByText("问答服务暂时不可用")).toBeInTheDocument();
-  expect(screen.getByText("失败")).toBeInTheDocument();
 
   await user.click(screen.getByRole("button", { name: "重试" }));
 
@@ -388,9 +415,7 @@ test("中断的批量会话支持继续执行", async () => {
 
   await user.click(screen.getByRole("button", { name: "继续执行" }));
 
-  expect(
-    await screen.findByText("先承接预算，再讨论缴费期和保障缺口。")
-  ).toBeInTheDocument();
+  expect(await screen.findByText("完成 1")).toBeInTheDocument();
   expect(requests).toContainEqual(
     expect.objectContaining({
       url: "/api/batch-runs/run-1/resume",
@@ -430,8 +455,11 @@ test("导出回填文件走 include_table 详情并复用回填纯函数", async
   });
   render(<App />);
 
+  const qaPanel = screen.getByRole("main", { name: "RAG 问答" });
   expect(
-    await screen.findByText("先承接预算，再讨论缴费期和保障缺口。")
+    await within(qaPanel).findByRole("button", {
+      name: /客户说每年不能超过80万怎么办？/
+    })
   ).toBeInTheDocument();
 
   await user.click(screen.getByRole("button", { name: "下载回填文件" }));
@@ -552,21 +580,36 @@ test("批量行反馈只调批量单入口并本地更新 bad_case", async () =>
   });
   render(<App />);
 
-  await user.click(await screen.findByRole("button", { name: "不完整" }));
-  await user.click(screen.getByLabelText("缺关键话术"));
-  await user.type(screen.getByLabelText("哪里不对"), "当前回答没有讲清楚保障缺口。");
-  await user.type(screen.getByLabelText("正确回答应包含什么"), "应该命中保障缺口分析。");
-  await user.click(screen.getByRole("button", { name: "保存反馈" }));
+  // 反馈操作在行详情屏内完成：批量不再有回答级反馈，
+  // 证据“不该用”带理由直接落地行级 bad case。
+  const qaPanel = screen.getByRole("main", { name: "RAG 问答" });
+  await user.click(
+    await within(qaPanel).findByRole("button", {
+      name: /客户说每年不能超过80万怎么办？/
+    })
+  );
+  expect(
+    await screen.findByText("先承接预算，再讨论缴费期和保障缺口。")
+  ).toBeInTheDocument();
+  expect(screen.queryByText("这个回答可用吗？")).not.toBeInTheDocument();
 
-  expect(await screen.findByText("反馈已保存。")).toBeInTheDocument();
+  await user.click(await screen.findByLabelText("证据 1 不该用"));
+  await user.type(
+    screen.getByLabelText("不可用理由"),
+    "该证据与客户问题无关。"
+  );
+  await user.click(screen.getByRole("button", { name: "保存不可用反馈" }));
+
+  expect(await screen.findByText("已记录不可用反馈。")).toBeInTheDocument();
   expect(requests).toContainEqual(
     expect.objectContaining({
       url: "/api/batch-runs/run-1/rows/1/bad-case",
       method: "POST",
       body: expect.objectContaining({
         query: "客户说每年不能超过80万怎么办？",
-        feedback_result: "incomplete",
-        problem_tags: ["missing_talk_track"],
+        feedback_result: "citation_issue",
+        issue_types: ["citation_issue"],
+        problem_detail: "该证据与客户问题无关。",
         input_answer: "人工答案",
         batch_source_label: "qa.csv"
       })
@@ -575,11 +618,13 @@ test("批量行反馈只调批量单入口并本地更新 bad_case", async () =>
   expect(
     requests.filter((request) => request.url.endsWith("/api/bad-cases"))
   ).toHaveLength(0);
-  // 本地已回写 bad_case，导出按钮无需等待下一次轮询即可用。
+  // 本地已回写 bad_case：返回列表后行带“已反馈”徽标，导出按钮无需等待下一次轮询即可用。
+  await user.click(screen.getByRole("button", { name: "返回列表" }));
+  expect(screen.getByText("已反馈")).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "下载 bad case JSONL" })).toBeEnabled();
 });
 
-test("批量视图引用选中态使用稳定 key 并联动证据面板", async () => {
+test("批量行详情自动选中证据并联动右侧明细", async () => {
   const user = userEvent.setup();
   installStorageStub().setItem(
     "xhbx-rag.active-session.v1",
@@ -597,24 +642,32 @@ test("批量视图引用选中态使用稳定 key 并联动证据面板", async 
   });
   render(<App />);
 
+  const qaPanel = screen.getByRole("main", { name: "RAG 问答" });
+  await user.click(
+    await within(qaPanel).findByRole("button", {
+      name: /客户说每年不能超过80万怎么办？/
+    })
+  );
   expect(
     await screen.findByText("先承接预算，再讨论缴费期和保障缺口。")
   ).toBeInTheDocument();
 
+  // 进入详情屏自动选中第一条证据，右侧明细展示正文与来源摘录。
+  const detailPane = screen.getByRole("complementary", {
+    name: "索引和溯源"
+  });
+  expect(
+    await within(detailPane).findByText("证据 1 · 异议处理")
+  ).toBeInTheDocument();
+  expect(
+    within(detailPane).getByText("data/案例A/第2节.track-0.txt")
+  ).toBeInTheDocument();
+
+  // 展开紧凑证据列表，选中行处于按下状态。
+  await user.click(screen.getByRole("button", { name: /检索证据/ }));
   const evidenceList = await screen.findByRole("region", {
     name: "检索证据列表"
   });
-  expect(
-    within(evidenceList).getByText(
-      "客户担心预算，可以先承接预算，再对齐保障缺口。"
-    )
-  ).toBeInTheDocument();
-
-  const sourceButton = within(evidenceList).getByRole("button", {
-    name: "第2节.track-0.txt · L1"
-  });
-  await user.click(sourceButton);
-
-  expect(sourceButton).toHaveAttribute("aria-pressed", "true");
-  expect(screen.getByText("data/案例A/第2节.track-0.txt")).toBeInTheDocument();
+  const rows = within(evidenceList).getAllByRole("button");
+  expect(rows[0]).toHaveAttribute("aria-pressed", "true");
 });

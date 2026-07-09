@@ -1,12 +1,7 @@
-import {
-  AlertCircle,
-  Database,
-  ExternalLink,
-  FileText
-} from "lucide-react";
+import { AlertCircle, Database, FileText } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { ApiError, deleteBatchRun, getStatus, listBatchRuns, revealSource } from "./api";
+import { ApiError, deleteBatchRun, getStatus, listBatchRuns } from "./api";
 import {
   latestSessionSelection,
   mergeSessionEntries,
@@ -25,16 +20,18 @@ import {
 import { BatchCreateView } from "./components/BatchCreateView";
 import { BatchRunView } from "./components/BatchRunView";
 import { ChatView } from "./components/ChatView";
+import {
+  EvidenceDetailContext,
+  type EvidenceDetailContextValue
+} from "./components/EvidenceDetailContext";
 import { SessionSidebar } from "./components/SessionSidebar";
 import {
   loadSessionSelection,
   persistSessionSelection
 } from "./sessionSelection";
 import type {
-  AnswerResponse,
   BatchRunSummary,
   ChatTurn,
-  Citation,
   SessionSelection,
   StatusResponse
 } from "./types";
@@ -75,13 +72,14 @@ export function App({
     loadSessionSelection
   );
   const [creatingBatch, setCreatingBatch] = useState(false);
-  const [selectedCitation, setSelectedCitation] = useState<Citation | null>(null);
-  const [selectedCitationKey, setSelectedCitationKey] = useState<string | null>(
+  // 右侧证据明细：App 只持有选中 key 与 portal 容器，
+  // 明细内容由拥有反馈状态的 BadCasePanel portal 进来。
+  const [selectedEvidenceKey, setSelectedEvidenceKey] = useState<string | null>(
     null
   );
-  const [batchCitationResponse, setBatchCitationResponse] =
-    useState<AnswerResponse | null>(null);
-  const [revealMessage, setRevealMessage] = useState("");
+  const [detailContainer, setDetailContainer] = useState<HTMLElement | null>(
+    null
+  );
 
   // 选中态归一：批量按原样保留，聊天校验会话存在性后回退。
   const effectiveSelection = useMemo<SessionSelection>(() => {
@@ -211,18 +209,24 @@ export function App({
     }
   }, [batchRunsLoaded, batchRuns, selection, sessionStore.sessions]);
 
-  const resetCitationState = useCallback(() => {
-    setSelectedCitation(null);
-    setSelectedCitationKey(null);
-    setBatchCitationResponse(null);
-    setRevealMessage("");
+  const resetEvidenceSelection = useCallback(() => {
+    setSelectedEvidenceKey(null);
   }, []);
+
+  const evidenceDetailContext = useMemo<EvidenceDetailContextValue>(
+    () => ({
+      container: detailContainer,
+      selectedEvidenceKey,
+      onSelectEvidence: setSelectedEvidenceKey
+    }),
+    [detailContainer, selectedEvidenceKey]
+  );
 
   function selectSession(nextSelection: SessionSelection) {
     setSelection(nextSelection);
     setCreatingBatch(false);
     setDeleteError("");
-    resetCitationState();
+    resetEvidenceSelection();
     if (nextSelection.kind === "chat") {
       setSessionStore((current) => ({
         ...current,
@@ -244,7 +248,7 @@ export function App({
   function startBatchCreate() {
     setCreatingBatch(true);
     setDeleteError("");
-    resetCitationState();
+    resetEvidenceSelection();
   }
 
   function handleBatchCreated(summary: BatchRunSummary) {
@@ -262,7 +266,7 @@ export function App({
     setSessionStore(nextStore);
     if (effectiveSelection.kind === "chat" && effectiveSelection.id === sessionId) {
       setSelection({ kind: "chat", id: nextStore.active_session_id });
-      resetCitationState();
+      resetEvidenceSelection();
     }
   }
 
@@ -303,42 +307,15 @@ export function App({
     );
   }
 
-  function handleCitationSelect(
-    citation: Citation | null,
-    key: string | null,
-    response: AnswerResponse | null
-  ) {
-    setSelectedCitation(citation);
-    setSelectedCitationKey(key);
-    setRevealMessage("");
-    if (effectiveSelection.kind === "batch") {
-      setBatchCitationResponse(response);
-    }
-  }
-
-  async function handleReveal() {
-    if (!selectedCitation?.source_path) {
-      return;
-    }
-
-    try {
-      await revealSource({ source_path: selectedCitation.source_path });
-      setRevealMessage("已在 Finder 中显示文件。");
-    } catch (error) {
-      setRevealMessage(error instanceof Error ? error.message : "无法显示文件。");
-    }
-  }
-
   const chatLatestResponse = useMemo(
     () => latestResponseFromTurns(activeChatSession.turns),
     [activeChatSession.turns]
   );
-  const evidenceResponse =
-    effectiveSelection.kind === "batch"
-      ? batchCitationResponse ?? undefined
-      : chatLatestResponse;
+  const hasEvidenceContext =
+    effectiveSelection.kind === "batch" || Boolean(chatLatestResponse);
 
   return (
+    <EvidenceDetailContext.Provider value={evidenceDetailContext}>
     <div className="app-shell">
       <SessionSidebar
         chatSessions={sessionStore.sessions}
@@ -375,8 +352,6 @@ export function App({
             key={effectiveSelection.id}
             runId={effectiveSelection.id}
             pollIntervalMs={batchPollIntervalMs}
-            selectedCitationKey={selectedCitationKey}
-            onSelectCitation={handleCitationSelect}
             onRunMutated={() => void refetchBatchRuns()}
           />
         ) : (
@@ -384,8 +359,6 @@ export function App({
             key={activeChatSession.id}
             session={activeChatSession}
             onUpdateSession={updateSessionTurns}
-            selectedCitationKey={selectedCitationKey}
-            onSelectCitation={handleCitationSelect}
           />
         )}
       </main>
@@ -417,60 +390,19 @@ export function App({
         <section className="source-detail">
           <div className="pane-heading">
             <FileText size={20} aria-hidden="true" />
-            <h2>溯源详情</h2>
+            <h2>证据明细</h2>
           </div>
-          {!selectedCitation ? (
+          <div className="evidence-detail-slot" ref={setDetailContainer} />
+          {!selectedEvidenceKey && (
             <p className="empty-source">
-              {evidenceResponse ? "请选择一个引用。" : "暂无引用。"}
+              {hasEvidenceContext
+                ? "点击一条检索证据查看明细。"
+                : "暂无证据。"}
             </p>
-          ) : (
-            <div className="source-stack">
-              <div className="detail-block">
-                <span>文件</span>
-                <strong>
-                  {selectedCitation.source_path ||
-                    selectedCitation.filename ||
-                    "未知文件"}
-                </strong>
-              </div>
-              <div className="detail-grid">
-                <div className="detail-block">
-                  <span>类型</span>
-                  <strong>{selectedCitation.source_type || "未知"}</strong>
-                </div>
-                <div className="detail-block">
-                  <span>位置</span>
-                  <strong>
-                    {selectedCitation.display_location || "未提供精确位置"}
-                  </strong>
-                </div>
-              </div>
-              <div className="detail-block">
-                <span>定位</span>
-                <strong>{selectedCitation.locator_confidence || "未提供"}</strong>
-              </div>
-              <div className="excerpt-box">
-                <span>原文摘录</span>
-                <p>
-                  {selectedCitation.display_excerpt ||
-                    selectedCitation.quote ||
-                    "没有摘录内容。"}
-                </p>
-              </div>
-              <button
-                className="secondary-button"
-                type="button"
-                disabled={!selectedCitation.can_reveal}
-                onClick={handleReveal}
-              >
-                <ExternalLink size={18} aria-hidden="true" />
-                在 Finder 中显示文件
-              </button>
-              {revealMessage && <p className="meta-text">{revealMessage}</p>}
-            </div>
           )}
         </section>
       </aside>
     </div>
+    </EvidenceDetailContext.Provider>
   );
 }

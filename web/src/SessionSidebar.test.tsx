@@ -145,7 +145,9 @@ test("删除批量会话成功后从列表移除并回退到最新条目", async
   render(<App />);
 
   expect(
-    await screen.findByText("先承接预算，再讨论缴费期和保障缺口。")
+    await within(
+      screen.getByRole("main", { name: "RAG 问答" })
+    ).findByRole("button", { name: /客户说每年不能超过80万怎么办？/ })
   ).toBeInTheDocument();
 
   await user.click(
@@ -196,8 +198,11 @@ test("删除运行中的批量会话返回 409 时保持选中并展示后端 de
   });
   render(<App />);
 
+  const qaPanel = screen.getByRole("main", { name: "RAG 问答" });
   expect(
-    await screen.findByText("先承接预算，再讨论缴费期和保障缺口。")
+    await within(qaPanel).findByRole("button", {
+      name: /客户说每年不能超过80万怎么办？/
+    })
   ).toBeInTheDocument();
 
   await user.click(
@@ -209,7 +214,9 @@ test("删除运行中的批量会话返回 409 时保持选中并展示后端 de
   ).toBeInTheDocument();
   expect(screen.getAllByText("批量测试").length).toBeGreaterThan(0);
   expect(
-    screen.getByText("先承接预算，再讨论缴费期和保障缺口。")
+    within(qaPanel).getByRole("button", {
+      name: /客户说每年不能超过80万怎么办？/
+    })
   ).toBeInTheDocument();
 });
 
@@ -235,7 +242,9 @@ test("刷新后恢复选中的批量会话", async () => {
   render(<App />);
 
   expect(
-    await screen.findByText("先承接预算，再讨论缴费期和保障缺口。")
+    await within(
+      screen.getByRole("main", { name: "RAG 问答" })
+    ).findByRole("button", { name: /客户说每年不能超过80万怎么办？/ })
   ).toBeInTheDocument();
   const sidebar = screen.getByRole("navigation", { name: "历史会话" });
   const batchItem = within(sidebar)

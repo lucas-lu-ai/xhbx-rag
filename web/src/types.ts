@@ -183,6 +183,8 @@ export type EvidenceFeedback = {
   judgement: EvidenceFeedbackJudgement;
   label: string;
   text_preview: string;
+  // “不该用”反馈附带的不可用理由；后端 evidence_feedback 为宽松 dict，可透传。
+  reason?: string;
 };
 
 export type BadCaseRequest = {
