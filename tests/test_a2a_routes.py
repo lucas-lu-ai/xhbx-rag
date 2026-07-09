@@ -1,4 +1,5 @@
 from fastapi.testclient import TestClient
+import pytest
 from uuid import UUID
 
 import xhbx_rag.web.app as web_app
@@ -325,6 +326,23 @@ def test_tasks_send_rejects_invalid_jsonrpc_request() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [[], None, "", "not-object", 123],
+)
+def test_tasks_send_rejects_invalid_jsonrpc_request_payload_not_object(payload: object) -> None:
+    client = TestClient(web_app.create_app())
+
+    response = client.post("/a2a/xhbx-rag-answer", json=payload)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "jsonrpc": "2.0",
+        "id": None,
+        "error": {"code": -32600, "message": "JSON-RPC 请求格式不合法"},
+    }
+
+
 def test_tasks_send_masks_internal_error(monkeypatch) -> None:
     def fail_answer_question(*, query: str, top_n: int, top_k: int) -> dict:
         raise RuntimeError("secret-token leaked from /Users/milan/.env")
@@ -387,4 +405,34 @@ def test_tasks_send_passes_safe_answer_error(monkeypatch) -> None:
         "jsonrpc": "2.0",
         "id": 1,
         "error": {"code": -32000, "message": detail},
+    }
+
+
+def test_tasks_send_masks_internal_error_when_answer_result_is_not_mapping(monkeypatch) -> None:
+    def fail_answer_question(*, query: str, top_n: int, top_k: int) -> str:
+        return "not-a-mapping"
+
+    monkeypatch.setattr(a2a_routes, "answer_question", fail_answer_question)
+    client = TestClient(web_app.create_app())
+
+    response = client.post(
+        "/a2a/xhbx-rag-answer",
+        json={
+            "jsonrpc": "2.0",
+            "method": "tasks/send",
+            "params": {
+                "message": {
+                    "role": "user",
+                    "parts": [{"type": "text", "text": "保单整理有什么作用？"}],
+                }
+            },
+            "id": 1,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": {"code": -32000, "message": "问答服务暂时不可用"},
     }

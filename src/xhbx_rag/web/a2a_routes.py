@@ -4,7 +4,7 @@ import logging
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Body, Request
 
 from .safe_errors import answer_exception_detail
 from .services import answer_question
@@ -58,7 +58,7 @@ def agent_card(request: Request) -> dict[str, Any]:
 
 
 @router.post("")
-def handle_jsonrpc(payload: dict[str, Any]) -> dict[str, Any]:
+def handle_jsonrpc(payload: Any = Body(default=None)) -> dict[str, Any]:
     request_id = payload.get("id") if isinstance(payload, dict) else None
     if not _is_valid_jsonrpc_envelope(payload):
         return _jsonrpc_error(request_id, INVALID_REQUEST, "JSON-RPC 请求格式不合法")
@@ -82,23 +82,22 @@ def handle_jsonrpc(payload: dict[str, Any]) -> dict[str, Any]:
 
     try:
         result = answer_question(query=query, top_n=DEFAULT_TOP_N, top_k=DEFAULT_TOP_K)
+        task_id = str(params.get("id") or uuid4())
+        session_id = str(params.get("sessionId") or uuid4())
+        return {
+            "jsonrpc": JSONRPC_VERSION,
+            "id": request_id,
+            "result": _completed_task(
+                task_id=task_id,
+                session_id=session_id,
+                answer=result.get("answer", ""),
+                request_metadata=params.get("metadata"),
+                answer_result=result,
+            ),
+        }
     except Exception as exc:  # noqa: BLE001 - A2A boundary returns safe error only
         logger.exception("A2A tasks/send failed")
         return _jsonrpc_error(request_id, SERVER_ERROR, answer_exception_detail(exc))
-
-    task_id = str(params.get("id") or uuid4())
-    session_id = str(params.get("sessionId") or uuid4())
-    return {
-        "jsonrpc": JSONRPC_VERSION,
-        "id": request_id,
-        "result": _completed_task(
-            task_id=task_id,
-            session_id=session_id,
-            answer=result.get("answer", ""),
-            request_metadata=params.get("metadata"),
-            answer_result=result,
-        ),
-    }
 
 
 def _is_valid_jsonrpc_envelope(payload: Any) -> bool:
