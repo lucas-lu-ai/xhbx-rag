@@ -4,7 +4,7 @@ import logging
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter, Body, Request
+from fastapi import APIRouter, Request
 
 from .safe_errors import answer_exception_detail
 from .services import answer_question
@@ -58,7 +58,12 @@ def agent_card(request: Request) -> dict[str, Any]:
 
 
 @router.post("")
-def handle_jsonrpc(payload: Any = Body(default=None)) -> dict[str, Any]:
+async def handle_jsonrpc(request: Request) -> dict[str, Any]:
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001 - malformed JSON must map to JSON-RPC error
+        return _jsonrpc_error(None, INVALID_REQUEST, "JSON-RPC 请求格式不合法")
+
     request_id = payload.get("id") if isinstance(payload, dict) else None
     if not _is_valid_jsonrpc_envelope(payload):
         return _jsonrpc_error(request_id, INVALID_REQUEST, "JSON-RPC 请求格式不合法")
@@ -82,8 +87,8 @@ def handle_jsonrpc(payload: Any = Body(default=None)) -> dict[str, Any]:
 
     try:
         result = answer_question(query=query, top_n=DEFAULT_TOP_N, top_k=DEFAULT_TOP_K)
-        task_id = str(params.get("id") or uuid4())
-        session_id = str(params.get("sessionId") or uuid4())
+        task_id = _normalize_task_identifier(params.get("id"), "id")
+        session_id = _normalize_task_identifier(params.get("sessionId"), "sessionId")
         return {
             "jsonrpc": JSONRPC_VERSION,
             "id": request_id,
@@ -119,8 +124,8 @@ def _jsonrpc_error(request_id: Any, code: int, message: str) -> dict[str, Any]:
 
 def _completed_task(
     *,
-    task_id: str,
-    session_id: str,
+    task_id: Any,
+    session_id: Any,
     answer: Any,
     request_metadata: Any,
     answer_result: dict[str, Any],
@@ -165,15 +170,26 @@ def _extract_query(message: Any) -> str:
     parts = message.get("parts")
     if not isinstance(parts, list):
         raise ValueError("A2A message.parts 格式不合法")
-    text_parts = [
-        str(part.get("text", ""))
-        for part in parts
-        if isinstance(part, dict) and part.get("type") == "text"
-    ]
+    text_parts = []
+    for part in parts:
+        if not isinstance(part, dict) or part.get("type") != "text":
+            continue
+        text = part.get("text")
+        if not isinstance(text, str):
+            raise ValueError("A2A message.parts[].text 必须是字符串")
+        text_parts.append(text)
     query = "\n".join(text_parts).strip()
     if not query:
         raise ValueError("问题不能为空")
     return query
+
+
+def _normalize_task_identifier(value: Any, field_name: str) -> Any:
+    if value is None:
+        return str(uuid4())
+    if isinstance(value, str) and not value.strip():
+        raise ValueError(f"A2A {field_name} 不能为空")
+    return value
 
 
 def _agent_url(request: Request) -> str:
