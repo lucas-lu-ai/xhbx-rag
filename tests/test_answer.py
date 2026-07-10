@@ -9,6 +9,7 @@ import pytest
 from xhbx_rag.answer import (
     AnswerAgent,
     AnswerGenerationError,
+    GeneratedAnswer,
     IncompleteModelOutputError,
     _retry_messages,
     answer_from_search_result,
@@ -385,6 +386,31 @@ def test_answer_agent_retries_incomplete_streams(
     assert expected_error in http.calls[1]["json"]["messages"][-1]["content"]
 
 
+def test_answer_agent_retries_overly_deep_sse_payload_safely(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="xhbx_rag.answer")
+    sentinel = "SSE-DEEP-PAYLOAD-SENTINEL"
+    deeply_nested_payload = (
+        "[" * 10_000 + json.dumps(sentinel) + "]" * 10_000
+    )
+    http = _SequencedFakeSseClient(
+        [
+            _sse_lines(deeply_nested_payload),
+            _answer_sse_lines("SSE 深层载荷后纠错成功。", [1], reasoning_parts=()),
+        ]
+    )
+
+    result = _agent(http).generate(_search_result())
+
+    assert result.answer == "SSE 深层载荷后纠错成功。"
+    assert len(http.calls) == 2
+    retry_messages = http.calls[1]["json"]["messages"]
+    assert "SSE 数据块解析失败: JSON 嵌套过深" in retry_messages[-1]["content"]
+    assert sentinel not in str(retry_messages)
+    assert sentinel not in caplog.text
+
+
 def test_answer_agent_retries_transport_interruption_after_partial_content() -> None:
     class _PartialThenValidClient(_SequencedFakeSseClient):
         @contextmanager
@@ -689,6 +715,28 @@ def test_answer_agent_sanitizes_validation_error_in_retry_feedback() -> None:
     assert "ValidationError" in correction
     assert "string_type" in correction
     assert "answer" in correction
+
+
+def test_answer_agent_propagates_programming_recursion_error_without_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    http = _FakeSseClient(
+        _answer_sse_lines("模型校验前正文有效。", [1], reasoning_parts=())
+    )
+
+    def fail_validation(data: object) -> GeneratedAnswer:
+        raise RecursionError("PROGRAMMING-SENTINEL")
+
+    monkeypatch.setattr(
+        GeneratedAnswer,
+        "model_validate",
+        staticmethod(fail_validation),
+    )
+
+    with pytest.raises(RecursionError, match="PROGRAMMING-SENTINEL"):
+        _agent(http).generate(_search_result())
+
+    assert len(http.calls) == 1
 
 
 def test_answer_agent_sanitizes_pydantic_failure_traceback() -> None:

@@ -183,12 +183,24 @@ class AnswerAgent:
             stream_result = self._stream_chat_content(body, attempt_thinking_parts)
             thinking_parts.extend(attempt_thinking_parts)
             content = stream_result.content
+            model_output_error: ValueError | RecursionError | None = None
             try:
                 _require_complete_stream(stream_result)
-                data = json.loads(_strip_json_fences(content))
-                generated = GeneratedAnswer.model_validate(data)
-            except (ValueError, RecursionError) as exc:
-                last_error = _safe_model_error_summary(exc)
+            except ValueError as exc:
+                model_output_error = exc
+            else:
+                try:
+                    data = json.loads(_strip_json_fences(content))
+                except (json.JSONDecodeError, RecursionError) as exc:
+                    model_output_error = exc
+                else:
+                    try:
+                        generated = GeneratedAnswer.model_validate(data)
+                    except ValidationError as exc:
+                        model_output_error = exc
+
+            if model_output_error is not None:
+                last_error = _safe_model_error_summary(model_output_error)
                 if attempt == MODEL_OUTPUT_ATTEMPTS:
                     break
                 retry_notice = (
@@ -201,7 +213,7 @@ class AnswerAgent:
                     "answer correction retry attempt=%d error_type=%s "
                     "content_chars=%d saw_done=%s finish_reason=%s",
                     attempt,
-                    type(exc).__name__,
+                    type(model_output_error).__name__,
                     len(content),
                     stream_result.saw_done,
                     _safe_finish_reason_for_log(stream_result.finish_reason),
@@ -209,7 +221,7 @@ class AnswerAgent:
                 messages = _retry_messages(
                     base_messages,
                     invalid_content=content,
-                    error=exc,
+                    error=model_output_error,
                 )
                 continue
             return generated.model_copy(update={"reasoning": "".join(thinking_parts)})
@@ -251,6 +263,15 @@ class AnswerAgent:
                             break
                         try:
                             delta, chunk_finish_reason = _chunk_event(data)
+                        except RecursionError:
+                            return _StreamChatResult(
+                                content="".join(content_parts),
+                                saw_done=False,
+                                finish_reason=finish_reason,
+                                stream_error=(
+                                    "SSE 数据块解析失败: JSON 嵌套过深"
+                                ),
+                            )
                         except ValueError as exc:
                             return _StreamChatResult(
                                 content="".join(content_parts),
