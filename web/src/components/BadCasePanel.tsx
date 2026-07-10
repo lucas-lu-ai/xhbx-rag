@@ -174,6 +174,7 @@ export function BadCasePanel({
           <EvidenceDetail
             key={selectedEvidenceKey}
             evidence={selectedEvidence}
+            relatedEvidences={evidences}
             index={selectedEvidenceIndex}
             cited={citedIndexes.has(selectedEvidenceIndex + 1)}
             feedbackJudgement={

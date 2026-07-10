@@ -1517,6 +1517,122 @@ dd {
   white-space: pre-wrap;
 }
 
+.related-script-tokens {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.related-script-token {
+  display: inline-flex;
+  align-items: center;
+  min-height: 26px;
+  border: 1px solid rgb(124 58 237 / 0.35);
+  border-radius: 999px;
+  background: rgb(245 243 255 / 0.86);
+  color: #5b21b6;
+  padding: 2px 9px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 800;
+  line-height: 1.35;
+  cursor: pointer;
+  transition:
+    background 160ms ease,
+    border-color 160ms ease,
+    color 160ms ease;
+}
+
+.related-script-token:hover {
+  border-color: rgb(124 58 237 / 0.58);
+  background: rgb(237 233 254 / 0.96);
+  color: #4c1d95;
+}
+
+.related-script-token:focus-visible {
+  outline: 2px solid rgb(124 58 237 / 0.42);
+  outline-offset: 2px;
+}
+
+.related-script-token[aria-expanded="true"] {
+  border-color: rgb(124 58 237 / 0.72);
+  background: rgb(237 233 254);
+  color: #4c1d95;
+}
+
+.related-script-separator {
+  color: var(--color-muted);
+}
+
+.related-script-detail {
+  grid-column: 2 / -1;
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  border: 1px solid rgb(124 58 237 / 0.18);
+  border-radius: 8px;
+  background: rgb(250 245 255 / 0.42);
+  padding: 10px 12px;
+}
+
+.related-script-detail-heading,
+.related-script-detail-row,
+.related-script-detail-list {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.related-script-detail-heading {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  border-bottom: 1px dashed rgb(148 163 184 / 0.32);
+  padding-bottom: 7px;
+}
+
+.related-script-detail-heading strong {
+  min-width: 0;
+  color: #5b21b6;
+  overflow-wrap: anywhere;
+}
+
+.related-script-detail-heading span,
+.related-script-detail-row span,
+.related-script-detail-list > span {
+  color: var(--color-muted);
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1.45;
+}
+
+.related-script-detail-row {
+  margin: 0;
+}
+
+.related-script-detail-row strong {
+  min-width: 0;
+  color: var(--color-foreground);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.related-script-detail-list ul {
+  display: grid;
+  gap: 3px;
+  margin: 0;
+  padding-left: 18px;
+}
+
+.related-script-detail-list li {
+  color: var(--color-foreground);
+  font-size: 13px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
 .evidence-tag-hits {
   display: flex;
   flex-wrap: wrap;

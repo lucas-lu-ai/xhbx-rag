@@ -346,6 +346,60 @@ test("来源原文默认折叠，点击标题展开、再点击折叠", async ()
   ).not.toBeInTheDocument();
 });
 
+test("关联话术保持 ID 展示，点击后内联展开完整话术", async () => {
+  const user = userEvent.setup();
+  const structured: RetrievalEvidence = {
+    ...evidence,
+    text: [
+      "案例：案例A",
+      "知识类型：异议处理",
+      "客户异议：保险收益不如银行/产品有坏处吗（精明型客户）",
+      "推荐回应：坦诚告知流动性限制",
+      "关联话术：script_009"
+    ].join("\n"),
+    metadata: {
+      case_name: "案例A",
+      related_script_ids: ["script_009"],
+      related_script_details: [
+        {
+          script_id: "script_009",
+          stage: "产品讲解/异议处理",
+          scenario: "精明型客户质疑保险收益不如银行理财或有坏处",
+          customer_trigger: "客户直接询问收益率、流动性限制或产品缺陷",
+          goal: "坦诚披露弊端以赢得信任",
+          source_quote:
+            "短期没有，长期任何一家金融工具不能和保险相抗衡。",
+          coach_wording:
+            "王总，坦白讲，保险短期内确实没有高收益，本金也有锁定期。",
+          strategy_names: ["性格四象限差异化沟通策略"],
+          follow_up_questions: ["您是否更看重长期确定的现金流安排？"],
+          compliance_notes: ["严禁夸大分红或万能账户结算利率"]
+        }
+      ]
+    }
+  };
+  render(<EvidenceDetail evidence={structured} index={0} cited={false} />);
+
+  const scriptButton = screen.getByRole("button", { name: "script_009" });
+  expect(scriptButton).toHaveAttribute("aria-expanded", "false");
+  expect(
+    screen.queryByText("精明型客户质疑保险收益不如银行理财或有坏处")
+  ).not.toBeInTheDocument();
+
+  await user.click(scriptButton);
+
+  expect(scriptButton).toHaveAttribute("aria-expanded", "true");
+  expect(
+    screen.getByText("精明型客户质疑保险收益不如银行理财或有坏处")
+  ).toBeInTheDocument();
+  expect(
+    screen.getByText("王总，坦白讲，保险短期内确实没有高收益，本金也有锁定期。")
+  ).toBeInTheDocument();
+  expect(
+    screen.getByText("严禁夸大分红或万能账户结算利率")
+  ).toBeInTheDocument();
+});
+
 test("AI 归纳的 bullet 块默认展开", () => {
   const structured: RetrievalEvidence = {
     ...evidence,

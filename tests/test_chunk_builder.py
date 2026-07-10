@@ -93,3 +93,27 @@ def test_script_chunk_contains_retrieval_text_metadata_and_citations() -> None:
     assert "销售技能/沟通谈判/保险理念沟通" in script_chunk.text
     assert script_chunk.text.count("标签：") == 1
     assert script_chunk.citations[0].quote == "客户不想聊保险。"
+
+
+def test_objection_chunk_metadata_includes_related_script_details() -> None:
+    objection_chunk = [
+        chunk
+        for chunk in build_chunks(_knowledge())
+        if chunk.chunk_type == "objection_handling"
+    ][0]
+
+    assert objection_chunk.metadata["related_script_ids"] == ["script_001"]
+    assert objection_chunk.metadata["related_script_details"] == [
+        {
+            "script_id": "script_001",
+            "stage": "售前",
+            "scenario": "客户抗拒保险",
+            "customer_trigger": "客户不想聊保险",
+            "goal": "打开话题",
+            "source_quote": "客户不想聊保险。",
+            "coach_wording": "先聊家庭责任。",
+            "strategy_names": ["风险唤醒"],
+            "follow_up_questions": ["现在家庭责任主要集中在哪里？"],
+            "compliance_notes": ["不承诺收益"],
+        }
+    ]

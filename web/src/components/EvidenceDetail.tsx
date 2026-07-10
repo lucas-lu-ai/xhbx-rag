@@ -6,7 +6,7 @@ import {
   LoaderCircle,
   Save
 } from "lucide-react";
-import { useState } from "react";
+import { Fragment, useId, useState } from "react";
 
 import { revealSource } from "../api";
 import {
@@ -65,11 +65,296 @@ function EvidenceSourceBlock({
   );
 }
 
+type RelatedScriptDetail = {
+  script_id: string;
+  stage?: string;
+  scenario?: string;
+  customer_trigger?: string;
+  goal?: string;
+  source_quote?: string;
+  coach_wording?: string;
+  strategy_names?: string[];
+  follow_up_questions?: string[];
+  compliance_notes?: string[];
+};
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function stringValue(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function splitDelimited(value: string): string[] {
+  return value
+    .split(/[、,，]/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function stringList(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item).trim()).filter(Boolean);
+  }
+  if (typeof value === "string") {
+    return splitDelimited(value);
+  }
+  return [];
+}
+
+function relatedScriptFromRecord(
+  record: Record<string, unknown>
+): RelatedScriptDetail | null {
+  const scriptId = stringValue(record.script_id);
+  if (!scriptId) {
+    return null;
+  }
+  return {
+    script_id: scriptId,
+    stage: stringValue(record.stage) || undefined,
+    scenario: stringValue(record.scenario) || undefined,
+    customer_trigger: stringValue(record.customer_trigger) || undefined,
+    goal: stringValue(record.goal) || undefined,
+    source_quote: stringValue(record.source_quote) || undefined,
+    coach_wording: stringValue(record.coach_wording) || undefined,
+    strategy_names: stringList(record.strategy_names),
+    follow_up_questions: stringList(record.follow_up_questions),
+    compliance_notes: stringList(record.compliance_notes)
+  };
+}
+
+function relatedScriptFromEvidence(
+  evidence: RetrievalEvidence
+): RelatedScriptDetail | null {
+  const metadata = evidence.metadata ?? {};
+  const segments = parseEvidenceText(evidence.text || "");
+  const fields = new Map<string, string>();
+  const blocks = new Map<string, string[]>();
+  for (const segment of segments) {
+    if (segment.kind === "field") {
+      fields.set(segment.label, segment.value);
+    }
+    if (segment.kind === "block") {
+      blocks.set(segment.label, segment.items);
+    }
+  }
+  const scriptId = stringValue(metadata.script_id) || fields.get("话术 ID") || "";
+  if (!scriptId) {
+    return null;
+  }
+  return {
+    script_id: scriptId,
+    stage: stringValue(metadata.stage) || fields.get("阶段") || undefined,
+    scenario: stringValue(metadata.scenario) || fields.get("场景") || undefined,
+    customer_trigger:
+      stringValue(metadata.customer_trigger) ||
+      fields.get("客户触发点") ||
+      undefined,
+    goal: fields.get("目标") || undefined,
+    source_quote: fields.get("原始话术") || undefined,
+    coach_wording: fields.get("教练推荐话术") || undefined,
+    strategy_names:
+      stringList(metadata.strategy_names).length > 0
+        ? stringList(metadata.strategy_names)
+        : splitDelimited(fields.get("关联策略") || ""),
+    follow_up_questions: blocks.get("追问建议") ?? [],
+    compliance_notes: blocks.get("合规提醒") ?? []
+  };
+}
+
+function buildRelatedScriptLookup(
+  evidence: RetrievalEvidence,
+  relatedEvidences: RetrievalEvidence[]
+): Map<string, RelatedScriptDetail> {
+  const lookup = new Map<string, RelatedScriptDetail>();
+  const metadata = evidence.metadata ?? {};
+  const currentCaseName = stringValue(metadata.case_name);
+  const metadataDetails = Array.isArray(metadata.related_script_details)
+    ? metadata.related_script_details
+    : [];
+
+  for (const item of metadataDetails) {
+    const detail = relatedScriptFromRecord(asRecord(item) ?? {});
+    if (detail) {
+      lookup.set(detail.script_id, detail);
+    }
+  }
+
+  for (const candidate of relatedEvidences) {
+    if (candidate.chunk_type !== "script") {
+      continue;
+    }
+    const candidateCaseName = stringValue(candidate.metadata?.case_name);
+    if (
+      currentCaseName &&
+      candidateCaseName &&
+      candidateCaseName !== currentCaseName
+    ) {
+      continue;
+    }
+    const detail = relatedScriptFromEvidence(candidate);
+    if (detail && !lookup.has(detail.script_id)) {
+      lookup.set(detail.script_id, detail);
+    }
+  }
+
+  return lookup;
+}
+
+function splitRelatedScriptIds(value: string): string[] {
+  return value
+    .split(/[、,，\s]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function safeDomId(value: string): string {
+  return value.replace(/[^A-Za-z0-9_-]/g, "-");
+}
+
+function DetailLine({ label, value }: { label: string; value?: string }) {
+  if (!value) {
+    return null;
+  }
+  return (
+    <p className="related-script-detail-row">
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </p>
+  );
+}
+
+function DetailList({ label, items }: { label: string; items?: string[] }) {
+  if (!items || items.length === 0) {
+    return null;
+  }
+  return (
+    <div className="related-script-detail-list">
+      <span>{label}</span>
+      <ul>
+        {items.map((item, index) => (
+          <li key={`${label}-${index}`}>{item}</li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function RelatedScriptDetailCard({
+  detail,
+  id
+}: {
+  detail: RelatedScriptDetail;
+  id: string;
+}) {
+  return (
+    <div className="related-script-detail" id={id}>
+      <div className="related-script-detail-heading">
+        <strong>{detail.script_id}</strong>
+        {detail.stage && <span>{detail.stage}</span>}
+      </div>
+      <DetailLine label="场景" value={detail.scenario} />
+      <DetailLine label="客户触发点" value={detail.customer_trigger} />
+      <DetailLine label="目标" value={detail.goal} />
+      <DetailLine label="原始话术" value={detail.source_quote} />
+      <DetailLine label="教练推荐话术" value={detail.coach_wording} />
+      <DetailList label="关联策略" items={detail.strategy_names} />
+      <DetailList label="追问建议" items={detail.follow_up_questions} />
+      <DetailList label="合规提醒" items={detail.compliance_notes} />
+    </div>
+  );
+}
+
+function RelatedScriptRow({
+  label,
+  value,
+  scriptLookup
+}: {
+  label: string;
+  value: string;
+  scriptLookup: Map<string, RelatedScriptDetail>;
+}) {
+  const baseId = useId();
+  const scriptIds = splitRelatedScriptIds(value);
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
+
+  if (scriptIds.length === 0 || !scriptIds.some((id) => scriptLookup.has(id))) {
+    return (
+      <p className="evidence-struct-row">
+        <span className="evidence-field-label">{label}</span>
+        <span className="evidence-field-value">{value}</span>
+      </p>
+    );
+  }
+
+  function toggleScript(scriptId: string) {
+    setExpandedIds((current) => {
+      const next = new Set(current);
+      if (next.has(scriptId)) {
+        next.delete(scriptId);
+      } else {
+        next.add(scriptId);
+      }
+      return next;
+    });
+  }
+
+  return (
+    <>
+      <span className="evidence-field-label">{label}</span>
+      <span className="evidence-field-value related-script-tokens">
+        {scriptIds.map((scriptId, index) => {
+          const detail = scriptLookup.get(scriptId);
+          const detailId = `${baseId}-${safeDomId(scriptId)}`;
+          return (
+            <Fragment key={scriptId}>
+              {index > 0 && (
+                <span className="related-script-separator">、</span>
+              )}
+              {detail ? (
+                <button
+                  type="button"
+                  className="related-script-token"
+                  aria-expanded={expandedIds.has(scriptId)}
+                  aria-controls={detailId}
+                  onClick={() => toggleScript(scriptId)}
+                >
+                  {scriptId}
+                </button>
+              ) : (
+                <span>{scriptId}</span>
+              )}
+            </Fragment>
+          );
+        })}
+      </span>
+      {scriptIds.map((scriptId) => {
+        const detail = scriptLookup.get(scriptId);
+        if (!detail || !expandedIds.has(scriptId)) {
+          return null;
+        }
+        return (
+          <RelatedScriptDetailCard
+            detail={detail}
+            id={`${baseId}-${safeDomId(scriptId)}`}
+            key={`detail-${scriptId}`}
+          />
+        );
+      })}
+    </>
+  );
+}
+
 // 结构化正文：模型归纳字段与案例原文字段用不同颜色标签区分。
 function EvidenceStructuredText({
-  segments
+  segments,
+  scriptLookup
 }: {
   segments: EvidenceTextSegment[];
+  scriptLookup: Map<string, RelatedScriptDetail>;
 }) {
   return (
     <div className="evidence-text evidence-struct">
@@ -86,6 +371,16 @@ function EvidenceStructuredText({
           );
         }
         if (segment.kind === "field") {
+          if (segment.label === "关联话术") {
+            return (
+              <RelatedScriptRow
+                key={`segment-${index}`}
+                label={segment.label}
+                value={segment.value}
+                scriptLookup={scriptLookup}
+              />
+            );
+          }
           return (
             <p className="evidence-struct-row" key={`segment-${index}`}>
               <span
@@ -130,6 +425,7 @@ const MAX_VISIBLE_CITATIONS = 4;
 
 type EvidenceDetailProps = {
   evidence: RetrievalEvidence;
+  relatedEvidences?: RetrievalEvidence[];
   index: number;
   cited: boolean;
   feedbackJudgement?: EvidenceFeedbackJudgement;
@@ -144,6 +440,7 @@ type EvidenceDetailProps = {
 // 切换证据时由父级用 key 重新挂载，内部引用选中态随之重置。
 export function EvidenceDetail({
   evidence,
+  relatedEvidences = [],
   index,
   cited,
   feedbackJudgement,
@@ -172,6 +469,7 @@ export function EvidenceDetail({
   const complianceRisks = evidenceComplianceRisks(evidence.metadata);
   const text = evidence.text || evidence.text_preview || "没有正文内容。";
   const textSegments = parseEvidenceText(text);
+  const scriptLookup = buildRelatedScriptLookup(evidence, relatedEvidences);
 
   // 点击“应该用”立即选中并落地一条正向 bad case（无需理由）；
   // 已勾选时再点则取消本地判定，已落地的 bad case 不撤回。
@@ -293,7 +591,10 @@ export function EvidenceDetail({
         </div>
       )}
       {hasStructuredFields(textSegments) ? (
-        <EvidenceStructuredText segments={textSegments} />
+        <EvidenceStructuredText
+          segments={textSegments}
+          scriptLookup={scriptLookup}
+        />
       ) : (
         <p className="evidence-text">{text}</p>
       )}

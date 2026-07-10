@@ -167,11 +167,39 @@ def _script_chunk(
     )
 
 
+def _script_detail_metadata(item: CaseSalesScript) -> dict[str, object]:
+    return {
+        "script_id": item.script_id,
+        "stage": item.stage,
+        "scenario": item.scenario,
+        "customer_trigger": item.customer_trigger,
+        "goal": item.goal,
+        "source_quote": item.source_quote,
+        "coach_wording": item.coach_wording,
+        "strategy_names": item.strategy_names,
+        "follow_up_questions": item.follow_up_questions,
+        "compliance_notes": item.compliance_notes,
+    }
+
+
+def _related_script_details(
+    script_ids: list[str],
+    scripts_by_id: dict[str, CaseSalesScript],
+) -> list[dict[str, object]]:
+    details: list[dict[str, object]] = []
+    for script_id in script_ids:
+        script = scripts_by_id.get(script_id)
+        if script:
+            details.append(_script_detail_metadata(script))
+    return details
+
+
 def _objection_chunk(
     case_id: str,
     case_name: str,
     item: ObjectionHandling,
     index: int,
+    scripts_by_id: dict[str, CaseSalesScript],
 ) -> RagChunk:
     text = "\n".join(
         _lines(
@@ -200,6 +228,9 @@ def _objection_chunk(
             "objection": item.objection,
             "related_strategy_names": item.related_strategy_names,
             "related_script_ids": item.related_script_ids,
+            "related_script_details": _related_script_details(
+                item.related_script_ids, scripts_by_id
+            ),
         },
         citations=_citations(item.evidence_refs),
         source_file="case.sales_insights.json",
@@ -208,6 +239,9 @@ def _objection_chunk(
 
 def build_chunks(knowledge: StructuredCaseKnowledge) -> list[RagChunk]:
     chunks: list[RagChunk] = []
+    scripts_by_id = {
+        script.script_id: script for script in knowledge.scripts if script.script_id
+    }
     for index, item in enumerate(knowledge.customer_journey, start=1):
         chunks.append(
             _journey_chunk(knowledge.case_id, knowledge.case_name, item, index)
@@ -220,6 +254,12 @@ def build_chunks(knowledge: StructuredCaseKnowledge) -> list[RagChunk]:
         chunks.append(_script_chunk(knowledge.case_id, knowledge.case_name, item, index))
     for index, item in enumerate(knowledge.objection_handling, start=1):
         chunks.append(
-            _objection_chunk(knowledge.case_id, knowledge.case_name, item, index)
+            _objection_chunk(
+                knowledge.case_id,
+                knowledge.case_name,
+                item,
+                index,
+                scripts_by_id,
+            )
         )
     return [tag_chunk(chunk) for chunk in chunks]
