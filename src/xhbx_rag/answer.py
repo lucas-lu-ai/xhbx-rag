@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 import httpx
@@ -119,6 +120,14 @@ class _StreamStatusError(RuntimeError):
         self.status_code = status_code
 
 
+@dataclass(frozen=True)
+class _StreamChatResult:
+    content: str
+    saw_done: bool
+    finish_reason: str | None = None
+    stream_error: str | None = None
+
+
 class AnswerAgent:
     def __init__(
         self,
@@ -160,11 +169,15 @@ class AnswerAgent:
                 "enable_thinking": self.enable_thinking,
                 "response_format": {"type": "json_object"},
             }
-            content = self._stream_chat_content(body, thinking_parts)
+            attempt_thinking_parts: list[str] = []
+            stream_result = self._stream_chat_content(body, attempt_thinking_parts)
+            thinking_parts.extend(attempt_thinking_parts)
+            content = stream_result.content
             try:
+                _require_complete_stream(stream_result)
                 data = json.loads(_strip_json_fences(content))
                 generated = GeneratedAnswer.model_validate(data)
-            except (json.JSONDecodeError, ValidationError) as exc:
+            except (ValueError, ValidationError) as exc:
                 last_error = _bounded_text(
                     f"{type(exc).__name__}: {exc}",
                     ERROR_SUMMARY_CHARS,
@@ -185,11 +198,13 @@ class AnswerAgent:
         self,
         body: dict[str, Any],
         thinking_parts: list[str],
-    ) -> str:
+    ) -> _StreamChatResult:
         attempts = max(1, self.retry_attempts)
         for attempt in range(1, attempts + 1):
             content_parts: list[str] = []
             received_delta = False
+            saw_done = False
+            finish_reason: str | None = None
             try:
                 with self.http_client.stream(
                     "POST",
@@ -209,8 +224,19 @@ class AnswerAgent:
                         if data is None:
                             continue
                         if data == "[DONE]":
+                            saw_done = True
                             break
-                        delta = _chunk_delta(data)
+                        try:
+                            delta, chunk_finish_reason = _chunk_event(data)
+                        except ValueError as exc:
+                            return _StreamChatResult(
+                                content="".join(content_parts),
+                                saw_done=False,
+                                finish_reason=finish_reason,
+                                stream_error=f"SSE 数据块解析失败: {exc}",
+                            )
+                        if chunk_finish_reason is not None:
+                            finish_reason = chunk_finish_reason
                         reasoning = delta.get("reasoning_content")
                         if isinstance(reasoning, str) and reasoning:
                             received_delta = True
@@ -221,13 +247,23 @@ class AnswerAgent:
                         if isinstance(text, str) and text:
                             received_delta = True
                             content_parts.append(text)
-                return "".join(content_parts)
+                return _StreamChatResult(
+                    content="".join(content_parts),
+                    saw_done=saw_done,
+                    finish_reason=finish_reason,
+                )
             except _StreamStatusError as exc:
                 if attempt == attempts or not is_retryable_status_code(exc.status_code):
                     raise AnswerGenerationError(str(exc)) from exc
-            except RETRYABLE_TRANSPORT_ERRORS:
-                # 已经向界面推送过增量时不重试，避免思考内容重复显示。
-                if received_delta or attempt == attempts:
+            except RETRYABLE_TRANSPORT_ERRORS as exc:
+                if received_delta:
+                    return _StreamChatResult(
+                        content="".join(content_parts),
+                        saw_done=False,
+                        finish_reason=finish_reason,
+                        stream_error=f"流式连接中断: {type(exc).__name__}",
+                    )
+                if attempt == attempts:
                     raise
             sleep_before_retry(attempt, self.retry_base_delay)
         raise AnswerGenerationError("chat/completions 流式重试次数耗尽")
@@ -244,16 +280,31 @@ def _sse_data(line: object) -> str | None:
     return stripped.removeprefix("data:").strip()
 
 
-def _chunk_delta(data: str) -> dict[str, Any]:
-    try:
-        payload = json.loads(data)
-    except ValueError:
-        return {}
+def _chunk_event(data: str) -> tuple[dict[str, Any], str | None]:
+    payload = json.loads(data)
     choices = payload.get("choices") if isinstance(payload, dict) else None
     if not isinstance(choices, list) or not choices:
-        return {}
-    delta = choices[0].get("delta") if isinstance(choices[0], dict) else None
-    return delta if isinstance(delta, dict) else {}
+        return {}, None
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        return {}, None
+    delta = choice.get("delta")
+    finish_reason = choice.get("finish_reason")
+    return (
+        delta if isinstance(delta, dict) else {},
+        finish_reason if isinstance(finish_reason, str) else None,
+    )
+
+
+def _require_complete_stream(result: _StreamChatResult) -> None:
+    if result.stream_error:
+        raise ValueError(result.stream_error)
+    if not result.saw_done:
+        raise ValueError("流式响应未收到 [DONE]")
+    if result.finish_reason not in (None, "stop"):
+        raise ValueError(
+            f"流式响应异常结束: finish_reason={result.finish_reason}"
+        )
 
 
 def _strip_json_fences(text: str) -> str:

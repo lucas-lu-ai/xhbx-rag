@@ -17,6 +17,13 @@ def _delta_chunk(**delta: object) -> str:
     return json.dumps({"choices": [{"delta": delta}]}, ensure_ascii=False)
 
 
+def _finish_chunk(reason: str) -> str:
+    return json.dumps(
+        {"choices": [{"delta": {}, "finish_reason": reason}]},
+        ensure_ascii=False,
+    )
+
+
 def _sse_lines(*data_items: str) -> list[str]:
     lines = [f"data: {item}" for item in data_items]
     lines.append("data: [DONE]")
@@ -48,6 +55,13 @@ class _FakeStreamResponse:
 
     def iter_lines(self):
         yield from self._lines
+
+
+class _InterruptingStreamResponse(_FakeStreamResponse):
+    def iter_lines(self):
+        partial = '{"answer":"部分正文'
+        yield f"data: {_delta_chunk(content=partial)}"
+        raise httpx.RemoteProtocolError("peer closed stream")
 
 
 class _FakeSseClient:
@@ -227,6 +241,94 @@ def test_answer_agent_retries_stream_open_failures() -> None:
 
     assert result.answer == "保单整理能帮助客户看清保障缺口。"
     assert len(http.calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("first_response", "expected_error"),
+    [
+        (
+            [_delta_chunk(content='{"answer":"流提前结束')],
+            "未收到 [DONE]",
+        ),
+        (
+            _sse_lines(
+                _delta_chunk(content='{"answer":"长度截断'),
+                _finish_chunk("length"),
+            ),
+            "finish_reason=length",
+        ),
+        (
+            _sse_lines(
+                _delta_chunk(content='{"answer":"已收到部分'),
+                "{not-json",
+            ),
+            "SSE 数据块解析失败",
+        ),
+    ],
+)
+def test_answer_agent_retries_incomplete_streams(
+    first_response: list[str],
+    expected_error: str,
+) -> None:
+    http = _SequencedFakeSseClient(
+        [
+            [
+                line if line.startswith("data:") else f"data: {line}"
+                for line in first_response
+            ],
+            _answer_sse_lines("流重试成功。", [1], reasoning_parts=()),
+        ]
+    )
+
+    result = _agent(http).generate(_search_result())
+
+    assert result.answer == "流重试成功。"
+    assert len(http.calls) == 2
+    assert expected_error in http.calls[1]["json"]["messages"][-1]["content"]
+
+
+def test_answer_agent_retries_transport_interruption_after_partial_content() -> None:
+    class _PartialThenValidClient(_SequencedFakeSseClient):
+        @contextmanager
+        def stream(
+            self,
+            method: str,
+            url: str,
+            *,
+            headers: dict,
+            json: dict,
+            timeout: float,
+        ):
+            self.calls.append(
+                {
+                    "method": method,
+                    "url": url,
+                    "headers": headers,
+                    "json": json,
+                    "timeout": timeout,
+                }
+            )
+            if len(self.calls) == 1:
+                yield _InterruptingStreamResponse([])
+                return
+            yield _FakeStreamResponse(
+                _answer_sse_lines(
+                    "中断后重新生成成功。",
+                    [1],
+                    reasoning_parts=(),
+                )
+            )
+
+    http = _PartialThenValidClient([[]])
+
+    result = _agent(http).generate(_search_result())
+
+    assert result.answer == "中断后重新生成成功。"
+    assert len(http.calls) == 2
+    assert "部分正文" in http.calls[1]["json"]["messages"][-2]["content"]
+    assert "流式连接中断: RemoteProtocolError" in (
+        http.calls[1]["json"]["messages"][-1]["content"]
+    )
 
 
 def test_answer_agent_retries_invalid_json_with_error_feedback() -> None:
