@@ -322,7 +322,8 @@ def _require_complete_stream(result: _StreamChatResult) -> None:
         raise ValueError("流式响应未收到 [DONE]")
     if result.finish_reason not in (None, "stop"):
         raise ValueError(
-            f"流式响应异常结束: finish_reason={result.finish_reason}"
+            "流式响应异常结束: "
+            f"finish_reason={_safe_finish_reason_for_log(result.finish_reason)}"
         )
 
 

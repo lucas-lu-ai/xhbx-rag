@@ -526,6 +526,48 @@ def test_answer_agent_sanitizes_unknown_finish_reason_in_retry_log(
     assert "\nINJECTED" not in caplog.text
 
 
+def test_answer_agent_sanitizes_unknown_finish_reason_in_final_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="xhbx_rag.answer")
+    content = '{"answer":"有效但终态异常","citation_indexes":[1]}'
+    responses = [
+        _sse_lines(
+            _delta_chunk(content=content),
+            _finish_chunk("MODEL-OUTPUT-SENTINEL\nINJECTED"),
+        )
+        for _ in range(3)
+    ]
+    http = _SequencedFakeSseClient(responses)
+
+    with pytest.raises(IncompleteModelOutputError) as exc_info:
+        _agent(http).generate(_search_result())
+
+    assert isinstance(exc_info.value.__cause__, ValueError)
+    exception_texts = [str(exc_info.value), str(exc_info.value.__cause__)]
+    for text in exception_texts:
+        assert "finish_reason=other" in text
+        assert "MODEL-OUTPUT-SENTINEL" not in text
+        assert "INJECTED" not in text
+    correction_messages = [
+        call["json"]["messages"][-1]["content"] for call in http.calls[1:]
+    ]
+    assert all("finish_reason=other" in message for message in correction_messages)
+    assert all(
+        "MODEL-OUTPUT-SENTINEL" not in message and "INJECTED" not in message
+        for message in correction_messages
+    )
+    retry_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "xhbx_rag.answer"
+    ]
+    assert len(retry_messages) == 2
+    assert all("finish_reason=other" in message for message in retry_messages)
+    assert "MODEL-OUTPUT-SENTINEL" not in caplog.text
+    assert "INJECTED" not in caplog.text
+
+
 def test_answer_agent_stops_after_three_invalid_outputs(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
