@@ -14,6 +14,7 @@ output/
 .local/
 parsed/
 .superpowers/
+.worktrees/
 CLAUDE.md
 .claude/
 generated/
