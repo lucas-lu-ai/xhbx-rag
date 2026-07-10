@@ -2,8 +2,14 @@ import json
 from contextlib import contextmanager
 
 import httpx
+import pytest
 
-from xhbx_rag.answer import AnswerAgent, answer_from_search_result
+from xhbx_rag.answer import (
+    AnswerAgent,
+    IncompleteModelOutputError,
+    _retry_messages,
+    answer_from_search_result,
+)
 from xhbx_rag.observability import MemoryTraceSink
 
 
@@ -78,6 +84,34 @@ class _FakeSseClient:
         if self._failures:
             raise self._failures.pop(0)
         yield _FakeStreamResponse(self._lines, self._status_code)
+
+
+class _SequencedFakeSseClient(_FakeSseClient):
+    def __init__(self, responses: list[list[str]]) -> None:
+        super().__init__(responses[0])
+        self._responses = responses
+
+    @contextmanager
+    def stream(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict,
+        json: dict,
+        timeout: float,
+    ):
+        self.calls.append(
+            {
+                "method": method,
+                "url": url,
+                "headers": headers,
+                "json": json,
+                "timeout": timeout,
+            }
+        )
+        response_index = min(len(self.calls) - 1, len(self._responses) - 1)
+        yield _FakeStreamResponse(self._responses[response_index])
 
 
 def _search_result() -> dict:
@@ -160,6 +194,7 @@ def test_answer_agent_streams_thinking_and_parses_json_response() -> None:
     assert body["stream"] is True
     assert body["enable_thinking"] is True
     assert body["response_format"] == {"type": "json_object"}
+    assert len(http.calls) == 1
     user_content = body["messages"][-1]["content"]
     assert "保单整理对客户有什么作用？" in user_content
     assert "[证据1]" in user_content
@@ -192,6 +227,108 @@ def test_answer_agent_retries_stream_open_failures() -> None:
 
     assert result.answer == "保单整理能帮助客户看清保障缺口。"
     assert len(http.calls) == 2
+
+
+def test_answer_agent_retries_invalid_json_with_error_feedback() -> None:
+    invalid = '{"answer":"未闭合的回答'
+    http = _SequencedFakeSseClient(
+        [
+            _sse_lines(_delta_chunk(content=invalid)),
+            _answer_sse_lines("第二次生成成功。", [1], reasoning_parts=()),
+        ]
+    )
+    agent = _agent(http)
+
+    result = agent.generate(_search_result())
+
+    assert result.answer == "第二次生成成功。"
+    assert len(http.calls) == 2
+    base_messages = http.calls[0]["json"]["messages"]
+    retry_messages = http.calls[1]["json"]["messages"]
+    assert retry_messages[:2] == base_messages
+    assert retry_messages[-2] == {"role": "assistant", "content": invalid}
+    assert retry_messages[-1]["role"] == "user"
+    correction = retry_messages[-1]["content"]
+    assert "JSONDecodeError" in correction
+    assert "请从头重新生成完整 JSON，不要续写上一次内容" in correction
+    assert "answer 必须是非空字符串" in correction
+    assert "citation_indexes 必须是整数数组" in correction
+
+
+def test_answer_agent_stops_after_three_invalid_outputs() -> None:
+    invalid = '{"answer":"仍未闭合'
+    http = _SequencedFakeSseClient(
+        [_sse_lines(_delta_chunk(content=invalid)) for _ in range(3)]
+    )
+    agent = _agent(http)
+
+    with pytest.raises(
+        IncompleteModelOutputError,
+        match="模型输出不完整，已尝试 3 次: JSONDecodeError",
+    ) as exc_info:
+        agent.generate(_search_result())
+
+    assert len(http.calls) == 3
+    assert exc_info.value.last_error.startswith("JSONDecodeError:")
+    assert isinstance(exc_info.value.__cause__, json.JSONDecodeError)
+
+
+def test_answer_agent_retries_schema_validation_failure() -> None:
+    invalid = '{"answer":"   ","citation_indexes":[1]}'
+    http = _SequencedFakeSseClient(
+        [
+            _sse_lines(_delta_chunk(content=invalid)),
+            _answer_sse_lines("结构已纠正。", [1], reasoning_parts=()),
+        ]
+    )
+
+    result = _agent(http).generate(_search_result())
+
+    assert result.answer == "结构已纠正。"
+    assert "ValidationError" in http.calls[1]["json"]["messages"][-1]["content"]
+
+
+def test_answer_agent_can_succeed_on_third_attempt_with_only_latest_failure() -> None:
+    first_invalid = '{"answer":"第一次未闭合-FIRST'
+    second_invalid = '{"answer":"第二次仍未闭合-SECOND'
+    http = _SequencedFakeSseClient(
+        [
+            _sse_lines(_delta_chunk(content=first_invalid)),
+            _sse_lines(_delta_chunk(content=second_invalid)),
+            _answer_sse_lines("第三次生成成功。", [1], reasoning_parts=()),
+        ]
+    )
+
+    result = _agent(http).generate(_search_result())
+
+    assert result.answer == "第三次生成成功。"
+    assert len(http.calls) == 3
+    third_messages = http.calls[2]["json"]["messages"]
+    assert len(third_messages) == 4
+    assert third_messages[-2]["content"] == second_invalid
+    assert first_invalid not in str(third_messages)
+
+
+def test_retry_messages_bound_output_excerpt_and_error_summary() -> None:
+    invalid = "HEAD" + "x" * 5_000 + "TAIL"
+    messages = _retry_messages(
+        [{"role": "system", "content": "base"}],
+        invalid_content=invalid,
+        error=ValueError("ERROR-HEAD" + "y" * 1_000 + "ERROR-TAIL"),
+    )
+
+    excerpt = messages[-2]["content"]
+    assert len(excerpt) <= 4_000
+    assert excerpt.startswith("HEAD")
+    assert excerpt.endswith("TAIL")
+    assert "已截断" in excerpt
+
+    correction = messages[-1]["content"]
+    error_summary = correction.split("错误：", 1)[1].split("\n", 1)[0]
+    assert len(error_summary) <= 800
+    assert error_summary.startswith("ValueError: ERROR-HEAD")
+    assert error_summary.endswith("ERROR-TAIL")
+    assert "已截断" in error_summary
 
 
 def test_answer_agent_parses_fenced_json_content() -> None:

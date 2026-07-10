@@ -6,7 +6,14 @@ from collections.abc import Callable
 from typing import Any, Protocol
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from .http_retry import (
     RETRYABLE_TRANSPORT_ERRORS,
@@ -19,6 +26,21 @@ from .search import search_evidence
 
 class AnswerGenerationError(RuntimeError):
     """Raised when answer generation cannot produce a valid grounded answer."""
+
+
+MODEL_OUTPUT_ATTEMPTS = 3
+INVALID_OUTPUT_EXCERPT_CHARS = 4_000
+ERROR_SUMMARY_CHARS = 800
+
+
+class IncompleteModelOutputError(AnswerGenerationError):
+    """Raised after all model output correction attempts are exhausted."""
+
+    def __init__(self, last_error: str) -> None:
+        self.last_error = last_error
+        super().__init__(
+            f"模型输出不完整，已尝试 {MODEL_OUTPUT_ATTEMPTS} 次: {last_error}"
+        )
 
 
 class _SseHttpClient(Protocol):
@@ -121,25 +143,43 @@ class AnswerAgent:
         self.on_thinking_delta = on_thinking_delta
 
     def generate(self, search_result: dict[str, Any]) -> GeneratedAnswer:
-        body = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": _build_user_prompt(search_result)},
-            ],
-            "temperature": 0,
-            "stream": True,
-            "enable_thinking": self.enable_thinking,
-            "response_format": {"type": "json_object"},
-        }
+        base_messages = [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": _build_user_prompt(search_result)},
+        ]
+        messages = base_messages
         thinking_parts: list[str] = []
-        content = self._stream_chat_content(body, thinking_parts)
-        try:
-            data = json.loads(_strip_json_fences(content))
-            generated = GeneratedAnswer.model_validate(data)
-        except Exception as exc:  # noqa: BLE001 - normalize parser/model errors
-            raise AnswerGenerationError(f"answer generation 解析失败: {exc}") from exc
-        return generated.model_copy(update={"reasoning": "".join(thinking_parts)})
+        last_error = "未知模型输出错误"
+
+        for attempt in range(1, MODEL_OUTPUT_ATTEMPTS + 1):
+            body = {
+                "model": self.model,
+                "messages": messages,
+                "temperature": 0,
+                "stream": True,
+                "enable_thinking": self.enable_thinking,
+                "response_format": {"type": "json_object"},
+            }
+            content = self._stream_chat_content(body, thinking_parts)
+            try:
+                data = json.loads(_strip_json_fences(content))
+                generated = GeneratedAnswer.model_validate(data)
+            except (json.JSONDecodeError, ValidationError) as exc:
+                last_error = _bounded_text(
+                    f"{type(exc).__name__}: {exc}",
+                    ERROR_SUMMARY_CHARS,
+                )
+                if attempt == MODEL_OUTPUT_ATTEMPTS:
+                    raise IncompleteModelOutputError(last_error) from exc
+                messages = _retry_messages(
+                    base_messages,
+                    invalid_content=content,
+                    error=exc,
+                )
+                continue
+            return generated.model_copy(update={"reasoning": "".join(thinking_parts)})
+
+        raise IncompleteModelOutputError(last_error)
 
     def _stream_chat_content(
         self,
@@ -220,6 +260,50 @@ def _strip_json_fences(text: str) -> str:
     stripped = text.strip()
     match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", stripped, re.DOTALL)
     return match.group(1) if match else stripped
+
+
+def _bounded_text(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+
+    marker = "...（已截断）..."
+    remaining = limit - len(marker)
+    if remaining <= 0:
+        return marker[:limit]
+    head_chars = (remaining + 1) // 2
+    tail_chars = remaining - head_chars
+    tail = text[-tail_chars:] if tail_chars else ""
+    return f"{text[:head_chars]}{marker}{tail}"
+
+
+def _retry_messages(
+    base_messages: list[dict[str, str]],
+    *,
+    invalid_content: str,
+    error: Exception,
+) -> list[dict[str, str]]:
+    error_summary = _bounded_text(
+        f"{type(error).__name__}: {error}",
+        ERROR_SUMMARY_CHARS,
+    )
+    invalid_excerpt = _bounded_text(
+        invalid_content,
+        INVALID_OUTPUT_EXCERPT_CHARS,
+    )
+    return [
+        *base_messages,
+        {"role": "assistant", "content": invalid_excerpt},
+        {
+            "role": "user",
+            "content": (
+                "上一次输出无法作为完整回答解析。\n"
+                f"错误：{error_summary}\n"
+                "请从头重新生成完整 JSON，不要续写上一次内容。"
+                "只能输出包含 answer 和 citation_indexes 字段的 JSON object；"
+                "answer 必须是非空字符串，citation_indexes 必须是整数数组。"
+            ),
+        },
+    ]
 
 
 def answer_query(
