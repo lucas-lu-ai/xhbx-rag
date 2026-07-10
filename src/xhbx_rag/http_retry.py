@@ -22,7 +22,6 @@ RETRYABLE_TRANSPORT_ERRORS = (
     httpx.RemoteProtocolError,
     httpx.ConnectError,
     httpx.ConnectTimeout,
-    httpx.ReadError,
     httpx.ReadTimeout,
     httpx.PoolTimeout,
 )

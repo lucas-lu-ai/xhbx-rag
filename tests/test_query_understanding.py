@@ -209,6 +209,36 @@ def test_query_understanding_agent_retries_transient_http_errors() -> None:
     assert len(http.calls) == 2
 
 
+def test_query_understanding_agent_does_not_retry_read_error() -> None:
+    http = _FlakyHttpClient(
+        failures=[httpx.ReadError("socket reset")],
+        payload={
+            "choices": [
+                {
+                    "message": {
+                        "content": (
+                            '{"intent":"script_search","rewritten_query":"不应到达",'
+                            '"needs_retrieval":true,"filters":{}}'
+                        )
+                    }
+                }
+            ]
+        },
+    )
+    agent = QueryUnderstandingAgent(
+        base_url="https://api.example.com/v1",
+        api_key="secret",
+        model="chat-model",
+        http_client=http,
+        retry_base_delay=0,
+    )
+
+    with pytest.raises(httpx.ReadError, match="socket reset"):
+        agent.understand("客户不想聊保险怎么开场？")
+
+    assert len(http.calls) == 1
+
+
 def test_query_understanding_agent_fails_on_invalid_json() -> None:
     http = _FakeHttpClient({"choices": [{"message": {"content": "not-json"}}]})
     agent = QueryUnderstandingAgent(

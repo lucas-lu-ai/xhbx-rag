@@ -1,5 +1,6 @@
 import json
 import logging
+import traceback
 from contextlib import contextmanager
 
 import httpx
@@ -7,6 +8,7 @@ import pytest
 
 from xhbx_rag.answer import (
     AnswerAgent,
+    AnswerGenerationError,
     IncompleteModelOutputError,
     _retry_messages,
     answer_from_search_result,
@@ -18,7 +20,7 @@ def _delta_chunk(**delta: object) -> str:
     return json.dumps({"choices": [{"delta": delta}]}, ensure_ascii=False)
 
 
-def _finish_chunk(reason: str) -> str:
+def _finish_chunk(reason: object) -> str:
     return json.dumps(
         {"choices": [{"delta": {}, "finish_reason": reason}]},
         ensure_ascii=False,
@@ -526,6 +528,42 @@ def test_answer_agent_sanitizes_unknown_finish_reason_in_retry_log(
     assert "\nINJECTED" not in caplog.text
 
 
+@pytest.mark.parametrize(
+    "finish_reason",
+    [
+        42,
+        True,
+        ["FINISH-REASON-LIST-SENTINEL"],
+        {"FINISH-REASON-DICT-SENTINEL": 1},
+    ],
+)
+def test_answer_agent_retries_non_string_finish_reason_safely(
+    finish_reason: object,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="xhbx_rag.answer")
+    content = '{"answer":"首次回答","citation_indexes":[1]}'
+    http = _SequencedFakeSseClient(
+        [
+            _sse_lines(
+                _delta_chunk(content=content),
+                _finish_chunk(finish_reason),
+            ),
+            _answer_sse_lines("第二次生成成功。", [1], reasoning_parts=()),
+        ]
+    )
+
+    result = _agent(http).generate(_search_result())
+
+    assert result.answer == "第二次生成成功。"
+    assert len(http.calls) == 2
+    correction = http.calls[1]["json"]["messages"][-1]["content"]
+    assert "finish_reason=other" in correction
+    assert f"finish_reason={finish_reason}" not in correction
+    assert "finish_reason=other" in caplog.text
+    assert f"finish_reason={finish_reason}" not in caplog.text
+
+
 def test_answer_agent_sanitizes_unknown_finish_reason_in_final_error(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -543,7 +581,7 @@ def test_answer_agent_sanitizes_unknown_finish_reason_in_final_error(
     with pytest.raises(IncompleteModelOutputError) as exc_info:
         _agent(http).generate(_search_result())
 
-    assert isinstance(exc_info.value.__cause__, ValueError)
+    assert type(exc_info.value.__cause__) is AnswerGenerationError
     exception_texts = [str(exc_info.value), str(exc_info.value.__cause__)]
     for text in exception_texts:
         assert "finish_reason=other" in text
@@ -593,7 +631,8 @@ def test_answer_agent_stops_after_three_invalid_outputs(
 
     assert len(http.calls) == 3
     assert exc_info.value.last_error.startswith("JSONDecodeError:")
-    assert isinstance(exc_info.value.__cause__, json.JSONDecodeError)
+    assert type(exc_info.value.__cause__) is AnswerGenerationError
+    assert not hasattr(exc_info.value.__cause__, "doc")
     assert thinking == [
         "第1次失败思考。",
         "\n\n[第 1 次模型输出不完整，正在重新生成。]\n\n",
@@ -625,6 +664,129 @@ def test_answer_agent_retries_schema_validation_failure() -> None:
 
     assert result.answer == "结构已纠正。"
     assert "ValidationError" in http.calls[1]["json"]["messages"][-1]["content"]
+
+
+def test_answer_agent_sanitizes_validation_error_in_retry_feedback() -> None:
+    sentinel = "PYDANTIC-RETRY-INPUT-SENTINEL"
+    invalid = json.dumps(
+        {"answer": [sentinel], "citation_indexes": [1]},
+        ensure_ascii=False,
+    )
+    http = _SequencedFakeSseClient(
+        [
+            _sse_lines(_delta_chunk(content=invalid)),
+            _answer_sse_lines("结构已安全纠正。", [1], reasoning_parts=()),
+        ]
+    )
+
+    result = _agent(http).generate(_search_result())
+
+    assert result.answer == "结构已安全纠正。"
+    assistant_feedback = http.calls[1]["json"]["messages"][-2]["content"]
+    correction = http.calls[1]["json"]["messages"][-1]["content"]
+    assert sentinel in assistant_feedback
+    assert sentinel not in correction
+    assert "ValidationError" in correction
+    assert "string_type" in correction
+    assert "answer" in correction
+
+
+def test_answer_agent_sanitizes_pydantic_failure_traceback() -> None:
+    model_sentinel = "PYDANTIC-FINAL-INPUT-SENTINEL"
+    evidence_sentinel = "PYDANTIC-EVIDENCE-SENTINEL"
+    invalid = json.dumps(
+        {"answer": [model_sentinel], "citation_indexes": [1]},
+        ensure_ascii=False,
+    )
+    http = _SequencedFakeSseClient(
+        [_sse_lines(_delta_chunk(content=invalid)) for _ in range(3)]
+    )
+    search_result = _search_result()
+    search_result["results"][0]["content"] = evidence_sentinel
+
+    with pytest.raises(IncompleteModelOutputError) as exc_info:
+        _agent(http).generate(search_result)
+
+    formatted = "".join(
+        traceback.format_exception(
+            exc_info.type,
+            exc_info.value,
+            exc_info.tb,
+        )
+    )
+    assert type(exc_info.value.__cause__) is AnswerGenerationError
+    assert "ValidationError" in formatted
+    assert model_sentinel not in formatted
+    assert evidence_sentinel not in formatted
+
+
+def test_answer_agent_sanitizes_truncated_json_failure_traceback() -> None:
+    model_sentinel = "TRUNCATED-JSON-FINAL-SENTINEL"
+    evidence_sentinel = "TRUNCATED-JSON-EVIDENCE-SENTINEL"
+    invalid = f'{{"answer":"{model_sentinel}'
+    http = _SequencedFakeSseClient(
+        [_sse_lines(_delta_chunk(content=invalid)) for _ in range(3)]
+    )
+    search_result = _search_result()
+    search_result["results"][0]["content"] = evidence_sentinel
+
+    with pytest.raises(IncompleteModelOutputError) as exc_info:
+        _agent(http).generate(search_result)
+
+    formatted = "".join(
+        traceback.format_exception(
+            exc_info.type,
+            exc_info.value,
+            exc_info.tb,
+        )
+    )
+    cause = exc_info.value.__cause__
+    assert type(cause) is AnswerGenerationError
+    assert not hasattr(cause, "doc")
+    assert "JSONDecodeError" in formatted
+    assert model_sentinel not in formatted
+    assert evidence_sentinel not in formatted
+
+
+def test_answer_agent_ignores_non_finite_citation_index() -> None:
+    content = '{"answer":"稳健的沟通建议。","citation_indexes":[1e999]}'
+    http = _FakeSseClient(_sse_lines(_delta_chunk(content=content)))
+
+    result = _agent(http).generate(_search_result())
+
+    assert result.answer == "稳健的沟通建议。"
+    assert result.citation_indexes == []
+
+
+def test_answer_agent_retries_overly_deep_json_content() -> None:
+    deeply_nested = "[" * 10_000 + "0" + "]" * 10_000
+    http = _SequencedFakeSseClient(
+        [
+            _sse_lines(_delta_chunk(content=deeply_nested)),
+            _answer_sse_lines("深层 JSON 后纠错成功。", [1], reasoning_parts=()),
+        ]
+    )
+
+    result = _agent(http).generate(_search_result())
+
+    assert result.answer == "深层 JSON 后纠错成功。"
+    assert len(http.calls) == 2
+    assert "RecursionError" in http.calls[1]["json"]["messages"][-1]["content"]
+
+
+def test_answer_agent_reports_dedicated_error_after_three_overly_deep_outputs() -> None:
+    deeply_nested = "[" * 10_000 + "0" + "]" * 10_000
+    http = _SequencedFakeSseClient(
+        [_sse_lines(_delta_chunk(content=deeply_nested)) for _ in range(3)]
+    )
+
+    with pytest.raises(
+        IncompleteModelOutputError,
+        match="模型输出不完整，已尝试 3 次: RecursionError",
+    ):
+        _agent(http).generate(_search_result())
+
+    assert len(http.calls) == 3
 
 
 def test_answer_agent_can_succeed_on_third_attempt_with_only_latest_failure() -> None:

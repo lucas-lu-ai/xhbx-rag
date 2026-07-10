@@ -29,6 +29,12 @@ from .search import search_evidence
 logger = logging.getLogger(__name__)
 
 
+ANSWER_STREAM_RETRYABLE_TRANSPORT_ERRORS = (
+    *RETRYABLE_TRANSPORT_ERRORS,
+    httpx.ReadError,
+)
+
+
 class AnswerGenerationError(RuntimeError):
     """Raised when answer generation cannot produce a valid grounded answer."""
 
@@ -105,7 +111,7 @@ class GeneratedAnswer(BaseModel):
         for item in value:
             try:
                 index = int(item)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 continue
             if index > 0:
                 indexes.append(index)
@@ -162,7 +168,7 @@ class AnswerAgent:
         ]
         messages = base_messages
         thinking_parts: list[str] = []
-        last_error = "未知模型输出错误"
+        last_error: str
 
         for attempt in range(1, MODEL_OUTPUT_ATTEMPTS + 1):
             body = {
@@ -181,13 +187,10 @@ class AnswerAgent:
                 _require_complete_stream(stream_result)
                 data = json.loads(_strip_json_fences(content))
                 generated = GeneratedAnswer.model_validate(data)
-            except (ValueError, ValidationError) as exc:
-                last_error = _bounded_text(
-                    f"{type(exc).__name__}: {exc}",
-                    ERROR_SUMMARY_CHARS,
-                )
+            except (ValueError, RecursionError) as exc:
+                last_error = _safe_model_error_summary(exc)
                 if attempt == MODEL_OUTPUT_ATTEMPTS:
-                    raise IncompleteModelOutputError(last_error) from exc
+                    break
                 retry_notice = (
                     f"\n\n[第 {attempt} 次模型输出不完整，正在重新生成。]\n\n"
                 )
@@ -211,7 +214,8 @@ class AnswerAgent:
                 continue
             return generated.model_copy(update={"reasoning": "".join(thinking_parts)})
 
-        raise IncompleteModelOutputError(last_error)
+        safe_cause = AnswerGenerationError(last_error)
+        raise IncompleteModelOutputError(last_error) from safe_cause
 
     def _stream_chat_content(
         self,
@@ -274,7 +278,7 @@ class AnswerAgent:
             except _StreamStatusError as exc:
                 if attempt == attempts or not is_retryable_status_code(exc.status_code):
                     raise AnswerGenerationError(str(exc)) from exc
-            except RETRYABLE_TRANSPORT_ERRORS as exc:
+            except ANSWER_STREAM_RETRYABLE_TRANSPORT_ERRORS as exc:
                 if received_delta:
                     return _StreamChatResult(
                         content="".join(content_parts),
@@ -309,9 +313,14 @@ def _chunk_event(data: str) -> tuple[dict[str, Any], str | None]:
         return {}, None
     delta = choice.get("delta")
     finish_reason = choice.get("finish_reason")
+    normalized_finish_reason = (
+        finish_reason
+        if isinstance(finish_reason, str) or finish_reason is None
+        else "other"
+    )
     return (
         delta if isinstance(delta, dict) else {},
-        finish_reason if isinstance(finish_reason, str) else None,
+        normalized_finish_reason,
     )
 
 
@@ -353,16 +362,70 @@ def _bounded_text(text: str, limit: int) -> str:
     return f"{text[:head_chars]}{marker}{tail}"
 
 
+def _safe_error_fragment(value: object, limit: int) -> str:
+    return _bounded_text(" ".join(str(value).split()), limit)
+
+
+def _safe_model_error_summary(error: ValueError | RecursionError) -> str:
+    if isinstance(error, json.JSONDecodeError):
+        message = _safe_error_fragment(error.msg, ERROR_SUMMARY_CHARS // 2)
+        return _bounded_text(
+            "JSONDecodeError: "
+            f"{message} line={error.lineno} column={error.colno} pos={error.pos}",
+            ERROR_SUMMARY_CHARS,
+        )
+
+    if isinstance(error, ValidationError):
+        details: list[str] = []
+        for item in error.errors(
+            include_url=False,
+            include_context=False,
+            include_input=False,
+        ):
+            error_type = _safe_error_fragment(
+                item.get("type", "validation_error"),
+                100,
+            )
+            location = item.get("loc", ())
+            if isinstance(location, (list, tuple)):
+                safe_location = ".".join(
+                    _safe_error_fragment(part, 100) for part in location
+                )
+            else:
+                safe_location = _safe_error_fragment(location, 100)
+            safe_location = safe_location or "<root>"
+            if error_type in {"value_error", "assertion_error"}:
+                message = "模型输出未通过自定义字段校验"
+            else:
+                message = _safe_error_fragment(
+                    item.get("msg", "模型输出字段无效"),
+                    200,
+                )
+            details.append(
+                f"type={error_type} loc={safe_location} msg={message}"
+            )
+        detail_text = "; ".join(details) or "模型输出未通过结构校验"
+        return _bounded_text(
+            f"ValidationError: {detail_text}",
+            ERROR_SUMMARY_CHARS,
+        )
+
+    if isinstance(error, RecursionError):
+        return "RecursionError: 模型输出 JSON 嵌套层级过深"
+
+    return _bounded_text(
+        f"ValueError: {_safe_error_fragment(error, ERROR_SUMMARY_CHARS)}",
+        ERROR_SUMMARY_CHARS,
+    )
+
+
 def _retry_messages(
     base_messages: list[dict[str, str]],
     *,
     invalid_content: str,
-    error: Exception,
+    error: ValueError | RecursionError,
 ) -> list[dict[str, str]]:
-    error_summary = _bounded_text(
-        f"{type(error).__name__}: {error}",
-        ERROR_SUMMARY_CHARS,
-    )
+    error_summary = _safe_model_error_summary(error)
     invalid_excerpt = _bounded_text(
         invalid_content,
         INVALID_OUTPUT_EXCERPT_CHARS,
