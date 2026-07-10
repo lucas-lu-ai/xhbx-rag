@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from ..answer import IncompleteModelOutputError
 from .services import LOCAL_INDEX_UNAVAILABLE_ERROR, REQUIRED_CONFIG_KEYS
 
 SAFE_ANSWER_ERROR_MESSAGES = frozenset(
@@ -18,6 +19,7 @@ SAFE_ANSWER_ERROR_MESSAGES = frozenset(
     }
 )
 MISSING_CONFIG_ERROR_PREFIX = "缺少必要环境变量:"
+INCOMPLETE_MODEL_OUTPUT_ERROR_DETAIL = "模型输出不完整，已尝试 3 次，请稍后重试。"
 UNAVAILABLE_ANSWER_ERROR_DETAIL = "问答服务暂时不可用"
 _SAFE_CONFIG_KEYS = frozenset(REQUIRED_CONFIG_KEYS)
 
@@ -37,6 +39,8 @@ def is_safe_answer_error(message: str) -> bool:
 
 def answer_exception_detail(exc: Exception) -> str:
     """把问答异常归一为安全中文文案；未知异常一律返回兜底文案。"""
+    if isinstance(exc, IncompleteModelOutputError):
+        return INCOMPLETE_MODEL_OUTPUT_ERROR_DETAIL
     if isinstance(exc, ValueError):
         message = str(exc)
         if message == LOCAL_INDEX_UNAVAILABLE_ERROR:

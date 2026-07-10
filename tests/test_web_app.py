@@ -5,6 +5,7 @@ import logging
 import pytest
 from fastapi.testclient import TestClient
 
+from xhbx_rag.answer import IncompleteModelOutputError
 import xhbx_rag.web.app as web_app
 
 
@@ -191,6 +192,26 @@ def test_answer_route_hides_generic_exception_detail_and_logs(monkeypatch) -> No
     assert log_messages == ["Answer route failed"]
 
 
+def test_answer_route_reports_incomplete_model_output_safely(monkeypatch) -> None:
+    def fail_answer_question(*, query: str, top_n: int, top_k: int):
+        raise IncompleteModelOutputError(
+            "JSONDecodeError: secret-token at /Users/milan/private-output.json"
+        )
+
+    monkeypatch.setattr(web_app, "answer_question", fail_answer_question)
+    client = TestClient(web_app.create_app())
+
+    response = client.post(
+        "/api/answer",
+        json={"query": "保单整理有什么作用？", "top_n": 20, "top_k": 5},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "模型输出不完整，已尝试 3 次，请稍后重试。"
+    assert "secret-token" not in response.text
+    assert "/Users/milan" not in response.text
+
+
 def test_answer_route_reports_local_index_unavailable(monkeypatch) -> None:
     detail = "本地 Milvus 索引暂时不可用，请关闭其他正在使用索引的进程后重试。"
 
@@ -341,6 +362,38 @@ def test_answer_stream_route_hides_internal_error_detail_and_logs(monkeypatch) -
     assert "secret-token" not in body
     assert "/Users/milan" not in body
     assert log_messages == ["Answer stream route failed"]
+
+
+def test_answer_stream_route_reports_incomplete_model_output_safely(
+    monkeypatch,
+) -> None:
+    def fake_answer_question_stream_events(*, query, top_n, top_k):
+        yield {
+            "type": "_exception",
+            "exception": IncompleteModelOutputError(
+                "JSONDecodeError: secret-token at /Users/milan/private-output.json"
+            ),
+        }
+
+    monkeypatch.setattr(
+        web_app,
+        "answer_question_stream_events",
+        fake_answer_question_stream_events,
+    )
+    client = TestClient(web_app.create_app())
+
+    with client.stream(
+        "POST",
+        "/api/answer/stream",
+        json={"query": "客户说每年不能超过80万怎么办？"},
+    ) as response:
+        body = response.read().decode("utf-8")
+
+    assert response.status_code == 200
+    assert "event: error" in body
+    assert '"detail": "模型输出不完整，已尝试 3 次，请稍后重试。"' in body
+    assert "secret-token" not in body
+    assert "/Users/milan" not in body
 
 
 @pytest.mark.parametrize("top_n", [True, "20"])

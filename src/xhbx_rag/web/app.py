@@ -264,7 +264,10 @@ def create_app(
             raise HTTPException(status_code=502, detail="问答服务暂时不可用") from exc
         except Exception as exc:  # noqa: BLE001 - API boundary returns safe summary
             logger.exception("Answer route failed")
-            raise HTTPException(status_code=502, detail="问答服务暂时不可用") from exc
+            raise HTTPException(
+                status_code=502,
+                detail=_answer_exception_detail(exc),
+            ) from exc
 
     @web_app.post("/api/answer/stream")
     def answer_stream(request: AnswerRequest) -> StreamingResponse:
