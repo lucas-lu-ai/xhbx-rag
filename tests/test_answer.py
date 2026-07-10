@@ -64,6 +64,18 @@ class _InterruptingStreamResponse(_FakeStreamResponse):
         raise httpx.RemoteProtocolError("peer closed stream")
 
 
+class _ReadErrorBeforeDeltaResponse(_FakeStreamResponse):
+    def iter_lines(self):
+        raise httpx.ReadError("socket reset before first delta")
+
+
+class _ReadErrorAfterPartialContentResponse(_FakeStreamResponse):
+    def iter_lines(self):
+        partial = '{"answer":"ReadError 前的部分正文'
+        yield f"data: {_delta_chunk(content=partial)}"
+        raise httpx.ReadError("socket reset after partial content")
+
+
 class _FakeSseClient:
     def __init__(
         self,
@@ -126,6 +138,34 @@ class _SequencedFakeSseClient(_FakeSseClient):
         )
         response_index = min(len(self.calls) - 1, len(self._responses) - 1)
         yield _FakeStreamResponse(self._responses[response_index])
+
+
+class _SequencedResponseClient(_FakeSseClient):
+    def __init__(self, responses: list[_FakeStreamResponse]) -> None:
+        super().__init__([])
+        self._responses = responses
+
+    @contextmanager
+    def stream(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict,
+        json: dict,
+        timeout: float,
+    ):
+        self.calls.append(
+            {
+                "method": method,
+                "url": url,
+                "headers": headers,
+                "json": json,
+                "timeout": timeout,
+            }
+        )
+        response_index = min(len(self.calls) - 1, len(self._responses) - 1)
+        yield self._responses[response_index]
 
 
 def _search_result() -> dict:
@@ -241,6 +281,54 @@ def test_answer_agent_retries_stream_open_failures() -> None:
 
     assert result.answer == "保单整理能帮助客户看清保障缺口。"
     assert len(http.calls) == 2
+
+
+def test_answer_agent_retries_read_error_before_any_delta() -> None:
+    http = _SequencedResponseClient(
+        [
+            _ReadErrorBeforeDeltaResponse([]),
+            _FakeStreamResponse(
+                _answer_sse_lines(
+                    "读取错误后连接重试成功。",
+                    [1],
+                    reasoning_parts=(),
+                )
+            ),
+        ]
+    )
+
+    result = _agent(http, retry_base_delay=0).generate(_search_result())
+
+    assert result.answer == "读取错误后连接重试成功。"
+    assert len(http.calls) == 2
+
+
+def test_answer_agent_retries_read_error_after_partial_content() -> None:
+    partial = '{"answer":"ReadError 前的部分正文'
+    http = _SequencedResponseClient(
+        [
+            _ReadErrorAfterPartialContentResponse([]),
+            _FakeStreamResponse(
+                _answer_sse_lines(
+                    "读取中断后内容纠错成功。",
+                    [1],
+                    reasoning_parts=(),
+                )
+            ),
+        ]
+    )
+
+    result = _agent(http).generate(_search_result())
+
+    assert result.answer == "读取中断后内容纠错成功。"
+    assert len(http.calls) == 2
+    assert http.calls[1]["json"]["messages"][-2] == {
+        "role": "assistant",
+        "content": partial,
+    }
+    assert "流式连接中断: ReadError" in (
+        http.calls[1]["json"]["messages"][-1]["content"]
+    )
 
 
 @pytest.mark.parametrize(
