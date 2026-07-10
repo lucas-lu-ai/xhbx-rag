@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -23,6 +24,9 @@ from .http_retry import (
 )
 from .observability import TraceSink, emit_trace
 from .search import search_evidence
+
+
+logger = logging.getLogger(__name__)
 
 
 class AnswerGenerationError(RuntimeError):
@@ -184,6 +188,21 @@ class AnswerAgent:
                 )
                 if attempt == MODEL_OUTPUT_ATTEMPTS:
                     raise IncompleteModelOutputError(last_error) from exc
+                retry_notice = (
+                    f"\n\n[第 {attempt} 次模型输出不完整，正在重新生成。]\n\n"
+                )
+                thinking_parts.append(retry_notice)
+                if self.on_thinking_delta is not None:
+                    self.on_thinking_delta(retry_notice)
+                logger.warning(
+                    "answer correction retry attempt=%d error_type=%s "
+                    "content_chars=%d saw_done=%s finish_reason=%s",
+                    attempt,
+                    type(exc).__name__,
+                    len(content),
+                    stream_result.saw_done,
+                    stream_result.finish_reason,
+                )
                 messages = _retry_messages(
                     base_messages,
                     invalid_content=content,

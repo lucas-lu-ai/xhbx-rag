@@ -1,4 +1,5 @@
 import json
+import logging
 from contextlib import contextmanager
 
 import httpx
@@ -222,7 +223,10 @@ def _agent(http: _FakeSseClient, **kwargs: object) -> AnswerAgent:
     )
 
 
-def test_answer_agent_streams_thinking_and_parses_json_response() -> None:
+def test_answer_agent_streams_thinking_and_parses_json_response(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="xhbx_rag.answer")
     http = _FakeSseClient(
         _answer_sse_lines(
             "保单整理能帮助客户看清保障缺口，并建立对代理人的专业信任。",
@@ -239,6 +243,10 @@ def test_answer_agent_streams_thinking_and_parses_json_response() -> None:
     assert result.reasoning == "先梳理证据，再归纳回答要点。"
     # 思考增量按到达顺序实时回调，而不是收尾时一次性给出。
     assert thinking == ["先梳理证据，", "再归纳回答要点。"]
+    assert "正在重新生成" not in result.reasoning
+    assert not [
+        record for record in caplog.records if record.name == "xhbx_rag.answer"
+    ]
     call = http.calls[0]
     assert call["method"] == "POST"
     assert call["url"] == "https://api.example.com/v1/chat/completions"
@@ -445,12 +453,62 @@ def test_answer_agent_retries_invalid_json_with_error_feedback() -> None:
     assert "citation_indexes 必须是整数数组" in correction
 
 
-def test_answer_agent_stops_after_three_invalid_outputs() -> None:
+def test_answer_agent_reports_correction_retry_in_reasoning_and_safe_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="xhbx_rag.answer")
+    invalid = '{"answer":"MODEL-OUTPUT-SENTINEL'
+    first_thinking = "第一次思考。"
+    retry_notice = "\n\n[第 1 次模型输出不完整，正在重新生成。]\n\n"
+    second_thinking = "第二次思考。"
+    http = _SequencedFakeSseClient(
+        [
+            _sse_lines(
+                _delta_chunk(reasoning_content=first_thinking),
+                _delta_chunk(content=invalid),
+            ),
+            _answer_sse_lines(
+                "第二次生成成功。",
+                [1],
+                reasoning_parts=(second_thinking,),
+            ),
+        ]
+    )
+    thinking: list[str] = []
+
+    result = _agent(http, on_thinking_delta=thinking.append).generate(_search_result())
+
+    assert thinking == [first_thinking, retry_notice, second_thinking]
+    assert result.reasoning == "".join(thinking)
+    retry_records = [
+        record for record in caplog.records if record.name == "xhbx_rag.answer"
+    ]
+    assert len(retry_records) == 1
+    log_message = retry_records[0].getMessage()
+    assert "attempt=1" in log_message
+    assert "error_type=JSONDecodeError" in log_message
+    assert f"content_chars={len(invalid)}" in log_message
+    assert "saw_done=True" in log_message
+    assert "finish_reason=None" in log_message
+    assert "MODEL-OUTPUT-SENTINEL" not in caplog.text
+
+
+def test_answer_agent_stops_after_three_invalid_outputs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="xhbx_rag.answer")
     invalid = '{"answer":"仍未闭合'
     http = _SequencedFakeSseClient(
-        [_sse_lines(_delta_chunk(content=invalid)) for _ in range(3)]
+        [
+            _sse_lines(
+                _delta_chunk(reasoning_content=f"第{attempt}次失败思考。"),
+                _delta_chunk(content=invalid),
+            )
+            for attempt in range(1, 4)
+        ]
     )
-    agent = _agent(http)
+    thinking: list[str] = []
+    agent = _agent(http, on_thinking_delta=thinking.append)
 
     with pytest.raises(
         IncompleteModelOutputError,
@@ -461,6 +519,22 @@ def test_answer_agent_stops_after_three_invalid_outputs() -> None:
     assert len(http.calls) == 3
     assert exc_info.value.last_error.startswith("JSONDecodeError:")
     assert isinstance(exc_info.value.__cause__, json.JSONDecodeError)
+    assert thinking == [
+        "第1次失败思考。",
+        "\n\n[第 1 次模型输出不完整，正在重新生成。]\n\n",
+        "第2次失败思考。",
+        "\n\n[第 2 次模型输出不完整，正在重新生成。]\n\n",
+        "第3次失败思考。",
+    ]
+    assert "第 3 次模型输出不完整，正在重新生成" not in "".join(thinking)
+    retry_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "xhbx_rag.answer"
+    ]
+    assert len(retry_messages) == 2
+    assert "attempt=1" in retry_messages[0]
+    assert "attempt=2" in retry_messages[1]
 
 
 def test_answer_agent_retries_schema_validation_failure() -> None:
