@@ -201,7 +201,7 @@ class AnswerAgent:
                     type(exc).__name__,
                     len(content),
                     stream_result.saw_done,
-                    stream_result.finish_reason,
+                    _safe_finish_reason_for_log(stream_result.finish_reason),
                 )
                 messages = _retry_messages(
                     base_messages,
@@ -324,6 +324,12 @@ def _require_complete_stream(result: _StreamChatResult) -> None:
         raise ValueError(
             f"流式响应异常结束: finish_reason={result.finish_reason}"
         )
+
+
+def _safe_finish_reason_for_log(finish_reason: str | None) -> str | None:
+    if finish_reason in (None, "stop", "length", "content_filter"):
+        return finish_reason
+    return "other"
 
 
 def _strip_json_fences(text: str) -> str:

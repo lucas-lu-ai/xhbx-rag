@@ -493,6 +493,39 @@ def test_answer_agent_reports_correction_retry_in_reasoning_and_safe_log(
     assert "MODEL-OUTPUT-SENTINEL" not in caplog.text
 
 
+def test_answer_agent_sanitizes_unknown_finish_reason_in_retry_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="xhbx_rag.answer")
+    content = '{"answer":"首次回答","citation_indexes":[1]}'
+    http = _SequencedFakeSseClient(
+        [
+            _sse_lines(
+                _delta_chunk(content=content),
+                _finish_chunk("MODEL-OUTPUT-SENTINEL\nINJECTED"),
+            ),
+            _answer_sse_lines("第二次生成成功。", [1], reasoning_parts=()),
+        ]
+    )
+
+    result = _agent(http).generate(_search_result())
+
+    assert result.answer == "第二次生成成功。"
+    retry_records = [
+        record for record in caplog.records if record.name == "xhbx_rag.answer"
+    ]
+    assert len(retry_records) == 1
+    log_message = retry_records[0].getMessage()
+    assert "attempt=1" in log_message
+    assert "error_type=ValueError" in log_message
+    assert f"content_chars={len(content)}" in log_message
+    assert "saw_done=True" in log_message
+    assert "finish_reason=other" in log_message
+    assert "MODEL-OUTPUT-SENTINEL" not in caplog.text
+    assert "INJECTED" not in caplog.text
+    assert "\nINJECTED" not in caplog.text
+
+
 def test_answer_agent_stops_after_three_invalid_outputs(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
