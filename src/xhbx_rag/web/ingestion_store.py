@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import uuid
@@ -464,7 +465,7 @@ class IngestionStore:
                 SET status = 'running', workspace_path = ?, started_at = ?
                 WHERE job_id = ? AND attempt_no = ? AND status = 'queued'
                 """,
-                (str(workspace_path.resolve()), now, job_id, attempt_no),
+                (os.path.abspath(os.fspath(workspace_path)), now, job_id, attempt_no),
             )
             if cursor.rowcount != 1:
                 raise RuntimeError("当前 attempt 不在 queued 状态")
@@ -637,7 +638,11 @@ class IngestionStore:
             current_state = row["commit_state"]
             job_status = row["job_status"]
             attempt_status = row["attempt_status"]
-            resolved_journal = str(journal_path.resolve()) if journal_path is not None else None
+            resolved_journal = (
+                os.path.abspath(os.fspath(journal_path))
+                if journal_path is not None
+                else None
+            )
             stored_journal = row["journal_path"]
             if (
                 stored_journal is not None

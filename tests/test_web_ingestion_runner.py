@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -201,6 +202,37 @@ def _prepare_recovery(
     return journal
 
 
+def _overwrite_current_attempt_paths(
+    store: IngestionStore,
+    job_id: str,
+    *,
+    workspace_path: Path | None = None,
+    journal_path: Path | None = None,
+    commit_state: str | None = None,
+) -> None:
+    assignments: list[str] = []
+    values: list[str] = []
+    if workspace_path is not None:
+        assignments.append("workspace_path = ?")
+        values.append(str(workspace_path))
+    if journal_path is not None:
+        assignments.append("journal_path = ?")
+        values.append(str(journal_path))
+    if commit_state is not None:
+        assignments.append("commit_state = ?")
+        values.append(commit_state)
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            f"""
+            UPDATE ingestion_attempts SET {', '.join(assignments)}
+            WHERE job_id = ? AND attempt_no = (
+                SELECT attempt_count FROM ingestion_jobs WHERE job_id = ?
+            )
+            """,
+            (*values, job_id, job_id),
+        )
+
+
 def test_runner_success_maps_events_commits_and_cleans_attempts(tmp_path: Path) -> None:
     store, job_id, job_dir = queued_store(tmp_path, item_count=1)
     pipeline = FakePipeline(
@@ -359,6 +391,158 @@ def test_corrupt_journal_stays_rolling_back_and_keeps_all_materials(tmp_path: Pa
     assert (job_dir / "attempts" / "1" / "staging" / "chunks.jsonl").is_file()
 
 
+def test_current_rollback_symlink_never_adopts_or_moves_old_committed_material(
+    tmp_path: Path,
+) -> None:
+    store, job_id, job_dir = queued_store(tmp_path)
+    assert store.claim_job(job_id)
+    workspace = job_dir / "attempts" / "1"
+    workspace.mkdir(parents=True)
+    store.begin_attempt(job_id, workspace)
+    (workspace / "staging").mkdir()
+    (workspace / "staging/current.txt").write_text("current", encoding="utf-8")
+    old_rollback = tmp_path / "old-job" / "rollback"
+    old_rollback.mkdir(parents=True)
+    old_journal = (old_rollback / "journal.json").resolve()
+    old_journal.write_text("old committed", encoding="utf-8")
+    (old_rollback / "snapshot.jsonl").write_text("old snapshot", encoding="utf-8")
+    (workspace / "rollback").symlink_to(old_rollback, target_is_directory=True)
+    indexer = FakeAtomicIndexer()
+    indexer.states[old_journal] = "committed"
+
+    _runner(store, FakePipeline(), indexer).recover_after_restart()
+
+    job = store.get_job(job_id)
+    assert job is not None
+    assert job["status"] == "rolling_back"
+    assert job["attempt"]["commit_state"] == "rolling_back"
+    execution = store.get_job_for_execution(job_id)
+    assert execution is not None
+    assert execution["attempt"]["journal_path"] == workspace / "rollback/journal.json"
+    assert old_journal.read_text(encoding="utf-8") == "old committed"
+    assert old_rollback.is_dir()
+    assert (workspace / "staging/current.txt").is_file()
+    assert (workspace / "rollback").is_symlink()
+
+
+@pytest.mark.parametrize("location", ["outside", "other_job"])
+def test_stored_fake_committed_journal_not_bound_to_current_attempt_is_rejected(
+    tmp_path: Path, location: str
+) -> None:
+    store, job_id, job_dir = queued_store(tmp_path, name="current")
+    assert store.claim_job(job_id)
+    workspace = job_dir / "attempts" / "1"
+    workspace.mkdir(parents=True)
+    store.begin_attempt(job_id, workspace)
+    (workspace / "staging").mkdir()
+    (workspace / "staging/current.txt").write_text("current", encoding="utf-8")
+    foreign_root = (
+        tmp_path / "outside"
+        if location == "outside"
+        else tmp_path / "jobs" / "other" / "attempts" / "1" / "rollback"
+    )
+    foreign_root.mkdir(parents=True)
+    foreign_journal = (foreign_root / "journal.json").absolute()
+    foreign_journal.write_text("same collection committed", encoding="utf-8")
+    (foreign_root / "snapshot.jsonl").write_text("foreign", encoding="utf-8")
+    _overwrite_current_attempt_paths(
+        store,
+        job_id,
+        journal_path=foreign_journal,
+        commit_state="prepared",
+    )
+    indexer = FakeAtomicIndexer()
+    indexer.states[foreign_journal.resolve()] = "committed"
+
+    runner: IngestionRunner
+    runner = _runner(
+        store,
+        FakePipeline(),
+        indexer,
+        sleep_fn=lambda delay: runner.stop(),
+    )
+    runner.execute_recovery(job_id)
+
+    job = store.get_job(job_id)
+    assert job is not None
+    assert job["status"] == "rolling_back"
+    assert job["attempt"]["commit_state"] == "rolling_back"
+    assert foreign_journal.read_text(encoding="utf-8") == "same collection committed"
+    assert (workspace / "staging/current.txt").is_file()
+
+
+def test_rollback_pending_external_path_is_never_adopted_or_deleted(tmp_path: Path) -> None:
+    store, job_id, job_dir = queued_store(tmp_path)
+    foreign_root = tmp_path / "foreign-rollback"
+    foreign_root.mkdir()
+    foreign_journal = (foreign_root / "journal.json").absolute()
+    foreign_journal.write_text("foreign committed", encoding="utf-8")
+    (foreign_root / "snapshot.jsonl").write_text("foreign snapshot", encoding="utf-8")
+
+    class ExternalPendingIndexer(FakeAtomicIndexer):
+        def commit(
+            self,
+            chunks_path: Path,
+            *,
+            journal_dir: Path,
+            on_state: Callable[[str, Path], None] | None = None,
+        ) -> AtomicIndexResult:
+            del chunks_path, journal_dir, on_state
+            self.states[foreign_journal.resolve()] = "committed"
+            raise RollbackPendingError(foreign_journal, "raw secret")
+
+    _runner(store, FakePipeline(), ExternalPendingIndexer()).execute_job(job_id)
+
+    job = store.get_job(job_id)
+    assert job is not None
+    assert job["status"] == "rolling_back"
+    assert job["attempt"]["commit_state"] == "rolling_back"
+    assert foreign_journal.read_text(encoding="utf-8") == "foreign committed"
+    assert (job_dir / "attempts" / "1" / "staging/chunks.jsonl").is_file()
+
+
+def test_old_attempt_committed_journal_cannot_complete_current_retry(tmp_path: Path) -> None:
+    store, job_id, job_dir = queued_store(tmp_path)
+    assert store.claim_job(job_id)
+    old_workspace = job_dir / "attempts" / "1"
+    old_workspace.mkdir(parents=True)
+    store.begin_attempt(job_id, old_workspace)
+    store.fail_job(job_id, code="parse_failed", detail="fixed")
+    assert store.retry_job(job_id) == {"result": "ok", "attempt_no": 2}
+    assert store.claim_job(job_id)
+    current_workspace = job_dir / "attempts" / "2"
+    current_workspace.mkdir(parents=True)
+    store.begin_attempt(job_id, current_workspace)
+    (current_workspace / "staging").mkdir()
+    (current_workspace / "staging/current.txt").write_text("current", encoding="utf-8")
+    old_rollback = old_workspace / "rollback"
+    old_rollback.mkdir()
+    old_journal = (old_rollback / "journal.json").absolute()
+    old_journal.write_text("old committed", encoding="utf-8")
+    (old_rollback / "snapshot.jsonl").write_text("old", encoding="utf-8")
+    _overwrite_current_attempt_paths(
+        store, job_id, journal_path=old_journal, commit_state="prepared"
+    )
+    indexer = FakeAtomicIndexer()
+    indexer.states[old_journal.resolve()] = "committed"
+
+    runner: IngestionRunner
+    runner = _runner(
+        store,
+        FakePipeline(),
+        indexer,
+        sleep_fn=lambda delay: runner.stop(),
+    )
+    runner.execute_recovery(job_id)
+
+    job = store.get_job(job_id)
+    assert job is not None
+    assert job["status"] == "rolling_back"
+    assert job["attempt"]["commit_state"] == "rolling_back"
+    assert old_journal.read_text(encoding="utf-8") == "old committed"
+    assert (current_workspace / "staging/current.txt").is_file()
+
+
 def test_execute_recovery_retries_2_4_then_rolls_back_and_cleans(tmp_path: Path) -> None:
     store, job_id, job_dir = queued_store(tmp_path)
     indexer = FakeAtomicIndexer(recover_failures=2)
@@ -405,6 +589,31 @@ def test_execute_recovery_retries_when_indexer_factory_is_temporarily_unavailabl
     assert sleeps == [2.0, 4.0]
     assert factory_calls == 3
     assert store.get_job(job_id)["status"] == "failed"
+
+
+def test_execute_recovery_backoff_saturates_without_unbounded_exponentiation(
+    tmp_path: Path,
+) -> None:
+    store, job_id, job_dir = queued_store(tmp_path)
+    indexer = FakeAtomicIndexer(recover_failures=2_000)
+    _prepare_recovery(store, job_id, job_dir, indexer)
+    sleeps: list[float] = []
+    runner: IngestionRunner
+
+    def record_and_stop(delay: float) -> None:
+        sleeps.append(delay)
+        if len(sleeps) == 1_105:
+            runner.stop()
+
+    runner = _runner(store, FakePipeline(), indexer, sleep_fn=record_and_stop)
+
+    runner.execute_recovery(job_id)
+
+    assert sleeps[:6] == [2.0, 4.0, 8.0, 16.0, 32.0, 60.0]
+    assert len(sleeps) == 1_105
+    assert all(2.0 <= delay <= 60.0 for delay in sleeps)
+    assert sleeps[-1] == 60.0
+    assert store.get_job(job_id)["status"] == "rolling_back"
 
 
 def test_execute_recovery_finishes_verified_committed_without_rollback(tmp_path: Path) -> None:
@@ -459,6 +668,25 @@ def test_recover_after_restart_immediately_fails_uncommitted_interruption(
     assert list((job_dir / "attempts").iterdir()) == []
 
 
+def test_restart_treats_empty_workspace_before_begin_as_precommit_interruption(
+    tmp_path: Path,
+) -> None:
+    store, job_id, job_dir = queued_store(tmp_path)
+    assert store.claim_job(job_id)
+    workspace = job_dir / "attempts" / "1"
+    workspace.mkdir(parents=True)
+    runner = _runner(store, FakePipeline(), FakeAtomicIndexer())
+
+    runner.recover_after_restart()
+
+    job = store.get_job(job_id)
+    assert job is not None
+    assert job["status"] == "failed"
+    assert job["error_code"] == "service_restarted"
+    assert list((job_dir / "attempts").iterdir()) == []
+    assert runner._queue.empty()
+
+
 def test_restart_discovers_durable_journal_when_sqlite_is_still_not_started(
     tmp_path: Path,
 ) -> None:
@@ -510,6 +738,55 @@ def test_recovery_items_run_before_queued_jobs(tmp_path: Path) -> None:
 
     assert log[0].startswith("recover:")
     assert log[1] == f"prepare:{queued_id}"
+
+
+def test_restart_actions_are_isolated_and_interrupted_store_failure_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, interrupted_id, _ = queued_store(tmp_path, name="interrupted")
+    assert store.claim_job(interrupted_id)
+    _, recovery_id, recovery_dir = queued_store(tmp_path, name="recovery")
+    _, queued_id, _ = queued_store(tmp_path, name="queued")
+    indexer = FakeAtomicIndexer()
+    _prepare_recovery(store, recovery_id, recovery_dir, indexer)
+    real_fail = store.fail_job
+    interrupted_fail_calls = 0
+
+    def flaky_fail(job_id: str, *, code: str, detail: str) -> None:
+        nonlocal interrupted_fail_calls
+        if job_id == interrupted_id and interrupted_fail_calls < 2:
+            interrupted_fail_calls += 1
+            raise RuntimeError("SQLite /private/path token=secret")
+        real_fail(job_id, code=code, detail=detail)
+
+    monkeypatch.setattr(store, "fail_job", flaky_fail)
+    sleeps: list[float] = []
+    runner = _runner(store, FakePipeline(), indexer, sleep_fn=sleeps.append)
+
+    runner.recover_after_restart()
+
+    queued_kinds = [item.kind for item in list(runner._queue.queue)]
+    assert "interrupt" in queued_kinds
+    assert "recovery" in queued_kinds
+    assert "job" in queued_kinds
+
+    runner.start()
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        statuses = [
+            store.get_job(job_id)["status"]
+            for job_id in (interrupted_id, recovery_id, queued_id)
+        ]
+        if statuses == ["failed", "failed", "succeeded"]:
+            break
+        time.sleep(0.01)
+    runner.stop()
+
+    assert interrupted_fail_calls == 2
+    assert sleeps == [2.0]
+    assert store.get_job(interrupted_id)["error_code"] == "service_restarted"
+    assert store.get_job(recovery_id)["status"] == "failed"
+    assert store.get_job(queued_id)["status"] == "succeeded"
 
 
 def test_delete_recovery_retries_without_finishing_store_early(

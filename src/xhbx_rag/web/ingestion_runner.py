@@ -3,6 +3,7 @@ from __future__ import annotations
 import itertools
 import os
 import queue
+import stat
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -40,7 +41,22 @@ class _AtomicIndexer(Protocol):
     def inspect_journal_state(self, journal_path: Path) -> str: ...
 
 
-QueueKind = Literal["job", "recovery", "delete", "stop"]
+QueueKind = Literal["job", "recovery", "interrupt", "delete", "stop"]
+
+
+class _UntrustedRecoveryMaterial(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class _ExpectedPaths:
+    job_dir: Path
+    attempts_dir: Path
+    attempt_no: int
+    workspace: Path
+    rollback_dir: Path
+    journal: Path
+    backup: Path
 
 
 @dataclass(order=True, frozen=True)
@@ -113,9 +129,10 @@ class IngestionRunner:
         if job is None:
             return
         try:
-            job_dir = _job_dir(job)
-            attempt_no = int(job["attempt_count"])
-            workspace = job_dir / "attempts" / str(attempt_no)
+            paths = _expected_paths(job)
+            _validate_attempt_binding(job, paths, allow_workspace_none=True)
+            _validate_directory_chain(paths, include_rollback=False)
+            workspace = paths.workspace
             workspace.mkdir(parents=True, exist_ok=False)
             self.store.begin_attempt(job_id, workspace)
         except Exception as exc:
@@ -160,7 +177,7 @@ class IngestionRunner:
         )
 
     def execute_recovery(self, job_id: str) -> None:
-        retry = 0
+        delay = 2.0
         while not self._stop_event.is_set():
             job = self.store.get_job_for_execution(job_id)
             if job is None or job["status"] not in {"running", "rolling_back"}:
@@ -168,21 +185,28 @@ class IngestionRunner:
             attempt = job.get("attempt")
             if not isinstance(attempt, dict):
                 return
-            journal = self._journal_for_job(job)
-            if journal is None:
-                return
-            indexer: _AtomicIndexer | None = None
-            state: str | None = None
             try:
-                indexer = self.indexer_factory(str(job["target"]))
-                indexer.recover(journal)
-                state = indexer.inspect_journal_state(journal)
-            except Exception:
-                if indexer is not None:
-                    try:
-                        state = indexer.inspect_journal_state(journal)
-                    except Exception:
-                        state = None
+                journal = self._journal_for_job(job)
+            except _UntrustedRecoveryMaterial:
+                journal = _expected_paths(job).journal
+                self._ensure_rolling_back(job_id, journal)
+                state = None
+            else:
+                if journal is None:
+                    return
+                state = None
+            indexer: _AtomicIndexer | None = None
+            if state is None and _is_trusted_journal(job, journal):
+                try:
+                    indexer = self.indexer_factory(str(job["target"]))
+                    indexer.recover(journal)
+                    state = indexer.inspect_journal_state(journal)
+                except Exception:
+                    if indexer is not None:
+                        try:
+                            state = indexer.inspect_journal_state(journal)
+                        except Exception:
+                            state = None
 
             if state == "committed":
                 if not self._reconcile_committed(job_id, journal):
@@ -204,32 +228,71 @@ class IngestionRunner:
                 return
 
             self._ensure_rolling_back(job_id, journal)
-            delay = min(2.0 * (2**retry), 60.0)
-            retry += 1
             if not self._sleep(delay):
                 return
+            delay = min(delay * 2.0, 60.0)
+
+    def execute_interrupt(self, job_id: str) -> None:
+        delay = 2.0
+        while not self._stop_event.is_set():
+            job = self.store.get_job_for_execution(job_id)
+            if job is None or job["status"] != "running":
+                return
+            try:
+                journal = self._journal_for_job(job)
+                if journal is not None:
+                    self.execute_recovery(job_id)
+                    return
+                if not self._cleanup_attempts(job):
+                    raise RuntimeError("interrupted cleanup pending")
+                code, detail = safe_ingestion_error("service_restarted")
+                self.store.fail_job(job_id, code=code, detail=detail)
+                return
+            except _UntrustedRecoveryMaterial:
+                self._ensure_rolling_back(job_id, _expected_paths(job).journal)
+                return
+            except Exception:
+                if not self._sleep(delay):
+                    return
+                delay = min(delay * 2.0, 60.0)
 
     def recover_after_restart(self) -> None:
         actions = self.store.recovery_actions()
         discovered_recovery: list[str] = []
+        interrupted_retry: list[str] = []
         for action in actions:
             if action.action == "fail_interrupted":
-                if self._fail_interrupted(action):
-                    discovered_recovery.append(action.job_id)
+                try:
+                    if self._fail_interrupted(action):
+                        discovered_recovery.append(action.job_id)
+                    else:
+                        current = self.store.get_job_for_execution(action.job_id)
+                        if current is not None and current["status"] == "running":
+                            interrupted_retry.append(action.job_id)
+                except Exception:
+                    interrupted_retry.append(action.job_id)
 
         queued_recovery: set[str] = set()
         for action in actions:
-            if action.action in {"rollback", "finish_committed"}:
-                self._put("recovery", action.job_id, priority=0)
-                queued_recovery.add(action.job_id)
-            elif action.action == "delete":
-                self._put("delete", action.job_id, priority=0)
+            try:
+                if action.action in {"rollback", "finish_committed"}:
+                    self._put("recovery", action.job_id, priority=0)
+                    queued_recovery.add(action.job_id)
+                elif action.action == "delete":
+                    self._put("delete", action.job_id, priority=0)
+            except Exception:
+                continue
         for job_id in discovered_recovery:
             if job_id not in queued_recovery:
                 self._put("recovery", job_id, priority=0)
+        for job_id in interrupted_retry:
+            self._put("interrupt", job_id, priority=0)
         for action in actions:
             if action.action == "enqueue":
-                self._put("job", action.job_id, priority=10)
+                try:
+                    self._put("job", action.job_id, priority=10)
+                except Exception:
+                    continue
 
     def _handle_commit_exception(
         self,
@@ -241,18 +304,27 @@ class IngestionRunner:
         exc: Exception,
     ) -> None:
         current = self.store.get_job_for_execution(job_id)
-        attempt = current.get("attempt") if current is not None else None
-        stored_journal = attempt.get("journal_path") if isinstance(attempt, dict) else None
-        journal: Path | None
-        if isinstance(exc, RollbackPendingError):
-            journal = Path(exc.journal_path).resolve()
-        elif isinstance(stored_journal, Path):
-            journal = stored_journal.resolve()
-        else:
-            candidate = (workspace / "rollback" / "journal.json").resolve()
-            journal = candidate if candidate.exists() else None
+        if current is None:
+            return
+        paths = _expected_paths(current)
+        if workspace != paths.workspace:
+            self._ensure_rolling_back(job_id, paths.journal)
+            return
+        if isinstance(exc, RollbackPendingError) and not _lexical_path_equals(
+            Path(exc.journal_path), paths.journal
+        ):
+            self._ensure_rolling_back(job_id, paths.journal)
+            return
+        try:
+            journal = self._journal_for_job(current)
+        except _UntrustedRecoveryMaterial:
+            self._ensure_rolling_back(job_id, paths.journal)
+            return
 
         if journal is None:
+            if isinstance(exc, RollbackPendingError):
+                self._ensure_rolling_back(job_id, paths.journal)
+                return
             self._finish_precommit_failure(job_id, job, exc)
             return
 
@@ -398,7 +470,17 @@ class IngestionRunner:
 
     def _cleanup_attempts(self, job: Mapping[str, object]) -> bool:
         try:
-            clear_attempt_workspaces(_job_dir(job))
+            job_id = job.get("job_id")
+            current = (
+                self.store.get_job_for_execution(job_id)
+                if isinstance(job_id, str)
+                else None
+            )
+            checked = current or job
+            paths = _expected_paths(checked)
+            _validate_attempt_binding(checked, paths, allow_workspace_none=True)
+            _validate_directory_chain(paths, include_rollback=True)
+            clear_attempt_workspaces(paths.job_dir)
         except Exception:
             return False
         return True
@@ -418,6 +500,7 @@ class IngestionRunner:
             self._restore_recovery_material(job, backup)
             return False
         try:
+            _validate_recovery_location(_expected_paths(job), backup)
             delete_job_workspace(backup)
         except Exception:
             pass
@@ -426,65 +509,73 @@ class IngestionRunner:
     def _stash_committed_recovery(
         self, job: Mapping[str, object]
     ) -> Path | None:
-        journal = self._journal_for_job(job)
-        if journal is None:
-            return None
-        backup = _recovery_backup_path(job)
         try:
+            paths = _expected_paths(job)
+            journal = self._journal_for_job(job)
+            if journal is None:
+                return None
+            backup = paths.backup
+            _validate_recovery_location(paths, backup)
             if backup.exists() or backup.is_symlink():
                 return None
             journal.parent.replace(backup)
             _fsync_directory(journal.parent.parent)
-            _fsync_directory(_job_dir(job))
+            _fsync_directory(_trusted_job_dir(job))
             if not self._cleanup_attempts(job):
                 self._restore_recovery_material(job, backup)
                 return None
             return backup
         except Exception:
-            self._restore_recovery_material(job, backup)
+            if "backup" in locals():
+                self._restore_recovery_material(job, backup)
             return None
 
     def _journal_for_job(self, job: Mapping[str, object]) -> Path | None:
+        paths = _expected_paths(job)
         attempt = job.get("attempt")
-        if not isinstance(attempt, dict):
+        if (
+            isinstance(attempt, dict)
+            and attempt.get("workspace_path") is None
+            and attempt.get("journal_path") is None
+            and attempt.get("commit_state") == "not_started"
+        ):
+            _validate_attempt_binding(job, paths, allow_workspace_none=True)
+            _validate_directory_chain(paths, include_rollback=True)
+            if paths.workspace.is_dir():
+                if any(paths.workspace.iterdir()):
+                    raise _UntrustedRecoveryMaterial("未开始 attempt 存在异常恢复材料")
+                return None
+            if paths.workspace.exists() or paths.workspace.is_symlink():
+                raise _UntrustedRecoveryMaterial("未开始 attempt 工作区不可信")
             return None
-        stored = attempt.get("journal_path")
-        workspace = attempt.get("workspace_path")
-        if isinstance(stored, Path):
-            journal = stored.resolve()
-        elif isinstance(workspace, Path):
-            journal = (workspace / "rollback" / "journal.json").resolve()
-        else:
-            return None
-        if journal.is_file():
-            return journal
-        backup = _recovery_backup_path(job)
-        if backup.is_dir() and self._restore_recovery_material(job, backup):
-            return journal if journal.is_file() else None
+        _validate_attempt_binding(job, paths, allow_workspace_none=False)
+        _validate_recovery_location(paths, paths.rollback_dir)
+        if paths.journal.is_file():
+            return paths.journal
+        _validate_recovery_location(paths, paths.backup)
+        if paths.backup.is_dir() and self._restore_recovery_material(job, paths.backup):
+            _validate_recovery_location(paths, paths.rollback_dir)
+            return paths.journal if paths.journal.is_file() else None
         return None
 
     def _restore_recovery_material(
         self, job: Mapping[str, object], backup: Path
     ) -> bool:
-        attempt = job.get("attempt")
-        if not isinstance(attempt, dict):
-            return False
-        stored = attempt.get("journal_path")
-        workspace = attempt.get("workspace_path")
-        if isinstance(stored, Path):
-            rollback_dir = stored.resolve().parent
-        elif isinstance(workspace, Path):
-            rollback_dir = (workspace / "rollback").resolve()
-        else:
-            return False
         try:
-            if rollback_dir.is_dir():
-                return (rollback_dir / "journal.json").is_file()
-            rollback_dir.parent.mkdir(parents=True, exist_ok=True)
-            backup.replace(rollback_dir)
-            _fsync_directory(rollback_dir.parent)
-            _fsync_directory(_job_dir(job))
-            return (rollback_dir / "journal.json").is_file()
+            paths = _expected_paths(job)
+            _validate_attempt_binding(job, paths, allow_workspace_none=False)
+            if backup != paths.backup:
+                raise _UntrustedRecoveryMaterial("恢复备份路径不可信")
+            _validate_recovery_location(paths, backup)
+            _validate_recovery_location(paths, paths.rollback_dir)
+            if paths.rollback_dir.is_dir():
+                return paths.journal.is_file()
+            paths.rollback_dir.parent.mkdir(parents=True, exist_ok=True)
+            backup.replace(paths.rollback_dir)
+            _fsync_directory(paths.rollback_dir.parent)
+            _fsync_directory(paths.job_dir)
+            _validate_recovery_location(paths, paths.rollback_dir)
+            return paths.journal.is_file()
         except Exception:
             return False
 
@@ -492,7 +583,11 @@ class IngestionRunner:
         job = self.store.get_job_for_execution(action.job_id)
         if job is None:
             return False
-        journal = self._journal_for_job(job)
+        try:
+            journal = self._journal_for_job(job)
+        except _UntrustedRecoveryMaterial:
+            self._ensure_rolling_back(action.job_id, _expected_paths(job).journal)
+            return True
         if journal is not None:
             try:
                 indexer = self.indexer_factory(str(job["target"]))
@@ -531,7 +626,8 @@ class IngestionRunner:
         if job is None:
             return
         try:
-            delete_job_workspace(_job_dir(job))
+            job_dir = _trusted_job_dir(job)
+            delete_job_workspace(job_dir)
         except Exception:
             return
         self.store.finish_delete(job_id)
@@ -558,6 +654,8 @@ class IngestionRunner:
                         self.execute_job(item.job_id)
                     elif item.kind == "recovery":
                         self.execute_recovery(item.job_id)
+                    elif item.kind == "interrupt":
+                        self.execute_interrupt(item.job_id)
                     elif item.kind == "delete":
                         self._execute_delete(item.job_id)
                 except Exception:
@@ -566,18 +664,136 @@ class IngestionRunner:
                 self._queue.task_done()
 
 
-def _job_dir(job: Mapping[str, object]) -> Path:
+def _trusted_job_dir(job: Mapping[str, object]) -> Path:
     source_path = job.get("source_path")
-    if not isinstance(source_path, Path) or source_path.parent.name != "source":
-        raise ValueError("入库任务工作区无效")
-    return source_path.parent.parent
+    if (
+        not isinstance(source_path, Path)
+        or not source_path.is_absolute()
+        or source_path.parent.name != "source"
+    ):
+        raise _UntrustedRecoveryMaterial("入库任务工作区无效")
+    job_dir = source_path.parent.parent
+    if source_path != source_path.resolve(strict=False):
+        raise _UntrustedRecoveryMaterial("入库源路径不可信")
+    if job_dir.exists() and (
+        job_dir.is_symlink() or job_dir.resolve(strict=True) != job_dir
+    ):
+        raise _UntrustedRecoveryMaterial("入库任务目录不可信")
+    return job_dir
 
 
-def _recovery_backup_path(job: Mapping[str, object]) -> Path:
+def _expected_paths(job: Mapping[str, object]) -> _ExpectedPaths:
+    job_dir = _trusted_job_dir(job)
     attempt = job.get("attempt")
-    if not isinstance(attempt, dict) or not _is_positive_int(attempt.get("attempt_no")):
-        raise ValueError("入库 attempt 无效")
-    return _job_dir(job) / f".recovery-attempt-{attempt['attempt_no']}"
+    attempt_count = job.get("attempt_count")
+    if (
+        not isinstance(attempt, dict)
+        or not _is_positive_int(attempt_count)
+        or attempt.get("attempt_no") != attempt_count
+    ):
+        raise _UntrustedRecoveryMaterial("当前 attempt 绑定无效")
+    attempt_no = cast(int, attempt_count)
+    attempts_dir = job_dir / "attempts"
+    workspace = attempts_dir / str(attempt_no)
+    rollback_dir = workspace / "rollback"
+    return _ExpectedPaths(
+        job_dir=job_dir,
+        attempts_dir=attempts_dir,
+        attempt_no=attempt_no,
+        workspace=workspace,
+        rollback_dir=rollback_dir,
+        journal=rollback_dir / "journal.json",
+        backup=job_dir / f".recovery-attempt-{attempt_no}",
+    )
+
+
+def _validate_attempt_binding(
+    job: Mapping[str, object],
+    paths: _ExpectedPaths,
+    *,
+    allow_workspace_none: bool,
+) -> None:
+    attempt = job.get("attempt")
+    if not isinstance(attempt, dict):
+        raise _UntrustedRecoveryMaterial("当前 attempt 缺失")
+    workspace = attempt.get("workspace_path")
+    if workspace is None and allow_workspace_none:
+        pass
+    elif not _lexical_path_equals(workspace, paths.workspace):
+        raise _UntrustedRecoveryMaterial("attempt workspace 绑定无效")
+    stored_journal = attempt.get("journal_path")
+    if stored_journal is not None and not _lexical_path_equals(
+        stored_journal, paths.journal
+    ):
+        raise _UntrustedRecoveryMaterial("commit journal 绑定无效")
+
+
+def _lexical_path_equals(value: object, expected: Path) -> bool:
+    return (
+        isinstance(value, Path)
+        and value.is_absolute()
+        and str(value) == str(expected)
+    )
+
+
+def _validate_directory_chain(
+    paths: _ExpectedPaths, *, include_rollback: bool
+) -> None:
+    components = [paths.attempts_dir, paths.workspace]
+    if include_rollback:
+        components.extend((paths.rollback_dir, paths.journal))
+    for index, component in enumerate(components):
+        if not component.exists() and not component.is_symlink():
+            continue
+        metadata = component.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            raise _UntrustedRecoveryMaterial("恢复路径包含符号链接")
+        is_final_file = include_rollback and index == len(components) - 1
+        if is_final_file:
+            if not stat.S_ISREG(metadata.st_mode):
+                raise _UntrustedRecoveryMaterial("journal 不是常规文件")
+        elif not stat.S_ISDIR(metadata.st_mode):
+            raise _UntrustedRecoveryMaterial("恢复路径组件不是目录")
+        resolved = component.resolve(strict=True)
+        if not resolved.is_relative_to(paths.job_dir):
+            raise _UntrustedRecoveryMaterial("恢复路径越过任务目录")
+
+
+def _validate_recovery_location(paths: _ExpectedPaths, location: Path) -> None:
+    if location == paths.rollback_dir:
+        _validate_directory_chain(paths, include_rollback=True)
+        return
+    if location != paths.backup:
+        raise _UntrustedRecoveryMaterial("恢复材料位置无效")
+    if not location.exists() and not location.is_symlink():
+        return
+    metadata = location.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise _UntrustedRecoveryMaterial("恢复备份不是可信目录")
+    if not location.resolve(strict=True).is_relative_to(paths.job_dir):
+        raise _UntrustedRecoveryMaterial("恢复备份越过任务目录")
+    for entry in location.iterdir():
+        entry_metadata = entry.lstat()
+        if stat.S_ISLNK(entry_metadata.st_mode) or not stat.S_ISREG(
+            entry_metadata.st_mode
+        ):
+            raise _UntrustedRecoveryMaterial("恢复备份包含不可信条目")
+        if not entry.resolve(strict=True).is_relative_to(location):
+            raise _UntrustedRecoveryMaterial("恢复备份条目越界")
+
+
+def _is_trusted_journal(job: Mapping[str, object], journal: Path) -> bool:
+    try:
+        return _journal_path_without_restore(job) == journal
+    except _UntrustedRecoveryMaterial:
+        return False
+
+
+def _journal_path_without_restore(job: Mapping[str, object]) -> Path | None:
+    paths = _expected_paths(job)
+    _validate_attempt_binding(job, paths, allow_workspace_none=False)
+    _validate_recovery_location(paths, paths.rollback_dir)
+    return paths.journal if paths.journal.is_file() else None
 
 
 def _fsync_directory(path: Path) -> None:
