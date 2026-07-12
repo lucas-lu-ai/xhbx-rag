@@ -228,7 +228,7 @@ def _zip_preflight_result(
     if not supported:
         raise UploadValidationError("上传中没有支持的文档")
     items = (
-        _map_case_items(supported)
+        _map_case_items(supported, source_stem=Path(source_name).stem)
         if target == "case"
         else _map_course_items(supported)
     )
@@ -275,9 +275,14 @@ def _validated_zip_entries(
             raise UploadValidationError(f"ZIP 路径冲突: {normalized}")
         seen_paths[path_key] = is_directory
 
+        if info.flag_bits & 0x1:
+            raise UploadValidationError(f"ZIP 中不允许加密条目: {normalized}")
         mode = (info.external_attr >> 16) & 0xFFFF
-        if stat.S_ISLNK(mode):
+        mode_type = stat.S_IFMT(mode)
+        if mode_type == stat.S_IFLNK:
             raise UploadValidationError(f"ZIP 中不允许符号链接: {normalized}")
+        if mode_type not in (0, stat.S_IFREG, stat.S_IFDIR):
+            raise UploadValidationError(f"ZIP 中不允许非常规类型: {normalized}")
         if info.file_size > limits.max_entry_bytes:
             raise UploadValidationError(f"ZIP 单个条目过大: {normalized}")
 
@@ -324,9 +329,14 @@ def _is_ignored_path(relative_path: str) -> bool:
     )
 
 
-def _map_case_items(relative_paths: list[str]) -> tuple[PreflightItem, ...]:
+def _map_case_items(
+    relative_paths: list[str],
+    *,
+    source_stem: str,
+) -> tuple[PreflightItem, ...]:
     grouped: dict[str, list[str]] = {}
     original_names: dict[str, str] = {}
+    safe_name_owners: dict[str, str] = {}
     for relative_path in relative_paths:
         parts = PurePosixPath(relative_path).parts
         unit_key = parts[0] if len(parts) > 1 else "__root__"
@@ -337,15 +347,26 @@ def _map_case_items(relative_paths: list[str]) -> tuple[PreflightItem, ...]:
         if previous is not None and previous != unit_key:
             raise UploadValidationError(f"案例名称冲突: {previous} / {unit_key}")
         original_names[normalized_name] = unit_key
+        if len(parts) > 1:
+            safe_name = _safe_case_name(normalized_name)
+            safe_owner = safe_name_owners.get(safe_name)
+            if safe_owner is not None and safe_owner != normalized_name:
+                raise UploadValidationError(
+                    f"案例名称冲突: {safe_owner} / {normalized_name}"
+                )
+            safe_name_owners[safe_name] = normalized_name
         grouped.setdefault(normalized_name, []).append(relative_path)
 
-    if "__root__" in grouped and "根目录" in grouped:
-        raise UploadValidationError("案例名称冲突: 根目录")
+    if (
+        "__root__" in grouped
+        and _safe_case_name(source_stem) in safe_name_owners
+    ):
+        raise UploadValidationError(f"案例名称冲突: {source_stem}")
 
     items: list[PreflightItem] = []
     for index, unit_key in enumerate(sorted(grouped), start=1):
         paths = tuple(grouped[unit_key])
-        display_name = "根目录" if unit_key == "__root__" else unit_key
+        display_name = source_stem if unit_key == "__root__" else unit_key
         items.append(
             PreflightItem(
                 item_index=index,
@@ -356,6 +377,11 @@ def _map_case_items(relative_paths: list[str]) -> tuple[PreflightItem, ...]:
             )
         )
     return tuple(items)
+
+
+def _safe_case_name(value: str) -> str:
+    safe = re.sub(r"[^\w\u4e00-\u9fff.-]+", "_", value).strip("._ ")
+    return safe or "case"
 
 
 def _map_course_items(relative_paths: list[str]) -> tuple[PreflightItem, ...]:

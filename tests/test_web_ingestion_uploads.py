@@ -23,6 +23,16 @@ def _zip(path: Path, entries: dict[str, bytes]) -> Path:
     return path
 
 
+def _mark_first_zip_entry_encrypted(path: Path) -> None:
+    data = bytearray(path.read_bytes())
+    for signature, flag_offset in ((b"PK\x03\x04", 6), (b"PK\x01\x02", 8)):
+        header = data.index(signature)
+        start = header + flag_offset
+        flags = int.from_bytes(data[start : start + 2], "little") | 0x1
+        data[start : start + 2] = flags.to_bytes(2, "little")
+    path.write_bytes(data)
+
+
 def test_case_zip_maps_root_files_and_first_level_directories(tmp_path: Path) -> None:
     source = _zip(
         tmp_path / "优秀案例.zip",
@@ -42,6 +52,8 @@ def test_case_zip_maps_root_files_and_first_level_directories(tmp_path: Path) ->
         ("李先生", 1),
         ("王女士", 1),
     ]
+    root_item = next(item for item in result.items if item.unit_key == "__root__")
+    assert root_item.display_name == "优秀案例"
     assert result.document_total == 3
     assert result.ignored_total == 2
 
@@ -108,6 +120,16 @@ def test_case_zip_rejects_normalized_name_collision(tmp_path: Path) -> None:
         preflight_upload(source, target="case", limits=IngestionLimits())
 
 
+def test_case_zip_rejects_downstream_safe_name_collision(tmp_path: Path) -> None:
+    source = _zip(
+        tmp_path / "cases.zip",
+        {"A B/notes.txt": b"space", "A?B/notes.txt": b"question"},
+    )
+
+    with pytest.raises(UploadValidationError, match="案例名称冲突"):
+        preflight_upload(source, target="case", limits=IngestionLimits())
+
+
 def test_case_zip_rejects_reserved_root_unit_key(tmp_path: Path) -> None:
     source = _zip(tmp_path / "cases.zip", {"__root__/notes.txt": b"notes"})
 
@@ -115,10 +137,20 @@ def test_case_zip_rejects_reserved_root_unit_key(tmp_path: Path) -> None:
         preflight_upload(source, target="case", limits=IngestionLimits())
 
 
-def test_case_zip_rejects_root_display_name_collision(tmp_path: Path) -> None:
+def test_case_zip_rejects_zip_stem_display_name_collision(tmp_path: Path) -> None:
     source = _zip(
         tmp_path / "cases.zip",
-        {"root.txt": b"root", "根目录/notes.txt": b"notes"},
+        {"root.txt": b"root", "cases/notes.txt": b"notes"},
+    )
+
+    with pytest.raises(UploadValidationError, match="案例名称冲突"):
+        preflight_upload(source, target="case", limits=IngestionLimits())
+
+
+def test_case_zip_rejects_safe_name_collision_with_zip_stem(tmp_path: Path) -> None:
+    source = _zip(
+        tmp_path / "A B.zip",
+        {"root.txt": b"root", "A?B/notes.txt": b"notes"},
     )
 
     with pytest.raises(UploadValidationError, match="案例名称冲突"):
@@ -153,6 +185,28 @@ def test_zip_rejects_symlink(tmp_path: Path) -> None:
     with ZipFile(source, "w") as archive:
         archive.writestr(info, "target.txt")
     with pytest.raises(UploadValidationError, match="符号链接"):
+        preflight_upload(source, target="course", limits=IngestionLimits())
+
+
+def test_zip_rejects_fifo(tmp_path: Path) -> None:
+    source = tmp_path / "fifo.zip"
+    info = ZipInfo("fifo.txt")
+    info.create_system = 3
+    info.external_attr = (stat.S_IFIFO | 0o644) << 16
+    with ZipFile(source, "w") as archive:
+        archive.writestr(info, "fifo")
+
+    with pytest.raises(UploadValidationError, match="非常规类型"):
+        preflight_upload(source, target="course", limits=IngestionLimits())
+
+
+def test_zip_rejects_encrypted_entry(tmp_path: Path) -> None:
+    source = _zip(tmp_path / "encrypted.zip", {"course.txt": b"course"})
+    _mark_first_zip_entry_encrypted(source)
+    with ZipFile(source) as archive:
+        assert archive.infolist()[0].flag_bits & 0x1
+
+    with pytest.raises(UploadValidationError, match="加密条目"):
         preflight_upload(source, target="course", limits=IngestionLimits())
 
 
