@@ -110,7 +110,11 @@ type IngestionDetailRefreshMode = "automatic" | "manual";
 type IngestionDetailRefreshCoordinator = {
   inFlight: Promise<RefreshResult<IngestionJobDetail>> | null;
   trailing: boolean;
-  waiters: Array<(result: RefreshResult<IngestionJobDetail>) => void>;
+  generation: number;
+  waiters: Array<{
+    generation: number;
+    resolve: (result: RefreshResult<IngestionJobDetail>) => void;
+  }>;
   cancelled: boolean;
 };
 
@@ -154,8 +158,12 @@ export function App({
   const [ingestionDetailError, setIngestionDetailError] = useState("");
   const [ingestionActions, setIngestionActions] = useState<Record<string, IngestionActionState>>({});
   const ingestionActionTokenRef = useRef(0);
+  const ingestionActionTokensRef = useRef(new Map<string, number>());
   const ingestionPendingJobsRef = useRef(new Set<string>());
   const ingestionListRequestRef = useRef(0);
+  const ingestionJobsRef = useRef<IngestionJobSummary[]>([]);
+  const ingestionJobVersionsRef = useRef(new Map<string, number>());
+  const ingestionJobTombstonesRef = useRef(new Set<string>());
   const ingestionDetailRequestRef = useRef(0);
   const ingestionDetailRefreshesRef = useRef(
     new Map<string, IngestionDetailRefreshCoordinator>()
@@ -176,7 +184,7 @@ export function App({
         coordinator.cancelled = true;
         coordinator.trailing = false;
         const waiters = coordinator.waiters.splice(0);
-        waiters.forEach((resolve) => resolve({ status: "stale" }));
+        waiters.forEach(({ resolve }) => resolve({ status: "stale" }));
       }
       ingestionDetailRefreshesRef.current.clear();
       unsubscribe();
@@ -185,15 +193,33 @@ export function App({
 
   const refetchIngestionJobs = useCallback(async (): Promise<RefreshResult<IngestionJobSummary[]>> => {
     const requestId = ++ingestionListRequestRef.current;
+    const versionSnapshot = new Map(ingestionJobVersionsRef.current);
     setIngestionJobsLoading(true);
     try {
       const payload = await listIngestionJobs();
-      if (!appMountedRef.current || requestId !== ingestionListRequestRef.current) {
-        return { status: "stale" };
+      if (!appMountedRef.current) return { status: "stale" };
+      if (requestId === ingestionListRequestRef.current) {
+        const mergedJobs = mergeIngestionJobList(
+          payload.jobs,
+          ingestionJobsRef.current,
+          versionSnapshot,
+          ingestionJobVersionsRef.current,
+          ingestionJobTombstonesRef.current
+        );
+        ingestionJobsRef.current = mergedJobs;
+        setIngestionJobs(mergedJobs);
+        setIngestionJobsLoaded(true);
+        setIngestionJobsError("");
+        const selectedJobId = selectedIngestionJobIdRef.current;
+        const selectedSummary = mergedJobs.find((job) => job.job_id === selectedJobId);
+        if (selectedSummary) {
+          setIngestionDetail((current) =>
+            current && current.job_id === selectedJobId
+              ? mergeSummaryIntoDetail(current, selectedSummary)
+              : current
+          );
+        }
       }
-      setIngestionJobs(payload.jobs);
-      setIngestionJobsLoaded(true);
-      setIngestionJobsError("");
       return { status: "success", value: payload.jobs };
     } catch (error) {
       if (!appMountedRef.current || requestId !== ingestionListRequestRef.current) {
@@ -210,9 +236,18 @@ export function App({
   }, []);
 
   const applyOptimisticIngestionJobs = useCallback(
-    (updater: (current: IngestionJobSummary[]) => IngestionJobSummary[]) => {
-      ingestionListRequestRef.current += 1;
-      setIngestionJobs(updater);
+    (
+      jobId: string,
+      updater: (current: IngestionJobSummary[]) => IngestionJobSummary[],
+      tombstone = false
+    ) => {
+      const version = (ingestionJobVersionsRef.current.get(jobId) ?? 0) + 1;
+      ingestionJobVersionsRef.current.set(jobId, version);
+      if (tombstone) ingestionJobTombstonesRef.current.add(jobId);
+      else ingestionJobTombstonesRef.current.delete(jobId);
+      const next = updater(ingestionJobsRef.current);
+      ingestionJobsRef.current = next;
+      setIngestionJobs(next);
       setIngestionJobsLoaded(true);
     },
     []
@@ -256,21 +291,24 @@ export function App({
     jobId: string,
     coordinator: IngestionDetailRefreshCoordinator
   ): Promise<RefreshResult<IngestionJobDetail>> {
+    const generation = ++coordinator.generation;
     const request = performIngestionDetailRefresh(jobId);
     coordinator.inFlight = request;
-    void request.then(() => {
+    void request.then((result) => {
       if (
         coordinator.cancelled ||
         ingestionDetailRefreshesRef.current.get(jobId) !== coordinator
       ) return;
       coordinator.inFlight = null;
+      const remainingWaiters = [] as IngestionDetailRefreshCoordinator["waiters"];
+      for (const waiter of coordinator.waiters) {
+        if (waiter.generation <= generation) waiter.resolve(result);
+        else remainingWaiters.push(waiter);
+      }
+      coordinator.waiters = remainingWaiters;
       if (!coordinator.trailing) return;
       coordinator.trailing = false;
-      const waiters = coordinator.waiters.splice(0);
-      const trailingRequest = launch(jobId, coordinator);
-      void trailingRequest.then((result) => {
-        waiters.forEach((resolve) => resolve(result));
-      });
+      void launch(jobId, coordinator);
     });
     return request;
   }, [performIngestionDetailRefresh]);
@@ -281,16 +319,31 @@ export function App({
   ): Promise<RefreshResult<IngestionJobDetail>> => {
     let coordinator = ingestionDetailRefreshesRef.current.get(jobId);
     if (!coordinator || coordinator.cancelled) {
-      coordinator = { inFlight: null, trailing: false, waiters: [], cancelled: false };
+      coordinator = {
+        inFlight: null,
+        trailing: false,
+        generation: 0,
+        waiters: [],
+        cancelled: false
+      };
       ingestionDetailRefreshesRef.current.set(jobId, coordinator);
     }
     if (!coordinator.inFlight) {
-      return launchIngestionDetailRefresh(jobId, coordinator);
+      if (mode === "automatic") {
+        return launchIngestionDetailRefresh(jobId, coordinator);
+      }
+      const generation = coordinator.generation + 1;
+      const result = new Promise<RefreshResult<IngestionJobDetail>>((resolve) => {
+        coordinator?.waiters.push({ generation, resolve });
+      });
+      launchIngestionDetailRefresh(jobId, coordinator);
+      return result;
     }
     coordinator.trailing = true;
     if (mode === "automatic") return coordinator.inFlight;
+    const generation = coordinator.generation + 1;
     return new Promise((resolve) => {
-      coordinator?.waiters.push(resolve);
+      coordinator?.waiters.push({ generation, resolve });
     });
   }, [launchIngestionDetailRefresh]);
 
@@ -300,7 +353,7 @@ export function App({
     coordinator.cancelled = true;
     coordinator.trailing = false;
     const waiters = coordinator.waiters.splice(0);
-    waiters.forEach((resolve) => resolve({ status: "stale" }));
+    waiters.forEach(({ resolve }) => resolve({ status: "stale" }));
     ingestionDetailRefreshesRef.current.delete(jobId);
   }, []);
 
@@ -631,7 +684,10 @@ export function App({
 
   function handleIngestionCreated(detail: IngestionJobDetail) {
     setIngestionDetail(detail);
-    applyOptimisticIngestionJobs((current) => upsertIngestionJob(current, detail));
+    applyOptimisticIngestionJobs(
+      detail.job_id,
+      (current) => upsertIngestionJob(current, detail)
+    );
     selectIngestionJob(detail.job_id);
   }
 
@@ -641,6 +697,7 @@ export function App({
   ): number | null {
     if (ingestionPendingJobsRef.current.has(jobId)) return null;
     const token = ++ingestionActionTokenRef.current;
+    ingestionActionTokensRef.current.set(jobId, token);
     ingestionPendingJobsRef.current.add(jobId);
     setIngestionActions((current) => ({
       ...current,
@@ -654,6 +711,8 @@ export function App({
     token: number,
     error: string
   ) {
+    if (ingestionActionTokensRef.current.get(jobId) !== token) return;
+    ingestionActionTokensRef.current.delete(jobId);
     ingestionPendingJobsRef.current.delete(jobId);
     setIngestionActions((current) => {
       const action = current[jobId];
@@ -694,8 +753,11 @@ export function App({
 
     if (!appMountedRef.current) return;
     if (!actionError) {
-      applyOptimisticIngestionJobs((current) =>
-        current.map((job) => job.job_id === jobId ? { ...job, status: "queued" } : job)
+      applyOptimisticIngestionJobs(
+        jobId,
+        (current) => current.map((job) =>
+          job.job_id === jobId ? { ...job, status: "queued" } : job
+        )
       );
       if (selectedIngestionJobIdRef.current === jobId) {
         setIngestionDetail((current) =>
@@ -711,6 +773,7 @@ export function App({
         : Promise.resolve({ status: "stale" });
     const [listResult, detailResult] = await Promise.all([listPromise, detailPromise]);
     if (
+      ingestionActionTokensRef.current.get(jobId) === token &&
       actionError &&
       listResult.status === "success" &&
       detailResult.status !== "success"
@@ -738,8 +801,9 @@ export function App({
             }
           : current
       );
-      applyOptimisticIngestionJobs((current) =>
-        current.map((job) =>
+      applyOptimisticIngestionJobs(
+        progress.job_id,
+        (current) => current.map((job) =>
           job.job_id === progress.job_id
             ? {
                 ...job,
@@ -760,7 +824,11 @@ export function App({
   );
 
   function commitDeletedIngestion(jobId: string): boolean {
-    applyOptimisticIngestionJobs((current) => current.filter((job) => job.job_id !== jobId));
+    applyOptimisticIngestionJobs(
+      jobId,
+      (current) => current.filter((job) => job.job_id !== jobId),
+      true
+    );
     const currentLocation = parseWorkspaceLocation(window.location.search);
     const wasSelected =
       currentLocation.view === "ingestion" && currentLocation.jobId === jobId;
@@ -777,7 +845,7 @@ export function App({
   async function reconcileDeletedIngestion(wasSelected: boolean) {
     const result = await refetchIngestionJobs();
     if (result.status !== "success" || !wasSelected || !appMountedRef.current) return;
-    navigateToIngestionFallback(result.value);
+    navigateToIngestionFallback(ingestionJobsRef.current);
   }
 
   function navigateToIngestionFallback(jobs: IngestionJobSummary[]) {
@@ -797,21 +865,30 @@ export function App({
     if (token === null) return false;
     try {
       await deleteIngestionJob(jobId);
-      if (!appMountedRef.current) return false;
+      if (
+        !appMountedRef.current ||
+        ingestionActionTokensRef.current.get(jobId) !== token
+      ) return false;
       const wasSelected = commitDeletedIngestion(jobId);
       finishIngestionAction(jobId, token, "");
       void reconcileDeletedIngestion(wasSelected);
       return true;
     } catch (error) {
       const actionError = apiErrorMessage(error, "删除任务失败，请稍后重试");
-      if (!appMountedRef.current) return false;
+      if (
+        !appMountedRef.current ||
+        ingestionActionTokensRef.current.get(jobId) !== token
+      ) return false;
       const jobsPromise = refetchIngestionJobs();
       const detailPromise: Promise<RefreshResult<IngestionJobDetail>> =
         selectedIngestionJobIdRef.current === jobId
           ? requestIngestionDetailRefresh(jobId, "manual")
           : Promise.resolve({ status: "stale" });
       const [jobsResult, detailResult] = await Promise.all([jobsPromise, detailPromise]);
-      if (!appMountedRef.current) return false;
+      if (
+        !appMountedRef.current ||
+        ingestionActionTokensRef.current.get(jobId) !== token
+      ) return false;
       if (
         jobsResult.status === "success" &&
         !jobsResult.value.some((job) => job.job_id === jobId)
@@ -1139,4 +1216,41 @@ function mergeSummaryIntoDetail(
     attempt: detail.attempt,
     events: detail.events
   };
+}
+
+function mergeIngestionJobList(
+  serverJobs: IngestionJobSummary[],
+  currentJobs: IngestionJobSummary[],
+  versionSnapshot: ReadonlyMap<string, number>,
+  currentVersions: ReadonlyMap<string, number>,
+  tombstones: ReadonlySet<string>
+): IngestionJobSummary[] {
+  const currentById = new Map(currentJobs.map((job) => [job.job_id, job]));
+  const serverIds = new Set<string>();
+  const merged: IngestionJobSummary[] = [];
+
+  for (const serverJob of serverJobs) {
+    const jobId = serverJob.job_id;
+    if (serverIds.has(jobId)) continue;
+    serverIds.add(jobId);
+    if (tombstones.has(jobId)) continue;
+    const changedLocally =
+      (currentVersions.get(jobId) ?? 0) !== (versionSnapshot.get(jobId) ?? 0);
+    const localJob = currentById.get(jobId);
+    if (changedLocally) {
+      if (localJob) merged.push(localJob);
+    } else {
+      merged.push(serverJob);
+    }
+  }
+
+  for (const localJob of currentJobs) {
+    const jobId = localJob.job_id;
+    if (serverIds.has(jobId) || tombstones.has(jobId)) continue;
+    const changedLocally =
+      (currentVersions.get(jobId) ?? 0) !== (versionSnapshot.get(jobId) ?? 0);
+    if (changedLocally) merged.push(localJob);
+  }
+
+  return merged;
 }
