@@ -284,20 +284,132 @@ test("详情刷新瞬时失败时保留旧内容并由后续轮询恢复", async
   await waitFor(() => expect(screen.queryByText("详情暂时不可用")).not.toBeInTheDocument());
 });
 
+test("慢详情刷新保持单飞并合并尾随请求且不放大列表轮询", async () => {
+  const running = ingestionDetail({
+    status: "running",
+    current_stage: "parsing",
+    item_done: 1,
+    updated_at: "2026-07-10T08:05:00+00:00"
+  });
+  const intermediate = ingestionDetail({
+    status: "succeeded",
+    current_stage: "completed",
+    item_done: 3,
+    updated_at: "2026-07-10T08:09:00+00:00"
+  });
+  const finalDetail = ingestionDetail({
+    status: "succeeded",
+    current_stage: "completed",
+    item_done: 3,
+    updated_at: "2026-07-10T08:10:00+00:00",
+    items: ingestionDetail().items.map((item, index) =>
+      index === 0 ? { ...item, display_name: "最终详情项目" } : item
+    ),
+    events: [
+      ...ingestionDetail().events,
+      {
+        attempt_no: 1,
+        sequence: 2,
+        event_type: "attempt_succeeded",
+        message: "最终详情已更新",
+        payload: {},
+        created_at: "2026-07-10T08:10:00+00:00"
+      }
+    ]
+  });
+  const slowFirst = deferredResponse();
+  const slowTrailing = deferredResponse();
+  const progress = (index: number, status: "running" | "succeeded") =>
+    jsonResponse({
+      job_id: "job-1",
+      status,
+      current_stage: status === "succeeded" ? "completed" : "parsing",
+      attempt_no: 1,
+      item_total: 3,
+      item_done: status === "succeeded" ? 3 : Math.min(index, 2),
+      document_total: 6,
+      chunk_total: 8 + index,
+      warning_count: 0,
+      active_item_index: status === "succeeded" ? null : Math.min(index + 1, 3),
+      message: status === "succeeded" ? "入库完成" : `第 ${index} 次进度`,
+      updated_at: `2026-07-10T08:0${5 + index}:00+00:00`
+    });
+  const stub = installIngestionApiStub({
+    jobs: [ingestionSummary({ status: "running", current_stage: "parsing", item_done: 1 })],
+    details: { "job-1": running },
+    responses: {
+      detail: {
+        "job-1": [jsonResponse(running), slowFirst.promise, slowTrailing.promise]
+      },
+      progress: {
+        "job-1": [
+          progress(1, "running"),
+          progress(2, "running"),
+          progress(3, "running"),
+          progress(4, "succeeded")
+        ]
+      }
+    }
+  });
+  const detailRequestCount = () =>
+    stub.requests.filter(
+      ({ url, method }) => method === "GET" && /\/api\/ingestion-jobs\/job-1$/.test(url)
+    ).length;
+  const listRequestCount = () =>
+    stub.requests.filter(
+      ({ url, method }) => method === "GET" && url.endsWith("/api/ingestion-jobs")
+    ).length;
+
+  window.history.replaceState(null, "", "/?view=ingestion&job=job-1");
+  render(<App ingestionPollIntervalMs={20} listPollIntervalMs={1000} />);
+
+  await screen.findByRole("heading", { name: "优秀案例.zip" });
+  await waitFor(() => expect(detailRequestCount()).toBe(2));
+  await new Promise((resolve) => setTimeout(resolve, 90));
+  expect(detailRequestCount()).toBe(2);
+  expect(listRequestCount()).toBe(1);
+
+  await act(async () => {
+    slowFirst.resolve(jsonResponse(intermediate));
+  });
+  await waitFor(() => expect(detailRequestCount()).toBe(3));
+
+  await act(async () => {
+    slowTrailing.resolve(jsonResponse(finalDetail));
+  });
+  expect(await screen.findByText("最终详情项目")).toBeInTheDocument();
+  expect(await screen.findByText("最终详情已更新")).toBeInTheDocument();
+  expect(listRequestCount()).toBe(1);
+});
+
 test("开始接口 500 后按服务端 queued 状态对账", async () => {
   const user = userEvent.setup();
   const startResponse = deferredResponse();
+  const progressResponse = deferredResponse();
   const draft = ingestionDraftPayload();
   const stub = installIngestionApiStub({
     jobs: [ingestionSummary({ ...draft })],
     details: { "job-1": draft },
-    responses: { start: { "job-1": [startResponse.promise] } }
+    responses: {
+      list: [
+        jsonResponse({ jobs: [ingestionSummary({ ...draft })] }),
+        jsonResponse({ jobs: [ingestionSummary({ ...draft, status: "queued" })] })
+      ],
+      detail: {
+        "job-1": [
+          jsonResponse(draft),
+          jsonResponse({ detail: "详情对账失败" }, { status: 503 })
+        ]
+      },
+      progress: { "job-1": [progressResponse.promise] },
+      start: { "job-1": [startResponse.promise] }
+    }
   });
   window.history.replaceState(null, "", "/?view=ingestion&job=job-1");
   render(<App />);
 
   await user.click(await screen.findByRole("button", { name: "确认并开始" }));
-  stub.setDetail({ ...draft, status: "queued" });
+  stub.setJobs([ingestionSummary({ ...draft, status: "queued" })]);
   await act(async () => {
     startResponse.resolve(jsonResponse({ detail: "启动请求超时" }, { status: 500 }));
   });
@@ -368,6 +480,60 @@ test("任务 A 动作进行中不禁用任务 B，A 的迟到失败不污染 B",
   expect(screen.getByRole("heading", { name: "课程资料.pdf" })).toBeInTheDocument();
   expect(screen.queryByText("任务 A 启动失败")).not.toBeInTheDocument();
   expect(screen.getByRole("button", { name: "删除任务" })).toBeEnabled();
+});
+
+test("不同任务动作并行且切回时各自保留 pending 与 error", async () => {
+  const user = userEvent.setup();
+  const draftA = ingestionDraftPayload({ job_id: "job-a", source_name: "案例A.zip" });
+  const failedB = ingestionDetail({
+    job_id: "job-b",
+    source_name: "课程B.pdf",
+    source_kind: "file",
+    target: "course",
+    status: "failed",
+    error_detail: "课程解析失败"
+  });
+  const startA = deferredResponse();
+  const retryB = deferredResponse();
+  const stub = installIngestionApiStub({
+    jobs: [
+      ingestionSummary({ ...failedB }),
+      ingestionSummary({ ...draftA })
+    ],
+    details: { "job-a": draftA, "job-b": failedB },
+    responses: {
+      start: { "job-a": [startA.promise] },
+      retry: { "job-b": [retryB.promise] }
+    }
+  });
+  window.history.replaceState(null, "", "/?view=ingestion&job=job-a");
+  render(<App />);
+
+  await user.click(await screen.findByRole("button", { name: "确认并开始" }));
+  await user.click(screen.getByRole("button", { name: /课程B\.pdf/ }));
+  await user.click(await screen.findByRole("button", { name: "从头重试" }));
+
+  await user.click(screen.getByRole("button", { name: /案例A\.zip/ }));
+  expect(await screen.findByRole("button", { name: "确认并开始" })).toBeDisabled();
+  await user.click(screen.getByRole("button", { name: /课程B\.pdf/ }));
+  expect(await screen.findByRole("button", { name: "从头重试" })).toBeDisabled();
+
+  stub.setDetail({ ...draftA, status: "queued" });
+  await act(async () => {
+    startA.resolve(jsonResponse({ ok: true, job_id: "job-a", status: "queued" }));
+  });
+  await user.click(screen.getByRole("button", { name: /案例A\.zip/ }));
+  expect(await screen.findByText("排队中")).toBeInTheDocument();
+  expect(screen.queryByText("课程B重试失败")).not.toBeInTheDocument();
+
+  await user.click(screen.getByRole("button", { name: /课程B\.pdf/ }));
+  await act(async () => {
+    retryB.resolve(jsonResponse({ detail: "课程B重试失败" }, { status: 500 }));
+  });
+  expect(await screen.findByText("课程B重试失败")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "从头重试" })).toBeEnabled();
+  await user.click(screen.getByRole("button", { name: /案例A\.zip/ }));
+  expect(screen.queryByText("课程B重试失败")).not.toBeInTheDocument();
 });
 
 test("DELETE 成功后列表刷新失败仍关闭对话框并保持已删除", async () => {
@@ -512,15 +678,29 @@ test("重试接口 500 后按服务端 queued 状态对账", async () => {
   const user = userEvent.setup();
   const failed = ingestionDetail({ status: "failed", error_detail: "解析失败" });
   const retryResponse = deferredResponse();
+  const progressResponse = deferredResponse();
   const stub = installIngestionApiStub({
     jobs: [ingestionSummary({ status: "failed" })],
     details: { "job-1": failed },
-    responses: { retry: { "job-1": [retryResponse.promise] } }
+    responses: {
+      list: [
+        jsonResponse({ jobs: [ingestionSummary({ status: "failed" })] }),
+        jsonResponse({ jobs: [ingestionSummary({ status: "queued" })] })
+      ],
+      detail: {
+        "job-1": [
+          jsonResponse(failed),
+          jsonResponse({ detail: "详情对账失败" }, { status: 503 })
+        ]
+      },
+      progress: { "job-1": [progressResponse.promise] },
+      retry: { "job-1": [retryResponse.promise] }
+    }
   });
   window.history.replaceState(null, "", "/?view=ingestion&job=job-1");
   render(<App />);
   await user.click(await screen.findByRole("button", { name: "从头重试" }));
-  stub.setDetail({ ...failed, status: "queued", error_code: null, error_detail: null });
+  stub.setJobs([ingestionSummary({ status: "queued", error_code: null, error_detail: null })]);
   await act(async () => {
     retryResponse.resolve(jsonResponse({ detail: "重试请求超时" }, { status: 500 }));
   });
@@ -532,16 +712,30 @@ test("删除接口 500 后按服务端 deleting 状态对账并关闭确认", as
   const user = userEvent.setup();
   const succeeded = ingestionDetail();
   const deleteResponse = deferredResponse();
+  const progressResponse = deferredResponse();
   const stub = installIngestionApiStub({
     jobs: [ingestionSummary()],
     details: { "job-1": succeeded },
-    responses: { delete: { "job-1": [deleteResponse.promise] } }
+    responses: {
+      list: [
+        jsonResponse({ jobs: [ingestionSummary()] }),
+        jsonResponse({ jobs: [ingestionSummary({ status: "deleting" })] })
+      ],
+      detail: {
+        "job-1": [
+          jsonResponse(succeeded),
+          jsonResponse({ detail: "详情对账失败" }, { status: 503 })
+        ]
+      },
+      progress: { "job-1": [progressResponse.promise] },
+      delete: { "job-1": [deleteResponse.promise] }
+    }
   });
   window.history.replaceState(null, "", "/?view=ingestion&job=job-1");
   render(<App />);
   await user.click(await screen.findByRole("button", { name: "删除任务" }));
   await user.click(screen.getByRole("button", { name: "确认删除" }));
-  stub.setDetail({ ...succeeded, status: "deleting" });
+  stub.setJobs([ingestionSummary({ status: "deleting" })]);
   await act(async () => {
     deleteResponse.resolve(jsonResponse({ detail: "删除请求超时" }, { status: 500 }));
   });

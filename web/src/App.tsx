@@ -100,6 +100,20 @@ type IngestionActionState = {
   error: string;
 };
 
+type RefreshResult<T> =
+  | { status: "success"; value: T }
+  | { status: "error"; error: string }
+  | { status: "stale" };
+
+type IngestionDetailRefreshMode = "automatic" | "manual";
+
+type IngestionDetailRefreshCoordinator = {
+  inFlight: Promise<RefreshResult<IngestionJobDetail>> | null;
+  trailing: boolean;
+  waiters: Array<(result: RefreshResult<IngestionJobDetail>) => void>;
+  cancelled: boolean;
+};
+
 export function App({
   batchPollIntervalMs = DEFAULT_BATCH_POLL_INTERVAL_MS,
   listPollIntervalMs = DEFAULT_LIST_POLL_INTERVAL_MS,
@@ -138,11 +152,14 @@ export function App({
   const [ingestionDetail, setIngestionDetail] = useState<IngestionJobDetail | null>(null);
   const [ingestionDetailLoading, setIngestionDetailLoading] = useState(false);
   const [ingestionDetailError, setIngestionDetailError] = useState("");
-  const [ingestionAction, setIngestionAction] = useState<IngestionActionState | null>(null);
+  const [ingestionActions, setIngestionActions] = useState<Record<string, IngestionActionState>>({});
   const ingestionActionTokenRef = useRef(0);
   const ingestionPendingJobsRef = useRef(new Set<string>());
   const ingestionListRequestRef = useRef(0);
   const ingestionDetailRequestRef = useRef(0);
+  const ingestionDetailRefreshesRef = useRef(
+    new Map<string, IngestionDetailRefreshCoordinator>()
+  );
   const appMountedRef = useRef(true);
 
   const selectedIngestionJobId =
@@ -155,24 +172,36 @@ export function App({
     const unsubscribe = subscribeWorkspaceLocation(setWorkspaceLocation);
     return () => {
       appMountedRef.current = false;
+      for (const coordinator of ingestionDetailRefreshesRef.current.values()) {
+        coordinator.cancelled = true;
+        coordinator.trailing = false;
+        const waiters = coordinator.waiters.splice(0);
+        waiters.forEach((resolve) => resolve({ status: "stale" }));
+      }
+      ingestionDetailRefreshesRef.current.clear();
       unsubscribe();
     };
   }, []);
 
-  const refetchIngestionJobs = useCallback(async (): Promise<IngestionJobSummary[] | null> => {
+  const refetchIngestionJobs = useCallback(async (): Promise<RefreshResult<IngestionJobSummary[]>> => {
     const requestId = ++ingestionListRequestRef.current;
     setIngestionJobsLoading(true);
     try {
       const payload = await listIngestionJobs();
-      if (!appMountedRef.current || requestId !== ingestionListRequestRef.current) return null;
+      if (!appMountedRef.current || requestId !== ingestionListRequestRef.current) {
+        return { status: "stale" };
+      }
       setIngestionJobs(payload.jobs);
       setIngestionJobsLoaded(true);
       setIngestionJobsError("");
-      return payload.jobs;
+      return { status: "success", value: payload.jobs };
     } catch (error) {
-      if (!appMountedRef.current || requestId !== ingestionListRequestRef.current) return null;
-      setIngestionJobsError(apiErrorMessage(error, "入库任务列表加载失败，请稍后刷新"));
-      return null;
+      if (!appMountedRef.current || requestId !== ingestionListRequestRef.current) {
+        return { status: "stale" };
+      }
+      const message = apiErrorMessage(error, "入库任务列表加载失败，请稍后刷新");
+      setIngestionJobsError(message);
+      return { status: "error", error: message };
     } finally {
       if (appMountedRef.current && requestId === ingestionListRequestRef.current) {
         setIngestionJobsLoading(false);
@@ -189,17 +218,9 @@ export function App({
     []
   );
 
-  const refetchIngestionDetail = useCallback(async (
-    requestedJobId?: string
-  ): Promise<IngestionJobDetail | null> => {
-    const jobId = requestedJobId ?? selectedIngestionJobIdRef.current;
-    if (!jobId) {
-      ingestionDetailRequestRef.current += 1;
-      setIngestionDetail(null);
-      setIngestionDetailLoading(false);
-      setIngestionDetailError("");
-      return null;
-    }
+  const performIngestionDetailRefresh = useCallback(async (
+    jobId: string
+  ): Promise<RefreshResult<IngestionJobDetail>> => {
     const requestId = ++ingestionDetailRequestRef.current;
     setIngestionDetailError("");
     setIngestionDetail((current) => current?.job_id === jobId ? current : null);
@@ -210,19 +231,20 @@ export function App({
         !appMountedRef.current ||
         requestId !== ingestionDetailRequestRef.current ||
         selectedIngestionJobIdRef.current !== jobId
-      ) return null;
+      ) return { status: "stale" };
       setIngestionDetail(payload);
       setIngestionDetailError("");
-      return payload;
+      return { status: "success", value: payload };
     } catch (error) {
       if (
         !appMountedRef.current ||
         requestId !== ingestionDetailRequestRef.current ||
         selectedIngestionJobIdRef.current !== jobId
-      ) return null;
+      ) return { status: "stale" };
+      const message = apiErrorMessage(error, "入库任务详情加载失败，请重新选择");
       setIngestionDetail((current) => current?.job_id === jobId ? current : null);
-      setIngestionDetailError(apiErrorMessage(error, "入库任务详情加载失败，请重新选择"));
-      return null;
+      setIngestionDetailError(message);
+      return { status: "error", error: message };
     } finally {
       if (appMountedRef.current && requestId === ingestionDetailRequestRef.current) {
         setIngestionDetailLoading(false);
@@ -230,13 +252,73 @@ export function App({
     }
   }, []);
 
+  const launchIngestionDetailRefresh = useCallback(function launch(
+    jobId: string,
+    coordinator: IngestionDetailRefreshCoordinator
+  ): Promise<RefreshResult<IngestionJobDetail>> {
+    const request = performIngestionDetailRefresh(jobId);
+    coordinator.inFlight = request;
+    void request.then(() => {
+      if (
+        coordinator.cancelled ||
+        ingestionDetailRefreshesRef.current.get(jobId) !== coordinator
+      ) return;
+      coordinator.inFlight = null;
+      if (!coordinator.trailing) return;
+      coordinator.trailing = false;
+      const waiters = coordinator.waiters.splice(0);
+      const trailingRequest = launch(jobId, coordinator);
+      void trailingRequest.then((result) => {
+        waiters.forEach((resolve) => resolve(result));
+      });
+    });
+    return request;
+  }, [performIngestionDetailRefresh]);
+
+  const requestIngestionDetailRefresh = useCallback((
+    jobId: string,
+    mode: IngestionDetailRefreshMode = "manual"
+  ): Promise<RefreshResult<IngestionJobDetail>> => {
+    let coordinator = ingestionDetailRefreshesRef.current.get(jobId);
+    if (!coordinator || coordinator.cancelled) {
+      coordinator = { inFlight: null, trailing: false, waiters: [], cancelled: false };
+      ingestionDetailRefreshesRef.current.set(jobId, coordinator);
+    }
+    if (!coordinator.inFlight) {
+      return launchIngestionDetailRefresh(jobId, coordinator);
+    }
+    coordinator.trailing = true;
+    if (mode === "automatic") return coordinator.inFlight;
+    return new Promise((resolve) => {
+      coordinator?.waiters.push(resolve);
+    });
+  }, [launchIngestionDetailRefresh]);
+
+  const cancelIngestionDetailRefresh = useCallback((jobId: string) => {
+    const coordinator = ingestionDetailRefreshesRef.current.get(jobId);
+    if (!coordinator) return;
+    coordinator.cancelled = true;
+    coordinator.trailing = false;
+    const waiters = coordinator.waiters.splice(0);
+    waiters.forEach((resolve) => resolve({ status: "stale" }));
+    ingestionDetailRefreshesRef.current.delete(jobId);
+  }, []);
+
   useEffect(() => {
     if (workspaceLocation.view === "ingestion") void refetchIngestionJobs();
   }, [refetchIngestionJobs, workspaceLocation.view]);
 
   useEffect(() => {
-    void refetchIngestionDetail(selectedIngestionJobId);
-  }, [refetchIngestionDetail, selectedIngestionJobId]);
+    if (!selectedIngestionJobId) {
+      ingestionDetailRequestRef.current += 1;
+      setIngestionDetail(null);
+      setIngestionDetailLoading(false);
+      setIngestionDetailError("");
+      return;
+    }
+    void requestIngestionDetailRefresh(selectedIngestionJobId, "manual");
+    return () => cancelIngestionDetailRefresh(selectedIngestionJobId);
+  }, [cancelIngestionDetailRefresh, requestIngestionDetailRefresh, selectedIngestionJobId]);
 
   const hasActiveIngestionJobs = ingestionJobs.some((job) => isIngestionJobActive(job.status));
   useEffect(() => {
@@ -560,7 +642,10 @@ export function App({
     if (ingestionPendingJobsRef.current.has(jobId)) return null;
     const token = ++ingestionActionTokenRef.current;
     ingestionPendingJobsRef.current.add(jobId);
-    setIngestionAction({ jobId, kind, token, pending: true, error: "" });
+    setIngestionActions((current) => ({
+      ...current,
+      [jobId]: { jobId, kind, token, pending: true, error: "" }
+    }));
     return token;
   }
 
@@ -570,12 +655,25 @@ export function App({
     error: string
   ) {
     ingestionPendingJobsRef.current.delete(jobId);
-    setIngestionAction((current) =>
-      current?.jobId === jobId && current.token === token
-        ? error
-          ? { ...current, pending: false, error }
-          : null
-        : current
+    setIngestionActions((current) => {
+      const action = current[jobId];
+      if (!action || action.token !== token) return current;
+      if (error) {
+        return { ...current, [jobId]: { ...action, pending: false, error } };
+      }
+      const next = { ...current };
+      delete next[jobId];
+      return next;
+    });
+  }
+
+  function mergeSummaryIntoSelectedDetail(
+    jobId: string,
+    summary: IngestionJobSummary
+  ) {
+    if (selectedIngestionJobIdRef.current !== jobId) return;
+    setIngestionDetail((current) =>
+      current?.job_id === jobId ? mergeSummaryIntoDetail(current, summary) : current
     );
   }
 
@@ -607,11 +705,19 @@ export function App({
     }
 
     const listPromise = refetchIngestionJobs();
-    const detailPromise =
+    const detailPromise: Promise<RefreshResult<IngestionJobDetail>> =
       actionError && selectedIngestionJobIdRef.current === jobId
-        ? refetchIngestionDetail(jobId)
-        : Promise.resolve(null);
-    await Promise.all([listPromise, detailPromise]);
+        ? requestIngestionDetailRefresh(jobId, "manual")
+        : Promise.resolve({ status: "stale" });
+    const [listResult, detailResult] = await Promise.all([listPromise, detailPromise]);
+    if (
+      actionError &&
+      listResult.status === "success" &&
+      detailResult.status !== "success"
+    ) {
+      const summary = listResult.value.find((job) => job.job_id === jobId);
+      if (summary) mergeSummaryIntoSelectedDetail(jobId, summary);
+    }
     if (appMountedRef.current) finishIngestionAction(jobId, token, actionError);
   }
 
@@ -659,6 +765,7 @@ export function App({
     const wasSelected =
       currentLocation.view === "ingestion" && currentLocation.jobId === jobId;
     if (wasSelected) {
+      cancelIngestionDetailRefresh(jobId);
       ingestionDetailRequestRef.current += 1;
       setIngestionDetail(null);
       setIngestionDetailError("");
@@ -668,9 +775,9 @@ export function App({
   }
 
   async function reconcileDeletedIngestion(wasSelected: boolean) {
-    const jobs = await refetchIngestionJobs();
-    if (!jobs || !wasSelected || !appMountedRef.current) return;
-    navigateToIngestionFallback(jobs);
+    const result = await refetchIngestionJobs();
+    if (result.status !== "success" || !wasSelected || !appMountedRef.current) return;
+    navigateToIngestionFallback(result.value);
   }
 
   function navigateToIngestionFallback(jobs: IngestionJobSummary[]) {
@@ -699,19 +806,31 @@ export function App({
       const actionError = apiErrorMessage(error, "删除任务失败，请稍后重试");
       if (!appMountedRef.current) return false;
       const jobsPromise = refetchIngestionJobs();
-      const detailPromise =
+      const detailPromise: Promise<RefreshResult<IngestionJobDetail>> =
         selectedIngestionJobIdRef.current === jobId
-          ? refetchIngestionDetail(jobId)
-          : Promise.resolve(null);
-      const [jobs, reconciledDetail] = await Promise.all([jobsPromise, detailPromise]);
+          ? requestIngestionDetailRefresh(jobId, "manual")
+          : Promise.resolve({ status: "stale" });
+      const [jobsResult, detailResult] = await Promise.all([jobsPromise, detailPromise]);
       if (!appMountedRef.current) return false;
-      if (jobs && !jobs.some((job) => job.job_id === jobId)) {
+      if (
+        jobsResult.status === "success" &&
+        !jobsResult.value.some((job) => job.job_id === jobId)
+      ) {
         const wasSelected = commitDeletedIngestion(jobId);
         finishIngestionAction(jobId, token, "");
-        if (wasSelected) navigateToIngestionFallback(jobs);
+        if (wasSelected) navigateToIngestionFallback(jobsResult.value);
         return true;
       }
-      if (reconciledDetail?.status === "deleting") {
+      const summary =
+        jobsResult.status === "success"
+          ? jobsResult.value.find((job) => job.job_id === jobId)
+          : undefined;
+      if (summary && detailResult.status !== "success") {
+        mergeSummaryIntoSelectedDetail(jobId, summary);
+      }
+      const reconciledStatus =
+        detailResult.status === "success" ? detailResult.value.status : summary?.status;
+      if (reconciledStatus === "deleting") {
         finishIngestionAction(jobId, token, actionError);
         return true;
       }
@@ -721,9 +840,7 @@ export function App({
   }
 
   const selectedIngestionAction =
-    ingestionDetail && ingestionAction?.jobId === ingestionDetail.job_id
-      ? ingestionAction
-      : null;
+    ingestionDetail ? ingestionActions[ingestionDetail.job_id] ?? null : null;
 
   if (workspaceLocation.view === "ingestion") {
     return (
@@ -768,7 +885,9 @@ export function App({
                 }
                 onDelete={handleDeleteIngestion}
                 onProgress={handleIngestionProgress}
-                onRefresh={() => void refetchIngestionDetail(ingestionDetail.job_id)}
+                onRefresh={() => {
+                  void requestIngestionDetailRefresh(ingestionDetail.job_id, "automatic");
+                }}
               />
             ) : (
               <div className="ingestion-main-state" role={ingestionDetailError ? "alert" : "status"}>
@@ -777,7 +896,11 @@ export function App({
                   <button
                     className="ghost-button"
                     type="button"
-                    onClick={() => void refetchIngestionDetail(workspaceLocation.jobId)}
+                    onClick={() => {
+                      if (workspaceLocation.jobId) {
+                        void requestIngestionDetailRefresh(workspaceLocation.jobId, "manual");
+                      }
+                    }}
                   >
                     重新加载任务详情
                   </button>
@@ -792,7 +915,11 @@ export function App({
           detail={ingestionDetail}
           loading={ingestionDetailLoading}
           error={ingestionDetailError}
-          onReload={() => void refetchIngestionDetail(workspaceLocation.jobId)}
+          onReload={() => {
+            if (workspaceLocation.jobId) {
+              void requestIngestionDetailRefresh(workspaceLocation.jobId, "manual");
+            }
+          }}
         />
       </div>
     );
@@ -998,4 +1125,18 @@ function upsertIngestionJob(
     ...summary
   } = detail;
   return [summary, ...jobs.filter((job) => job.job_id !== detail.job_id)];
+}
+
+function mergeSummaryIntoDetail(
+  detail: IngestionJobDetail,
+  summary: IngestionJobSummary
+): IngestionJobDetail {
+  return {
+    ...detail,
+    ...summary,
+    ignored_entries: detail.ignored_entries,
+    items: detail.items,
+    attempt: detail.attempt,
+    events: detail.events
+  };
 }
