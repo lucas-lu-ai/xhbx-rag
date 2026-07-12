@@ -33,6 +33,19 @@ def _running_job(store: IngestionStore, tmp_path: Path) -> str:
     return job_id
 
 
+_SAFE_INGESTION_ERRORS = {
+    "upload_invalid": "上传文件无效",
+    "upload_too_large": "上传文件超过大小限制",
+    "parse_failed": "文档解析失败",
+    "chunk_failed": "文档切分失败",
+    "embedding_failed": "向量生成失败",
+    "index_failed": "知识库写入失败",
+    "rollback_pending": "知识库恢复尚未完成",
+    "service_restarted": "服务重启导致任务中断，请从头重试",
+    "storage_unavailable": "任务存储暂时不可用",
+}
+
+
 def test_job_lifecycle_requires_valid_state_transitions(tmp_path: Path) -> None:
     store = _store(tmp_path)
     job = store.create_draft(
@@ -208,7 +221,7 @@ def test_item_failure_rollback_and_abort_retry_follow_current_attempt(tmp_path: 
     assert aborted is not None
     assert aborted["status"] == "failed"
     assert aborted["attempt_count"] == 1
-    assert aborted["error_detail"] == "无法清理旧任务产物"
+    assert aborted["error_detail"] == "清理旧任务产物失败"
     assert aborted["attempt"]["attempt_no"] == 1
     assert store.abort_retry(job_id, 2, "再次调用") is None
 
@@ -441,6 +454,124 @@ def test_fail_job_accepts_only_precommit_or_finished_rollback(tmp_path: Path) ->
     assert store.get_job(rolled_back)["status"] == "failed"
 
 
+@pytest.mark.parametrize(("code", "expected_detail"), _SAFE_INGESTION_ERRORS.items())
+def test_fail_job_persists_only_whitelisted_code_and_fixed_detail(
+    tmp_path: Path, code: str, expected_detail: str
+) -> None:
+    store = _store(tmp_path)
+    job_id = _running_job(store, tmp_path)
+    raw_detail = "原始模型响应：客户身份证 123456；Traceback: model raw should never persist"
+
+    store.fail_job(job_id, code=code, detail=raw_detail)
+
+    job = store.get_job(job_id)
+    assert job["error_code"] == code
+    assert job["error_detail"] == expected_detail
+    assert job["attempt"]["error_code"] == code
+    assert job["attempt"]["error_detail"] == expected_detail
+    assert raw_detail not in repr(job)
+    assert job["events"][-1]["message"] == expected_detail
+    assert job["events"][-1]["payload"] == {"error_code": code}
+
+
+def test_unknown_error_code_uses_fixed_storage_fallback(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    job_id = _running_job(store, tmp_path)
+    polluted_code = "x-api-key=header-secret"
+    raw_detail = "raw exception and original model response"
+
+    store.fail_job(job_id, code=polluted_code, detail=raw_detail)
+
+    job = store.get_job(job_id)
+    assert job["error_code"] == "storage_unavailable"
+    assert job["error_detail"] == _SAFE_INGESTION_ERRORS["storage_unavailable"]
+    assert polluted_code not in repr(job)
+    assert raw_detail not in repr(job)
+
+
+def test_mark_rolling_back_uses_fixed_whitelisted_error(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    job_id = _running_job(store, tmp_path)
+    store.mark_commit_state(job_id, "prepared", tmp_path / "journal.json")
+    raw_detail = "Milvus raw exception at \\server\\share\\journal.json"
+
+    store.mark_rolling_back(job_id, code="index_failed", detail=raw_detail)
+
+    job = store.get_job(job_id)
+    assert job["error_code"] == "index_failed"
+    assert job["error_detail"] == _SAFE_INGESTION_ERRORS["index_failed"]
+    assert job["attempt"]["error_detail"] == _SAFE_INGESTION_ERRORS["index_failed"]
+    assert raw_detail not in repr(job)
+    assert job["events"][-1]["message"] == _SAFE_INGESTION_ERRORS["index_failed"]
+
+
+def test_item_abort_and_stage_methods_never_persist_caller_text(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    job_id = _running_job(store, tmp_path)
+    stage_raw = "正在解析：原始模型响应 model-stage-raw"
+    unknown_stage = "x-api-key=stage-secret"
+    unknown_message = "Traceback: unknown-stage-model-raw"
+    item_raw = "输入失败：原始模型响应 item-model-raw"
+    abort_raw = "无法清理 \\\\server\\share\\abort-raw"
+
+    store.mark_stage(job_id, "parsing", stage_raw)
+    parsing_event = store.get_job(job_id)["events"][-1]
+    assert parsing_event["message"] == "正在解析文档"
+    assert parsing_event["payload"] == {"stage": "parsing"}
+
+    try:
+        store.mark_stage(job_id, unknown_stage, unknown_message)
+    except sqlite3.IntegrityError:
+        pytest.fail("未知 stage 应记录固定通用事件，而不是触发 SQLite 约束")
+    unknown_event = store.get_job(job_id)["events"][-1]
+    assert unknown_event["message"] == "任务处理中"
+    assert unknown_event["payload"] == {"stage": "unknown"}
+    assert store.get_job(job_id)["current_stage"] == "parsing"
+
+    assert store.mark_item_running(job_id, 1, "parsing") is True
+    store.fail_item(job_id, 1, item_raw)
+    failed_item_job = store.get_job(job_id)
+    assert failed_item_job["items"][0]["error_detail"] == "输入项处理失败"
+    assert failed_item_job["events"][-1]["message"] == "输入项处理失败"
+
+    store.fail_job(job_id, code="parse_failed", detail="job-model-raw")
+    assert store.retry_job(job_id) == {"result": "ok", "attempt_no": 2}
+    store.abort_retry(job_id, 2, abort_raw)
+    aborted = store.get_job(job_id)
+    assert aborted["error_code"] == "storage_unavailable"
+    assert aborted["error_detail"] == "清理旧任务产物失败"
+    assert aborted["events"][-1]["message"] == "清理旧任务产物失败"
+
+    raw_values = (
+        stage_raw,
+        unknown_stage,
+        unknown_message,
+        item_raw,
+        abort_raw,
+        "model-stage-raw",
+        "unknown-stage-model-raw",
+        "item-model-raw",
+        "abort-raw",
+        "job-model-raw",
+    )
+    assert all(raw not in repr(aborted) for raw in raw_values)
+    with sqlite3.connect(store.db_path) as connection:
+        persisted = "\n".join(
+            value
+            for row in connection.execute(
+                """
+                SELECT error_code, error_detail FROM ingestion_jobs WHERE job_id = ?
+                UNION ALL SELECT NULL, error_detail FROM ingestion_items WHERE job_id = ?
+                UNION ALL SELECT message, payload_json FROM ingestion_events WHERE job_id = ?
+                """,
+                (job_id, job_id, job_id),
+            )
+            for value in row
+            if value is not None
+        )
+    assert all(raw not in persisted for raw in raw_values)
+
+
 def test_persisted_details_and_event_content_are_safely_normalized(tmp_path: Path) -> None:
     store = _store(tmp_path)
     job_id = _running_job(store, tmp_path)
@@ -582,6 +713,65 @@ def test_cyclic_event_payload_uses_fixed_truncation_marker(tmp_path: Path) -> No
         if event["event_type"] == "cyclic_payload"
     )
     assert event["payload"] == {"truncated": True}
+
+
+def test_event_defense_redacts_hyphen_keys_unc_and_entire_tracebacks(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    job_id = _running_job(store, tmp_path)
+    unc_path = r"\\server\private-share\model-output.txt"
+    traceback_text = (
+        "Traceback (most recent call last):\n"
+        f'  File "{unc_path}", line 9, in call_model\n'
+        "RuntimeError: 原始模型响应 model-raw-content"
+    )
+    payload = {
+        "x-api-key": "header-secret",
+        "access-token": "hyphen-secret",
+        "client-secret": "json-secret",
+        "quoted_json": '{"api-key":"json-secret"}',
+        "unc": f"读取{unc_path}失败",
+        "trace": traceback_text,
+    }
+
+    with store._connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        store._append_event(
+            connection,
+            job_id,
+            1,
+            event_type="defense_boundary",
+            message=traceback_text,
+            payload=payload,
+        )
+
+    event = next(
+        event
+        for event in store.get_job(job_id)["events"]
+        if event["event_type"] == "defense_boundary"
+    )
+    assert event["message"] == "内部处理信息已隐藏"
+    public = repr(event)
+    forbidden = (
+        "hyphen-secret",
+        "header-secret",
+        "json-secret",
+        unc_path,
+        "Traceback",
+        "model-raw-content",
+        "原始模型响应",
+    )
+    assert all(raw not in public for raw in forbidden)
+
+    with sqlite3.connect(store.db_path) as connection:
+        row = connection.execute(
+            """
+            SELECT message, payload_json FROM ingestion_events
+            WHERE job_id = ? AND event_type = 'defense_boundary'
+            """,
+            (job_id,),
+        ).fetchone()
+    persisted = "\n".join(row)
+    assert all(raw not in persisted for raw in forbidden)
 
 
 def test_full_milestone_log_drops_new_event_without_rolling_back_state(

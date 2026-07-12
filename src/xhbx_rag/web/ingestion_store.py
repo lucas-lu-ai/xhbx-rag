@@ -19,16 +19,22 @@ _MAX_PERSISTED_TEXT_CHARS = 2_000
 _MAX_EVENT_PAYLOAD_BYTES = 16 * 1_024
 _REDACTED_PATH = "[已隐藏路径]"
 _REDACTED_SECRET = "[已隐藏敏感信息]"
+_UNSAFE_STACK_DETAIL = "内部处理信息已隐藏"
 _SENSITIVE_KEY_RE = re.compile(
-    r"^(?:bearer|(?:.*_)?(?:api_key|token|secret|password))$", re.IGNORECASE
+    r"^(?:bearer|(?:.*[_-])?(?:api[_-]key|token|secret|password))$", re.IGNORECASE
 )
 _SENSITIVE_VALUE_RE = re.compile(
-    r"(?<![A-Za-z0-9_])"
-    r"((?:[A-Za-z0-9]+_)*(?:api_key|token|secret|password)|Bearer)\s*[:=]\s*"
+    r"(?<![A-Za-z0-9_])[\"']?"
+    r"((?:[A-Za-z0-9.]+[_-])*(?:api[_-]key|token|secret|password)|Bearer)"
+    r"[\"']?\s*[:=]\s*"
     r"(?:\"[^\"]*\"|'[^']*'|[^\s,;，；。]+)",
     re.IGNORECASE,
 )
 _BEARER_TOKEN_RE = re.compile(r"\bBearer\s+[^\s,;，；。]+", re.IGNORECASE)
+_UNC_ABSOLUTE_PATH_RE = re.compile(
+    r"\\\\[^\\/\s]+[\\/]"
+    r"(?:[^\\/\s]+[\\/])*[^\\/\s,;，；。)\]}]+"
+)
 _WINDOWS_ABSOLUTE_PATH_RE = re.compile(
     r"(?<![A-Za-z0-9_])[A-Za-z]:[\\/]"
     r"(?:[^\\/\s]+[\\/])*[^\\/\s,;)\]}]+"
@@ -36,6 +42,35 @@ _WINDOWS_ABSOLUTE_PATH_RE = re.compile(
 _POSIX_ABSOLUTE_PATH_RE = re.compile(
     r"(?<![:/])/(?!/)(?:[^/\s]+/)*[^/\s,;)\]}]+"
 )
+_STACK_STRUCTURE_RE = re.compile(
+    r"\b(?:traceback|stack\s*trace|exception\s*chain)\b"
+    r"|during handling of the above exception"
+    r"|the above exception was the direct cause"
+    r"|(?:^|\n)\s*File\s+[\"'].*?,\s*line\s+\d+"
+    r"|(?:^|\n)\s*at\s+\S+\([^)]*\)",
+    re.IGNORECASE,
+)
+_SAFE_INGESTION_ERROR_DETAILS = {
+    "upload_invalid": "上传文件无效",
+    "upload_too_large": "上传文件超过大小限制",
+    "parse_failed": "文档解析失败",
+    "chunk_failed": "文档切分失败",
+    "embedding_failed": "向量生成失败",
+    "index_failed": "知识库写入失败",
+    "rollback_pending": "知识库恢复尚未完成",
+    "service_restarted": "服务重启导致任务中断，请从头重试",
+    "storage_unavailable": "任务存储暂时不可用",
+}
+_SAFE_STAGE_MESSAGES = {
+    "uploaded": "上传已完成",
+    "parsing": "正在解析文档",
+    "chunking": "正在切分文档",
+    "indexing": "正在写入知识库",
+    "completed": "任务已完成",
+}
+_UNKNOWN_STAGE_MESSAGE = "任务处理中"
+_ITEM_FAILURE_DETAIL = "输入项处理失败"
+_RETRY_CLEANUP_FAILURE_DETAIL = "清理旧任务产物失败"
 
 _PUBLIC_JOB_FIELDS = (
     "job_id",
@@ -66,8 +101,11 @@ def _utc_now() -> str:
 
 def _safe_text(value: object) -> str:
     text = str(value)
+    if _STACK_STRUCTURE_RE.search(text):
+        return _UNSAFE_STACK_DETAIL
     text = _SENSITIVE_VALUE_RE.sub(lambda match: f"{match.group(1)}={_REDACTED_SECRET}", text)
     text = _BEARER_TOKEN_RE.sub(f"Bearer {_REDACTED_SECRET}", text)
+    text = _UNC_ABSOLUTE_PATH_RE.sub(_REDACTED_PATH, text)
     text = _WINDOWS_ABSOLUTE_PATH_RE.sub(_REDACTED_PATH, text)
     text = _POSIX_ABSOLUTE_PATH_RE.sub(_REDACTED_PATH, text)
     return text[:_MAX_PERSISTED_TEXT_CHARS]
@@ -102,6 +140,13 @@ def _safe_payload_json(payload: object) -> str:
     if len(encoded.encode("utf-8")) > _MAX_EVENT_PAYLOAD_BYTES:
         return json.dumps({"truncated": True})
     return encoded
+
+
+def _safe_ingestion_error(code: object) -> tuple[str, str]:
+    normalized_code = str(code)
+    if normalized_code not in _SAFE_INGESTION_ERROR_DETAILS:
+        normalized_code = "storage_unavailable"
+    return normalized_code, _SAFE_INGESTION_ERROR_DETAILS[normalized_code]
 
 
 class IngestionStateError(RuntimeError):
@@ -434,29 +479,36 @@ class IngestionStore:
 
     def mark_stage(self, job_id: str, stage: str, message: str) -> None:
         now = _utc_now()
+        safe_stage = stage if stage in _SAFE_STAGE_MESSAGES else None
+        safe_message = _SAFE_STAGE_MESSAGES.get(stage, _UNKNOWN_STAGE_MESSAGE)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = self._active_attempt_row(connection, job_id)
             if row is None:
                 return
-            connection.execute(
-                "UPDATE ingestion_jobs SET current_stage = ?, updated_at = ? WHERE job_id = ?",
-                (stage, now, job_id),
-            )
-            connection.execute(
-                """
-                UPDATE ingestion_attempts SET current_stage = ?
-                WHERE job_id = ? AND attempt_no = ?
-                """,
-                (stage, job_id, row["attempt_count"]),
-            )
+            if safe_stage is None:
+                connection.execute(
+                    "UPDATE ingestion_jobs SET updated_at = ? WHERE job_id = ?", (now, job_id)
+                )
+            else:
+                connection.execute(
+                    "UPDATE ingestion_jobs SET current_stage = ?, updated_at = ? WHERE job_id = ?",
+                    (safe_stage, now, job_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE ingestion_attempts SET current_stage = ?
+                    WHERE job_id = ? AND attempt_no = ?
+                    """,
+                    (safe_stage, job_id, row["attempt_count"]),
+                )
             self._append_event(
                 connection,
                 job_id,
                 row["attempt_count"],
                 event_type="stage_changed",
-                message=message,
-                payload={"stage": stage},
+                message=safe_message,
+                payload={"stage": safe_stage or "unknown"},
             )
 
     def mark_item_running(self, job_id: str, item_index: int, stage: str) -> bool:
@@ -540,7 +592,7 @@ class IngestionStore:
 
     def fail_item(self, job_id: str, item_index: int, detail: str) -> None:
         now = _utc_now()
-        safe_detail = _safe_text(detail)
+        safe_detail = _ITEM_FAILURE_DETAIL
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = self._active_attempt_row(connection, job_id)
@@ -689,8 +741,7 @@ class IngestionStore:
 
     def mark_rolling_back(self, job_id: str, *, code: str, detail: str) -> None:
         now = _utc_now()
-        safe_code = _safe_text(code)
-        safe_detail = _safe_text(detail)
+        safe_code, safe_detail = _safe_ingestion_error(code)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = self._attempt_state_row(connection, job_id)
@@ -733,8 +784,7 @@ class IngestionStore:
 
     def fail_job(self, job_id: str, *, code: str, detail: str) -> None:
         now = _utc_now()
-        safe_code = _safe_text(code)
-        safe_detail = _safe_text(detail)
+        safe_code, safe_detail = _safe_ingestion_error(code)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -835,7 +885,7 @@ class IngestionStore:
 
     def abort_retry(self, job_id: str, attempt_no: int, detail: str) -> None:
         now = _utc_now()
-        safe_detail = _safe_text(detail)
+        safe_detail = _RETRY_CLEANUP_FAILURE_DETAIL
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
