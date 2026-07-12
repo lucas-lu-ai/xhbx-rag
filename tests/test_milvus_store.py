@@ -570,3 +570,21 @@ def test_multi_collection_store_merges_filter_options(tmp_path) -> None:
         "stages": ["售前"],
         "case_names": ["案例A"],
     }
+
+
+def test_store_fetches_raw_rows_with_vectors_and_restores_them(tmp_path) -> None:
+    store = MilvusLiteStore(db_path=tmp_path / "rag.db", collection_name="chunks")
+    original = MilvusChunkRecord.from_chunk(_chunk("same", "旧文本"), [0.1, 0.2])
+    replacement = MilvusChunkRecord.from_chunk(_chunk("same", "新文本"), [0.9, 0.8])
+    store.ensure_collection(2)
+    store.upsert([original])
+
+    snapshot = store.fetch_raw_rows_by_ids(["same"])
+    store.upsert([replacement])
+    store.delete_by_ids(["same"])
+    store.upsert_raw_rows(list(snapshot.values()))
+    store.flush()
+
+    restored = store.fetch_raw_rows_by_ids(["same"])["same"]
+    assert restored["text"] == "旧文本"
+    assert restored["vector"] == pytest.approx([0.1, 0.2])

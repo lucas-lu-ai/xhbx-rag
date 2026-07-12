@@ -1,5 +1,7 @@
 import json
+from contextlib import contextmanager
 
+import xhbx_rag.indexer as indexer
 from xhbx_rag.indexer import index_chunks
 from xhbx_rag.milvus_store import MilvusSearchHit
 from xhbx_rag.models import RagChunk
@@ -143,6 +145,46 @@ def test_index_chunks_rebuild_drops_collection_before_upsert(tmp_path) -> None:
     assert count == 1
     assert embedding.documents == [["文本1"]]
     assert store.operations == ["drop_collection", "ensure_collection:2", "upsert:1"]
+
+
+def test_index_chunks_locks_collection_writes(tmp_path, monkeypatch) -> None:
+    chunks_path = tmp_path / "chunks.jsonl"
+    chunks_path.write_text(
+        json.dumps(_chunk("c1", "文本1").model_dump(mode="json"), ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    events: list[str] = []
+
+    class LockableStore(_FakeStore):
+        uri = "db"
+        collection_name = "chunks"
+
+        def drop_collection(self) -> None:
+            events.append("drop")
+            super().drop_collection()
+
+        def ensure_collection(self, vector_dim: int) -> None:
+            events.append("ensure")
+            super().ensure_collection(vector_dim)
+
+        def upsert(self, records) -> None:
+            events.append("upsert")
+            super().upsert(records)
+
+    @contextmanager
+    def fake_lock(uri: str, collection_name: str):
+        assert (uri, collection_name) == ("db", "chunks")
+        events.append("lock")
+        try:
+            yield
+        finally:
+            events.append("unlock")
+
+    monkeypatch.setattr(indexer, "collection_write_lock", fake_lock, raising=False)
+
+    index_chunks(chunks_path, _FakeEmbedding(), LockableStore(), mode="rebuild")
+
+    assert events == ["lock", "drop", "ensure", "upsert", "unlock"]
 
 
 def test_index_chunks_emits_trace_events(tmp_path) -> None:

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Literal, Protocol
 
 from .chunk_io import load_chunks_jsonl
+from .index_lock import collection_write_lock
 from .milvus_store import MilvusChunkRecord
 from .observability import TraceSink, emit_trace
 
@@ -26,6 +28,14 @@ class _Store(Protocol):
         """Upsert records."""
 
 
+def _collection_write_context(store: _Store):
+    uri = getattr(store, "uri", None)
+    collection_name = getattr(store, "collection_name", None)
+    if uri is None or collection_name is None:
+        return nullcontext()
+    return collection_write_lock(str(uri), str(collection_name))
+
+
 def index_chunks(
     chunks_path: Path,
     embedding_client: _EmbeddingClient,
@@ -43,8 +53,9 @@ def index_chunks(
     )
     if not chunks:
         if mode == "rebuild":
-            store.drop_collection()
-            emit_trace(trace, "index.collection_dropped", {"mode": mode})
+            with _collection_write_context(store):
+                store.drop_collection()
+                emit_trace(trace, "index.collection_dropped", {"mode": mode})
         return 0
     vectors = embedding_client.embed_documents([chunk.text for chunk in chunks])
     if len(vectors) != len(chunks):
@@ -57,16 +68,17 @@ def index_chunks(
         "index.embedding_completed",
         {"chunk_count": len(chunks), "vector_count": len(vectors), "vector_dim": vector_dim},
     )
-    if mode == "rebuild":
-        store.drop_collection()
-        emit_trace(trace, "index.collection_dropped", {"mode": mode})
-    store.ensure_collection(vector_dim)
-    emit_trace(trace, "index.collection_ready", {"vector_dim": vector_dim})
-    store.upsert(
-        [
-            MilvusChunkRecord.from_chunk(chunk, vector)
-            for chunk, vector in zip(chunks, vectors, strict=True)
-        ]
-    )
-    emit_trace(trace, "index.upsert_completed", {"upsert_count": len(chunks)})
+    with _collection_write_context(store):
+        if mode == "rebuild":
+            store.drop_collection()
+            emit_trace(trace, "index.collection_dropped", {"mode": mode})
+        store.ensure_collection(vector_dim)
+        emit_trace(trace, "index.collection_ready", {"vector_dim": vector_dim})
+        store.upsert(
+            [
+                MilvusChunkRecord.from_chunk(chunk, vector)
+                for chunk, vector in zip(chunks, vectors, strict=True)
+            ]
+        )
+        emit_trace(trace, "index.upsert_completed", {"upsert_count": len(chunks)})
     return len(chunks)

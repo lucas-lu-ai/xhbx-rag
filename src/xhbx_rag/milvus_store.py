@@ -29,6 +29,7 @@ _CHUNK_OUTPUT_FIELDS = [
     "metadata_json",
     "citations_json",
 ]
+_ROLLBACK_OUTPUT_FIELDS = [*_CHUNK_OUTPUT_FIELDS, "text_hash", "vector"]
 _KEYWORD_CANDIDATE_OUTPUT_FIELDS = ["chunk_id", "text"]
 _FILTER_OPTION_OUTPUT_FIELDS = ["case_name", "chunk_type", "stage"]
 _KEYWORD_MIN_CANDIDATES = 50
@@ -146,6 +147,9 @@ class MilvusStore:
             index_params=index_params,
         )
 
+    def collection_exists(self) -> bool:
+        return bool(self.client.has_collection(self.collection_name))
+
     def upsert(self, records: list[MilvusChunkRecord]) -> None:
         if not records:
             return
@@ -154,6 +158,34 @@ class MilvusStore:
             data=[record.to_row() for record in records],
         )
         self.client.flush(self.collection_name)
+
+    def fetch_raw_rows_by_ids(
+        self, chunk_ids: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        if not chunk_ids or not self.collection_exists():
+            return {}
+        rows = self.client.query(
+            collection_name=self.collection_name,
+            filter=_chunk_id_filter_expr(chunk_ids),
+            limit=len(chunk_ids),
+            output_fields=_ROLLBACK_OUTPUT_FIELDS,
+        )
+        return {str(row["chunk_id"]): dict(row) for row in rows}
+
+    def delete_by_ids(self, chunk_ids: list[str]) -> None:
+        if chunk_ids and self.collection_exists():
+            self.client.delete(
+                collection_name=self.collection_name,
+                filter=_chunk_id_filter_expr(chunk_ids),
+            )
+
+    def upsert_raw_rows(self, rows: list[dict[str, Any]]) -> None:
+        if rows:
+            self.client.upsert(collection_name=self.collection_name, data=rows)
+
+    def flush(self) -> None:
+        if self.collection_exists():
+            self.client.flush(self.collection_name)
 
     def drop_collection(self) -> None:
         if self.client.has_collection(self.collection_name):
