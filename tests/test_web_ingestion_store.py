@@ -254,6 +254,38 @@ def test_item_failure_rollback_and_abort_retry_follow_current_attempt(tmp_path: 
     assert store.abort_retry(job_id, 2, "再次调用") is None
 
 
+def test_fail_job_marks_pending_items_as_skipped(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    job_id = _running_job(store, tmp_path)
+    assert store.mark_item_running(job_id, 1, "parsing") is True
+    store.fail_item(job_id, 1, "解析失败")
+
+    store.fail_job(job_id, code="parse_failed", detail="解析失败")
+
+    failed = store.get_job(job_id)
+    assert failed is not None
+    assert [item["status"] for item in failed["items"]] == ["failed", "skipped"]
+
+
+def test_succeeded_recovery_action_remains_until_cleanup_is_recorded(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    job_id = _running_job(store, tmp_path)
+    journal = tmp_path / "attempt" / "rollback" / "journal.json"
+    store.mark_commit_state(job_id, "prepared", journal)
+    store.mark_commit_state(job_id, "committed")
+    store.succeed_job(job_id, chunk_total=1, warning_count=0)
+
+    actions = {(item.job_id, item.action) for item in store.recovery_actions()}
+    assert (job_id, "cleanup_succeeded") in actions
+
+    store.mark_recovery_cleaned(job_id)
+
+    actions = {(item.job_id, item.action) for item in store.recovery_actions()}
+    assert (job_id, "cleanup_succeeded") not in actions
+
+
 def test_recovery_actions_requeue_and_rollback_correct_jobs(tmp_path: Path) -> None:
     store = _store(tmp_path)
     queued = store.create_draft(preflight=_preflight(), source_path=tmp_path / "q.zip")

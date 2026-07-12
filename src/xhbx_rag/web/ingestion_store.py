@@ -216,7 +216,14 @@ class IngestionStateError(RuntimeError):
 @dataclass(frozen=True)
 class RecoveryAction:
     job_id: str
-    action: Literal["enqueue", "fail_interrupted", "rollback", "finish_committed", "delete"]
+    action: Literal[
+        "enqueue",
+        "fail_interrupted",
+        "rollback",
+        "finish_committed",
+        "cleanup_succeeded",
+        "delete",
+    ]
     journal_path: Path | None = None
 
 
@@ -863,6 +870,23 @@ class IngestionStore:
                 payload={"chunk_total": chunk_total, "warning_count": warning_count},
             )
 
+    def mark_recovery_cleaned(self, job_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = self._attempt_state_row(connection, job_id)
+            if row is None or (
+                row["job_status"], row["attempt_status"], row["commit_state"]
+            ) != ("succeeded", "succeeded", "committed"):
+                raise IngestionStateError("恢复材料清理只允许用于已成功提交的任务")
+            connection.execute(
+                """
+                UPDATE ingestion_attempts
+                SET journal_path = NULL
+                WHERE job_id = ? AND attempt_no = ?
+                """,
+                (job_id, row["attempt_count"]),
+            )
+
     def mark_rolling_back(self, job_id: str, *, code: str, detail: str) -> None:
         now = _utc_now()
         safe_code, safe_detail = _safe_ingestion_error(code)
@@ -944,6 +968,22 @@ class IngestionStore:
                 WHERE job_id = ?
                 """,
                 (safe_code, safe_detail, now, now, job_id),
+            )
+            connection.execute(
+                """
+                UPDATE ingestion_items
+                SET status = CASE
+                        WHEN status = 'running' THEN 'failed'
+                        ELSE 'skipped'
+                    END,
+                    error_detail = CASE
+                        WHEN status = 'running' THEN ?
+                        ELSE error_detail
+                    END,
+                    updated_at = ?
+                WHERE job_id = ? AND status IN ('running', 'pending')
+                """,
+                (_ITEM_FAILURE_DETAIL, now, job_id),
             )
             if row["attempt_count"]:
                 connection.execute(
@@ -1084,6 +1124,7 @@ class IngestionStore:
                 LEFT JOIN ingestion_attempts AS a
                     ON a.job_id = j.job_id AND a.attempt_no = j.attempt_count
                 WHERE j.status IN ('queued', 'running', 'rolling_back', 'deleting')
+                   OR (j.status = 'succeeded' AND a.journal_path IS NOT NULL)
                 ORDER BY j.created_at, j.job_id
                 """
             ).fetchall()
@@ -1098,6 +1139,9 @@ class IngestionStore:
                 journal_path = None
             elif status == "deleting":
                 action = "delete"
+                journal_path = None
+            elif status == "succeeded":
+                action = "cleanup_succeeded"
                 journal_path = None
             elif commit_state == "committed":
                 action = "finish_committed"

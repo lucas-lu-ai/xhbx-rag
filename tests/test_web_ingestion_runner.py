@@ -321,6 +321,55 @@ def test_runner_pipeline_failure_safely_fails_and_cleans(
     assert "secret" not in repr(job)
 
 
+def test_runner_failure_marks_later_items_as_not_executed(tmp_path: Path) -> None:
+    store, job_id, _ = queued_store(tmp_path, item_count=2)
+    pipeline = FakePipeline(
+        error=IngestionPipelineError("parse_failed", "raw", 1),
+        events=[("item_started", {"item_index": 1, "stage": "parsing"})],
+    )
+
+    _runner(store, pipeline, FakeAtomicIndexer()).execute_job(job_id)
+
+    job = store.get_job(job_id)
+    assert job is not None
+    assert [item["status"] for item in job["items"]] == ["failed", "skipped"]
+
+
+def test_success_cleanup_failure_is_retried_after_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, job_id, job_dir = queued_store(tmp_path)
+    real_delete = runner_module.delete_job_workspace
+    delete_calls = 0
+
+    def fail_first_backup_delete(path: Path) -> None:
+        nonlocal delete_calls
+        if path.name.startswith(".recovery-attempt-"):
+            delete_calls += 1
+            if delete_calls == 1:
+                raise OSError("cannot remove committed recovery backup")
+        real_delete(path)
+
+    monkeypatch.setattr(runner_module, "delete_job_workspace", fail_first_backup_delete)
+    runner = _runner(store, FakePipeline(), FakeAtomicIndexer())
+    runner.execute_job(job_id)
+
+    backup = job_dir / ".recovery-attempt-1"
+    assert store.get_job(job_id)["status"] == "succeeded"
+    assert backup.is_dir()
+    assert any(action.action == "cleanup_succeeded" for action in store.recovery_actions())
+
+    runner.recover_after_restart()
+    runner.start()
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and backup.exists():
+        time.sleep(0.01)
+    runner.stop()
+
+    assert not backup.exists()
+    assert not any(action.action == "cleanup_succeeded" for action in store.recovery_actions())
+
+
 def test_runner_embedding_failure_is_fixed_and_precommit_clean(tmp_path: Path) -> None:
     store, job_id, job_dir = queued_store(tmp_path)
     indexer = FakeAtomicIndexer(mode="embedding_failure")
@@ -680,8 +729,12 @@ def test_execute_recovery_corruption_keeps_workspace_until_stop(tmp_path: Path) 
 def test_recover_after_restart_worker_fails_uncommitted_interruption(
     tmp_path: Path,
 ) -> None:
-    store, job_id, job_dir = queued_store(tmp_path)
+    store, job_id, job_dir = queued_store(tmp_path, item_count=2)
     assert store.claim_job(job_id)
+    workspace = job_dir / "attempts" / "1"
+    workspace.mkdir(parents=True)
+    store.begin_attempt(job_id, workspace)
+    assert store.mark_item_running(job_id, 1, "parsing") is True
     runner = _runner(store, FakePipeline(), FakeAtomicIndexer())
 
     runner.recover_after_restart()
@@ -698,6 +751,7 @@ def test_recover_after_restart_worker_fails_uncommitted_interruption(
     job = store.get_job(job_id)
     assert job["status"] == "failed"
     assert job["error_code"] == "service_restarted"
+    assert [item["status"] for item in job["items"]] == ["failed", "skipped"]
     assert (job_dir / "source" / "courses.zip").is_file()
     assert list((job_dir / "attempts").iterdir()) == []
 

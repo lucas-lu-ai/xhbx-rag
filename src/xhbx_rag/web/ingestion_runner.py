@@ -53,7 +53,7 @@ class _AtomicIndexer(Protocol):
     ) -> str: ...
 
 
-QueueKind = Literal["job", "recovery", "interrupt", "delete", "stop"]
+QueueKind = Literal["job", "recovery", "interrupt", "cleanup", "delete", "stop"]
 
 
 class _UntrustedRecoveryMaterial(RuntimeError):
@@ -291,6 +291,8 @@ class IngestionRunner:
                     self._put("interrupt", action.job_id, priority=0)
                 elif action.action == "delete":
                     self._put("delete", action.job_id, priority=0)
+                elif action.action == "cleanup_succeeded":
+                    self._put("cleanup", action.job_id, priority=0)
                 elif action.action == "enqueue":
                     self._put("job", action.job_id, priority=10)
             except Exception:
@@ -536,6 +538,11 @@ class IngestionRunner:
             delete_job_workspace(backup)
         except Exception:
             pass
+        else:
+            try:
+                self.store.mark_recovery_cleaned(job_id)
+            except Exception:
+                pass
         return True
 
     def _stash_committed_recovery(
@@ -677,6 +684,18 @@ class IngestionRunner:
             return
         self.store.finish_delete(job_id)
 
+    def _cleanup_succeeded_recovery(self, job_id: str) -> None:
+        job = self.store.get_job_for_execution(job_id)
+        if job is None or job.get("status") != "succeeded":
+            return
+        paths = _expected_paths(job)
+        _validate_attempt_binding(job, paths, allow_workspace_none=False)
+        _validate_recovery_location(paths, paths.backup)
+        if paths.backup.exists() or paths.backup.is_symlink():
+            delete_job_workspace(paths.backup)
+            _fsync_directory(paths.job_dir)
+        self.store.mark_recovery_cleaned(job_id)
+
     def _sleep(self, delay: float) -> bool:
         if self._stop_event.is_set():
             return False
@@ -701,6 +720,8 @@ class IngestionRunner:
                         self.execute_recovery(item.job_id)
                     elif item.kind == "interrupt":
                         self.execute_interrupt(item.job_id)
+                    elif item.kind == "cleanup":
+                        self._cleanup_succeeded_recovery(item.job_id)
                     elif item.kind == "delete":
                         self._execute_delete(item.job_id)
                 except Exception:
