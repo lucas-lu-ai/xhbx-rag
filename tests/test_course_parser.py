@@ -169,7 +169,8 @@ def test_parse_course_dir_degrades_when_enrichment_fails(tmp_path) -> None:
 
     report = parse_course_dir(course_dir, out_dir, enrichment_agent=_FailingEnrichmentAgent())
 
-    assert report.enrich_failures and "促成课" in report.enrich_failures[0]
+    assert report.enrich_failures == ["促成课: 课程增值服务不可用"]
+    assert "模型不可用" not in report.enrich_failures[0]
     chunks = load_chunks_jsonl(out_dir / "chunks.jsonl")
     overview = next(chunk for chunk in chunks if chunk.chunk_id.endswith("__overview"))
     assert overview.metadata["summary"] == ""

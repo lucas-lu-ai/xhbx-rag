@@ -193,7 +193,7 @@ def _enrich_or_none(
             sample_text=str(getattr(source, "text", ""))[:_ENRICH_SAMPLE_MAX_CHARS],
         )
     except Exception as exc:  # noqa: BLE001 - enrich 失败降级为纯规则产物
-        enrich_failures.append(f"{course_name}: {exc!r}")
+        enrich_failures.append(f"{course_name}: 课程增值服务不可用")
         emit_trace(
             trace,
             "course_parse.enrich_failed",

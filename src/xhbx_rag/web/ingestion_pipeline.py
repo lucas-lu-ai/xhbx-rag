@@ -6,6 +6,7 @@ import inspect
 import json
 import os
 import shutil
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +25,7 @@ from xhbx_rag.course_parser import (
     parse_course_dir,
 )
 from xhbx_rag.models import RagChunk
+from xhbx_rag.milvus_store import MilvusChunkRecord
 from xhbx_rag.normalizer import normalize_case
 from xhbx_rag.observability import TraceSink
 from xhbx_rag.parser import ParseFatalError, parse_inputs
@@ -115,8 +117,13 @@ class IngestionPipeline:
         on_event: EventCallback | None = None,
     ) -> PreparedIngestion:
         staging_dir = attempt_dir / "staging"
-        _remove_path(staging_dir)
         try:
+            try:
+                _clear_staging_artifacts(staging_dir)
+            except OSError as exc:
+                raise IngestionPipelineError(
+                    "chunk_failed", "staging 工作区清理失败"
+                ) from exc
             preflight, source_path = _preflight_from_job(job)
             try:
                 materialized = self.upload_materializer(
@@ -131,16 +138,11 @@ class IngestionPipeline:
                 ) from exc
             _validate_materialized_items(preflight.items, materialized)
 
-            try:
-                config = self.config_provider()
-            except Exception as exc:  # noqa: BLE001 - 不向 Web 暴露配置细节
-                raise IngestionPipelineError(
-                    "parse_failed", "入库加工配置无法加载"
-                ) from exc
-
             all_chunks: list[RagChunk] = []
             warnings: list[str] = []
+            seen_chunk_ids: set[str] = set()
             if preflight.target == "case":
+                config = _load_required_config(self.config_provider)
                 generator = _create_case_generator(
                     self.case_generation_factory, config
                 )
@@ -151,12 +153,16 @@ class IngestionPipeline:
                         attempt_dir,
                         generator,
                         on_event,
+                        seen_chunk_ids,
                     )
                     all_chunks.extend(chunks)
                     warnings.extend(item_warnings)
             else:
-                enrichment_agent, initialization_warnings = _create_course_enrichment(
-                    self.course_enrichment_factory, config
+                enrichment_agent, initialization_warnings = (
+                    _create_optional_course_enrichment(
+                        self.config_provider,
+                        self.course_enrichment_factory,
+                    )
                 )
                 warnings.extend(initialization_warnings)
                 for item in preflight.items:
@@ -166,12 +172,18 @@ class IngestionPipeline:
                         attempt_dir,
                         enrichment_agent,
                         on_event,
+                        seen_chunk_ids,
                     )
                     all_chunks.extend(chunks)
                     warnings.extend(item_warnings)
 
             _validate_batch(all_chunks, preflight.target)
-            chunks_path = _publish_staging(staging_dir, all_chunks)
+            try:
+                chunks_path = _publish_staging(staging_dir, all_chunks)
+            except Exception as exc:  # noqa: BLE001 - 对外只暴露固定错误
+                raise IngestionPipelineError(
+                    "chunk_failed", "staging 产物发布失败"
+                ) from exc
             return PreparedIngestion(
                 chunks_path=chunks_path,
                 chunk_count=len(all_chunks),
@@ -179,7 +191,10 @@ class IngestionPipeline:
                 warnings=tuple(warnings),
             )
         except BaseException:
-            _remove_path(staging_dir)
+            try:
+                _clear_staging_artifacts(staging_dir)
+            except OSError:
+                pass
             raise
 
     def _prepare_case_item(
@@ -189,10 +204,20 @@ class IngestionPipeline:
         attempt_dir: Path,
         generator: CaseGenerator,
         on_event: EventCallback | None,
+        seen_chunk_ids: set[str],
     ) -> tuple[list[RagChunk], list[str]]:
         _emit_item_event(on_event, "item_started", item, stage="parsing")
         generated_dir = _item_output_dir(attempt_dir / "generated", item)
         parsed_dir = _item_output_dir(attempt_dir / "parsed", item)
+        try:
+            _prepare_output_dir(generated_dir)
+            _prepare_output_dir(parsed_dir)
+        except OSError as exc:
+            error = IngestionPipelineError(
+                "parse_failed", "案例工作区初始化失败", item.item_index
+            )
+            _emit_failure(on_event, item, error)
+            raise error from exc
         try:
             result = generator(
                 case_dir=case_dir,
@@ -223,7 +248,30 @@ class IngestionPipeline:
             raise error
 
         try:
-            parsed = parse_inputs(result.insights_path, result.playbook_path)
+            insights_path = _require_confined_regular_file(
+                result.insights_path, generated_dir
+            )
+        except (OSError, ValueError) as exc:
+            error = IngestionPipelineError(
+                "parse_failed", "案例洞察产物无效", item.item_index
+            )
+            _emit_failure(on_event, item, error)
+            raise error from exc
+        playbook_path: Path | None = None
+        if result.playbook_path is not None:
+            try:
+                playbook_path = _require_confined_regular_file(
+                    result.playbook_path, generated_dir
+                )
+            except (OSError, ValueError) as exc:
+                error = IngestionPipelineError(
+                    "parse_failed", "案例 playbook 产物无效", item.item_index
+                )
+                _emit_failure(on_event, item, error)
+                raise error from exc
+
+        try:
+            parsed = parse_inputs(insights_path, playbook_path)
             knowledge = normalize_case(parsed)
         except (OSError, UnicodeError, ParseFatalError, ValueError) as exc:
             error = IngestionPipelineError(
@@ -236,8 +284,8 @@ class IngestionPipeline:
             if not chunks:
                 raise ValueError("案例未产生 chunk")
             report = build_parse_report(
-                result.insights_path,
-                result.playbook_path,
+                insights_path,
+                playbook_path,
                 parsed_dir,
                 knowledge,
                 chunks,
@@ -251,7 +299,9 @@ class IngestionPipeline:
             )
             _emit_failure(on_event, item, error)
             raise error from exc
-        _validate_item_chunks(chunks, "case", item, on_event)
+        _validate_item_chunks(
+            chunks, "case", item, on_event, seen_chunk_ids
+        )
         _emit_item_completed(on_event, item, len(chunks), len(parsed.warnings))
         return chunks, list(parsed.warnings)
 
@@ -262,9 +312,18 @@ class IngestionPipeline:
         attempt_dir: Path,
         enrichment_agent: CourseEnrichmentAgent | None,
         on_event: EventCallback | None,
+        seen_chunk_ids: set[str],
     ) -> tuple[list[RagChunk], list[str]]:
         _emit_item_event(on_event, "item_started", item, stage="parsing")
         parsed_dir = _item_output_dir(attempt_dir / "parsed", item)
+        try:
+            _prepare_output_dir(parsed_dir)
+        except OSError as exc:
+            error = IngestionPipelineError(
+                "parse_failed", "课程工作区初始化失败", item.item_index
+            )
+            _emit_failure(on_event, item, error)
+            raise error from exc
 
         def on_file(relative_path: str, status: str, chunk_count: int) -> None:
             if on_event is not None:
@@ -293,12 +352,6 @@ class IngestionPipeline:
                 raise CourseFileParseError(
                     item.unit_key, "课程文件解析不完整"
                 )
-            chunks_value = report.output_files.get("chunks")
-            if not chunks_value:
-                raise ChunkLoadError("课程 chunks 产物缺失")
-            chunks = load_chunks_jsonl(Path(chunks_value))
-            if not chunks:
-                raise ChunkLoadError("课程未产生 chunk")
         except Exception as exc:  # noqa: BLE001
             # 受支持课程文件必须全部成功。
             error = IngestionPipelineError(
@@ -306,8 +359,28 @@ class IngestionPipeline:
             )
             _emit_failure(on_event, item, error)
             raise error from exc
+        try:
+            chunks_value = report.output_files.get("chunks")
+            report_value = report.output_files.get("report")
+            if not chunks_value or not report_value:
+                raise ValueError("课程解析产物缺失")
+            chunks_path = _require_confined_regular_file(
+                chunks_value, parsed_dir
+            )
+            _require_confined_regular_file(report_value, parsed_dir)
+            chunks = load_chunks_jsonl(chunks_path)
+            if not chunks:
+                raise ChunkLoadError("课程未产生 chunk")
+        except (ChunkLoadError, OSError, UnicodeError, ValueError) as exc:
+            error = IngestionPipelineError(
+                "parse_failed", "课程解析产物无效", item.item_index
+            )
+            _emit_failure(on_event, item, error)
+            raise error from exc
         item_warnings = list(report.enrich_failures)
-        _validate_item_chunks(chunks, "course", item, on_event)
+        _validate_item_chunks(
+            chunks, "course", item, on_event, seen_chunk_ids
+        )
         _emit_item_completed(on_event, item, len(chunks), len(item_warnings))
         return chunks, item_warnings
 
@@ -371,6 +444,26 @@ def _create_case_generator(
     return generator
 
 
+def _load_required_config(provider: ConfigProvider) -> object:
+    try:
+        return provider()
+    except Exception as exc:  # noqa: BLE001 - 不向 Web 暴露配置细节
+        raise IngestionPipelineError(
+            "parse_failed", "入库加工配置无法加载"
+        ) from exc
+
+
+def _create_optional_course_enrichment(
+    provider: ConfigProvider,
+    factory: CourseEnrichmentFactory,
+) -> tuple[CourseEnrichmentAgent | None, list[str]]:
+    try:
+        config = provider()
+    except Exception:  # noqa: BLE001 - 课程增值不是必需步骤
+        return None, ["课程增值服务不可用"]
+    return _create_course_enrichment(factory, config)
+
+
 def _create_course_enrichment(
     factory: CourseEnrichmentFactory, config: object
 ) -> tuple[CourseEnrichmentAgent | None, list[str]]:
@@ -430,9 +523,8 @@ def _preflight_from_job(
             items.append(item)
     except (KeyError, TypeError, ValueError) as exc:
         raise IngestionPipelineError("upload_invalid", "入库输入项无效") from exc
-    items.sort(key=lambda value: value.item_index)
     indexes = [item.item_index for item in items]
-    if not items or len(set(indexes)) != len(indexes):
+    if not items or indexes != list(range(1, len(items) + 1)):
         raise IngestionPipelineError("upload_invalid", "入库输入项序号无效")
 
     ignored = job.get("ignored_entries", ())
@@ -463,6 +555,42 @@ def _validate_materialized_items(
 def _item_output_dir(root: Path, item: PreflightItem) -> Path:
     digest = hashlib.sha256(item.unit_key.encode("utf-8")).hexdigest()[:12]
     return root / f"item-{item.item_index:04d}-{digest}"
+
+
+def _prepare_output_dir(path: Path) -> None:
+    attempt_root = path.parent.parent
+    if attempt_root.is_symlink() or path.parent.is_symlink():
+        raise OSError("工作区路径无效")
+    attempt_root.mkdir(parents=True, exist_ok=True)
+    resolved_attempt = attempt_root.resolve(strict=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.parent.is_symlink() or not path.parent.resolve(strict=True).is_relative_to(
+        resolved_attempt
+    ):
+        raise OSError("工作区路径无效")
+    _remove_path(path)
+    path.mkdir()
+    if path.is_symlink() or not path.resolve(strict=True).is_relative_to(
+        resolved_attempt
+    ):
+        raise OSError("工作区路径无效")
+
+
+def _require_confined_regular_file(path_value: object, root: Path) -> Path:
+    try:
+        path = Path(os.fspath(path_value))  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise ValueError("产物路径无效") from exc
+    if root.is_symlink() or not root.is_dir() or path.is_symlink():
+        raise ValueError("产物路径无效")
+    try:
+        resolved_root = root.resolve(strict=True)
+        resolved_path = path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("产物路径无效") from exc
+    if not resolved_path.is_relative_to(resolved_root) or not resolved_path.is_file():
+        raise ValueError("产物路径无效")
+    return resolved_path
 
 
 def _validate_batch(chunks: list[RagChunk], target: Literal["case", "course"]) -> None:
@@ -501,48 +629,79 @@ def _validate_item_chunks(
     target: Literal["case", "course"],
     item: PreflightItem,
     on_event: EventCallback | None,
+    seen_chunk_ids: set[str],
 ) -> None:
     try:
         _validate_batch(chunks, target)
+        duplicate = next(
+            (chunk.chunk_id for chunk in chunks if chunk.chunk_id in seen_chunk_ids),
+            None,
+        )
+        if duplicate is not None:
+            raise IngestionPipelineError(
+                "chunk_failed", f"chunk_id 重复: {duplicate}"
+            )
     except IngestionPipelineError as exc:
         error = IngestionPipelineError(exc.code, exc.detail, item.item_index)
         _emit_failure(on_event, item, error)
         raise error from exc
+    seen_chunk_ids.update(chunk.chunk_id for chunk in chunks)
 
 
 def _validate_chunk_json_and_fields(chunk: RagChunk) -> None:
     try:
-        metadata_json = json.dumps(
-            chunk.metadata,
-            ensure_ascii=False,
-            allow_nan=False,
-        )
-    except (RecursionError, TypeError, ValueError) as exc:
+        chunk.source_file.encode("utf-8")
+        chunk.chunk_id.encode("utf-8")
+        chunk.text.encode("utf-8")
+    except UnicodeEncodeError as exc:
         raise IngestionPipelineError(
-            "chunk_failed", f"metadata 无法 JSON 序列化: {chunk.chunk_id}"
+            "chunk_failed", "chunk 字段无法编码为 UTF-8"
         ) from exc
     try:
-        citations_json = json.dumps(
-            [citation.model_dump(mode="json") for citation in chunk.citations],
-            ensure_ascii=False,
-            allow_nan=False,
-        )
+        for citation in chunk.citations:
+            citation.model_dump(mode="json")
     except (RecursionError, TypeError, ValueError) as exc:
         raise IngestionPipelineError(
             "chunk_failed", f"citations 无法 JSON 序列化: {chunk.chunk_id}"
         ) from exc
 
+    try:
+        row = MilvusChunkRecord.from_chunk(chunk, [0.0]).to_row()
+    except (RecursionError, TypeError, UnicodeError, ValueError) as exc:
+        raise IngestionPipelineError(
+            "chunk_failed", f"metadata 无法 JSON 序列化: {chunk.chunk_id}"
+        ) from exc
+
+    metadata_json = str(row["metadata_json"])
+    citations_json = str(row["citations_json"])
+    try:
+        json.loads(metadata_json, parse_constant=_reject_json_constant)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise IngestionPipelineError(
+            "chunk_failed", f"metadata 无法 JSON 序列化: {chunk.chunk_id}"
+        ) from exc
+    try:
+        json.loads(citations_json, parse_constant=_reject_json_constant)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise IngestionPipelineError(
+            "chunk_failed", f"citations 无法 JSON 序列化: {chunk.chunk_id}"
+        ) from exc
+
     fields = {
-        "chunk_id": chunk.chunk_id,
-        "text": chunk.text,
-        "case_name": str(chunk.metadata.get("case_name", "")),
-        "chunk_type": chunk.chunk_type,
-        "stage": str(chunk.metadata.get("stage", "")),
-        "scenario": str(chunk.metadata.get("scenario", "")),
+        "chunk_id": row["chunk_id"],
+        "text": row["text"],
+        "case_name": row["case_name"],
+        "chunk_type": row["chunk_type"],
+        "stage": row["stage"],
+        "scenario": row["scenario"],
         "metadata_json": metadata_json,
         "citations_json": citations_json,
     }
     for field_name, value in fields.items():
+        if not isinstance(value, str):
+            raise IngestionPipelineError(
+                "chunk_failed", f"Milvus 字段类型无效: {field_name}"
+            )
         try:
             encoded = value.encode("utf-8")
         except UnicodeEncodeError as exc:
@@ -554,12 +713,10 @@ def _validate_chunk_json_and_fields(chunk: RagChunk) -> None:
                 "chunk_failed",
                 f"{field_name} 超过 Milvus 字段上限: {chunk.chunk_id}",
             )
-    try:
-        chunk.source_file.encode("utf-8")
-    except UnicodeEncodeError as exc:
-        raise IngestionPipelineError(
-            "chunk_failed", "chunk 字段无法编码为 UTF-8: source_file"
-        ) from exc
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"非标准 JSON 常量: {value}")
 
 
 def _publish_staging(staging_dir: Path, chunks: list[RagChunk]) -> Path:
@@ -572,20 +729,33 @@ def _publish_staging(staging_dir: Path, chunks: list[RagChunk]) -> Path:
         )
         for chunk in chunks
     ]
-    staging_dir.mkdir(parents=True, exist_ok=False)
-    chunks_path = staging_dir / "chunks.jsonl"
-    temporary = staging_dir / "chunks.jsonl.tmp"
+    parent = staging_dir.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    temporary_dir = parent / f".staging.tmp-{uuid.uuid4().hex}"
+    temporary_dir.mkdir()
+    temporary_chunks_path = temporary_dir / "chunks.jsonl"
     try:
-        with temporary.open("x", encoding="utf-8") as output:
+        with temporary_chunks_path.open("x", encoding="utf-8") as output:
             output.write("\n".join(lines) + "\n")
             output.flush()
             os.fsync(output.fileno())
-        temporary.replace(chunks_path)
+        _fsync_directory(temporary_dir)
+        os.replace(temporary_dir, staging_dir)
+        _fsync_directory(parent)
     except BaseException:
-        temporary.unlink(missing_ok=True)
-        chunks_path.unlink(missing_ok=True)
+        _remove_path(temporary_dir)
+        _remove_path(staging_dir)
         raise
-    return chunks_path
+    return staging_dir / "chunks.jsonl"
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _emit_item_event(
@@ -644,3 +814,12 @@ def _remove_path(path: Path) -> None:
         path.unlink(missing_ok=True)
     elif path.exists():
         shutil.rmtree(path)
+
+
+def _clear_staging_artifacts(staging_dir: Path) -> None:
+    _remove_path(staging_dir)
+    parent = staging_dir.parent
+    if not parent.exists():
+        return
+    for temporary_dir in parent.glob(".staging.tmp-*"):
+        _remove_path(temporary_dir)
