@@ -254,3 +254,27 @@ def test_web_ingestion_upload_limits_are_deployable_and_persistent() -> None:
 
     assert "./.local:/app/.local" in compose
     assert "client_max_body_size 512m;" in nginx
+
+
+def test_web_ingestion_docs_and_proxy_limits_are_documented() -> None:
+    readme = read_repo_file("README.md")
+    env_template = read_repo_file(".env.example")
+    nginx = read_repo_file("web/nginx.conf")
+    assert "Web 文档入库" in readme
+    assert "ZIP 一级子目录" in readme
+    assert "失败任务从头重试" in readme
+    for documented_contract in (
+        "全有或全无",
+        "rollback pending",
+        "course_series",
+        ".local/web_ingestion",
+        "WEB_INGEST_MAX_UPLOAD_BYTES",
+        "WEB_INGEST_MAX_ZIP_ENTRIES",
+        "WEB_INGEST_MAX_EXTRACTED_BYTES",
+        "WEB_INGEST_MAX_ENTRY_BYTES",
+        "WEB_INGEST_MAX_COMPRESSION_RATIO",
+    ):
+        assert documented_contract in readme
+    assert "WEB_INGEST_MAX_UPLOAD_BYTES=536870912" in env_template
+    assert "WEB_INGEST_MAX_ZIP_ENTRIES=2000" in env_template
+    assert "client_max_body_size 512m;" in nginx
