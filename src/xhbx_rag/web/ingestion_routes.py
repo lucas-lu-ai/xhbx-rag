@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import re
+import stat
 import unicodedata
 import uuid
 from pathlib import Path
@@ -31,6 +32,8 @@ _CONFLICT_DETAIL = "当前任务状态不允许此操作"
 _UPLOAD_INVALID_DETAIL = "上传文件无效"
 _UPLOAD_TOO_LARGE_DETAIL = "上传文件超过大小限制"
 _STORAGE_UNAVAILABLE_DETAIL = "任务存储暂时不可用"
+_CREATING_PREFIX = ".creating-"
+_CREATING_MARKER = ".creating"
 
 
 class _ActualUploadTooLarge(UploadValidationError):
@@ -103,8 +106,16 @@ def _create_source_layout(store: IngestionStore, job_id: str) -> tuple[Path, Pat
     jobs_root.mkdir(parents=True, exist_ok=True)
     if jobs_root.is_symlink() or not jobs_root.is_dir():
         raise OSError("jobs_root 不是可信目录")
-    job_dir = jobs_root / job_id
+    job_dir = jobs_root / f"{_CREATING_PREFIX}{job_id}"
     job_dir.mkdir(mode=0o700)
+    marker = job_dir / _CREATING_MARKER
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(marker, flags, 0o600)
+    try:
+        os.write(descriptor, job_id.encode("ascii"))
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
     source_dir = job_dir / "source"
     source_dir.mkdir(mode=0o700)
     _fsync_directory(jobs_root)
@@ -112,24 +123,29 @@ def _create_source_layout(store: IngestionStore, job_id: str) -> tuple[Path, Pat
     return job_dir, source_dir
 
 
+def _publish_source_layout(
+    store: IngestionStore, job_id: str, creating_dir: Path, source_name: str
+) -> tuple[Path, Path]:
+    final_dir = store.jobs_root / job_id
+    if final_dir.exists() or final_dir.is_symlink():
+        raise FileExistsError("ingestion job workspace 已存在")
+    creating_dir.replace(final_dir)
+    _fsync_directory(store.jobs_root)
+    return final_dir, final_dir / "source" / source_name
+
+
 def _rollback_failed_create(
     store: IngestionStore, job_id: str, job_dir: Path, *, owns_job_dir: bool
 ) -> None:
+    if not owns_job_dir:
+        return
     try:
-        existing = store.get_job(job_id)
+        delete_result = store.begin_delete(job_id)
     except Exception:
-        logger.exception("检查失败 draft 数据库记录失败 job_id=%s", job_id)
-        existing = None
+        logger.exception("预留失败 draft 删除状态失败 job_id=%s", job_id)
+        return
 
-    if existing is not None:
-        try:
-            result = store.begin_delete(job_id)
-        except Exception:
-            logger.exception("预留失败 draft 删除状态失败 job_id=%s", job_id)
-            return
-        if result != "ok":
-            logger.error("失败 draft 无法进入 deleting job_id=%s result=%s", job_id, result)
-            return
+    if delete_result == "ok":
         try:
             delete_job_workspace(job_dir)
             if store.jobs_root.is_dir():
@@ -143,24 +159,84 @@ def _rollback_failed_create(
             logger.exception("完成失败 draft 删除失败 job_id=%s", job_id)
         return
 
-    if owns_job_dir:
+    if delete_result == "not_found" and owns_job_dir:
         try:
             delete_job_workspace(job_dir)
             if store.jobs_root.is_dir():
                 _fsync_directory(store.jobs_root)
         except Exception:
             logger.exception("清理失败上传目录失败 job_id=%s", job_id)
+        return
+
+    logger.error(
+        "失败 create workspace 所有权不明确，保留现场 job_id=%s result=%s",
+        job_id,
+        delete_result,
+    )
+
+
+def cleanup_abandoned_creates(store: object) -> None:
+    jobs_root = getattr(store, "jobs_root", None)
+    if not isinstance(jobs_root, Path) or not jobs_root.exists():
+        return
+    if jobs_root.is_symlink() or not jobs_root.is_dir():
+        logger.error("跳过不可信 ingestion jobs_root 创建态扫描")
+        return
+    try:
+        candidates = list(jobs_root.iterdir())
+    except OSError:
+        logger.exception("扫描 ingestion 创建态目录失败")
+        return
+    for candidate in candidates:
+        name = candidate.name
+        if name.startswith(_CREATING_PREFIX):
+            job_id = name[len(_CREATING_PREFIX) :]
+        elif _JOB_ID_RE.fullmatch(name):
+            marker = candidate / _CREATING_MARKER
+            try:
+                marker_metadata = marker.lstat()
+            except (FileNotFoundError, OSError):
+                continue
+            if not stat.S_ISREG(marker_metadata.st_mode) or stat.S_ISLNK(
+                marker_metadata.st_mode
+            ):
+                continue
+            job_id = name
+        else:
+            continue
+        if not _JOB_ID_RE.fullmatch(job_id):
+            continue
+        try:
+            metadata = candidate.lstat()
+        except OSError:
+            continue
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            continue
+        try:
+            existing = store.get_job(job_id)  # type: ignore[attr-defined]
+        except Exception:
+            logger.exception("查询 ingestion 创建态所有权失败 job_id=%s", job_id)
+            continue
+        if existing is not None:
+            continue
+        try:
+            delete_job_workspace(candidate)
+            _fsync_directory(jobs_root)
+        except Exception:
+            logger.exception("清理遗留 ingestion 创建态失败 job_id=%s", job_id)
 
 
 async def _close_uploads(uploads: list[object]) -> BaseException | None:
+    # Starlette/FastAPI teardown 可能在 handler 之后再次 close；UploadFile.close
+    # 按接口是幂等的，因此这里负责完成本次 close，但不依赖“只调用一次”。
     first_error: BaseException | None = None
     seen: set[int] = set()
 
     def remember(exc: BaseException) -> None:
         nonlocal first_error
         if first_error is None or (
-            isinstance(exc, asyncio.CancelledError)
-            and not isinstance(first_error, asyncio.CancelledError)
+            not isinstance(exc, Exception)
+            and isinstance(first_error, Exception)
         ):
             first_error = exc
         else:
@@ -237,11 +313,19 @@ async def create_ingestion_job(
             raise
         _fsync_directory(source_dir)
         preflight = preflight_upload(source_path, target=target, limits=limits)
+        job_dir, source_path = _publish_source_layout(
+            store,
+            job_id,
+            job_dir,
+            source_path.name,
+        )
         result = store.create_draft(
             preflight=preflight,
             source_path=source_path,
             job_id=job_id,
         )
+        (job_dir / _CREATING_MARKER).unlink()
+        _fsync_directory(job_dir)
     except BaseException as exc:
         primary_error = exc
 
@@ -249,8 +333,8 @@ async def create_ingestion_job(
     if close_error is not None and (
         primary_error is None
         or (
-            isinstance(close_error, asyncio.CancelledError)
-            and not isinstance(primary_error, asyncio.CancelledError)
+            not isinstance(close_error, Exception)
+            and isinstance(primary_error, Exception)
         )
     ):
         primary_error = close_error
@@ -268,7 +352,7 @@ async def create_ingestion_job(
             job_dir,
             owns_job_dir=owns_job_dir,
         )
-        if isinstance(primary_error, asyncio.CancelledError):
+        if not isinstance(primary_error, Exception):
             raise primary_error
         if isinstance(primary_error, _ActualUploadTooLarge):
             raise HTTPException(status_code=413, detail=_UPLOAD_TOO_LARGE_DETAIL) from primary_error

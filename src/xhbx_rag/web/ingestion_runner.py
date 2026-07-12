@@ -269,6 +269,12 @@ class IngestionRunner:
                 )
                 if disposition == "recovery":
                     self.execute_recovery(job_id)
+                    return
+                if disposition == "retry":
+                    if not self._sleep(delay):
+                        return
+                    delay = min(delay * 2.0, 60.0)
+                    continue
                 return
             except Exception:
                 if not self._sleep(delay):
@@ -607,7 +613,7 @@ class IngestionRunner:
 
     def _fail_interrupted(
         self, action: RecoveryAction
-    ) -> Literal["done", "recovery", "quarantined"]:
+    ) -> Literal["done", "recovery", "quarantined", "retry"]:
         job = self.store.get_job_for_execution(action.job_id)
         if job is None:
             return "done"
@@ -643,12 +649,13 @@ class IngestionRunner:
             return "recovery"
         if not self._cleanup_attempts(job):
             current = self.store.get_job_for_execution(action.job_id)
-            if current is not None:
-                try:
-                    self._journal_for_job(current)
-                except _UntrustedRecoveryMaterial:
-                    return "quarantined"
-            return "done"
+            if current is None:
+                return "done"
+            try:
+                self._journal_for_job(current)
+            except _UntrustedRecoveryMaterial:
+                return "quarantined"
+            return "retry"
         attempt = job.get("attempt")
         error_code = (
             "index_failed"

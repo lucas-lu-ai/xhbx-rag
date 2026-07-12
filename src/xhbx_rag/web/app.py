@@ -21,7 +21,7 @@ from .batch_routes import router as batch_router
 from .a2a_routes import router as a2a_router
 from .batch_runner import BatchRunner
 from .batch_store import BatchRunStore
-from .ingestion_routes import router as ingestion_router
+from .ingestion_routes import cleanup_abandoned_creates, router as ingestion_router
 from .ingestion_pipeline import IngestionPipeline
 from .ingestion_runner import IngestionRunner
 from .ingestion_store import IngestionStore
@@ -306,7 +306,9 @@ def create_app(
             )
             if runner_store is not ingestion_runtime_store:
                 raise ValueError("ingestion Store/Runner 运行时绑定不一致")
-            # 恢复项先进入优先队列，再启动 worker，避免新任务抢在恢复前执行。
+            # 先清理可识别且 SQLite 明确无主的创建态，再扫描恢复动作；两者
+            # 都只访问本地持久化状态，最后才启动可能访问外部服务的 worker。
+            cleanup_abandoned_creates(ingestion_runtime_store)
             ingestion_runtime.recover_after_restart()
             ingestion_runtime.start()
             active_ingestion_runner = ingestion_runtime

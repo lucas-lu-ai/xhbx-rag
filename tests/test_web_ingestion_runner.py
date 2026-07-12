@@ -881,6 +881,43 @@ def test_restart_actions_are_isolated_and_interrupted_store_failure_retries(
     assert store.get_job(queued_id)["status"] == "succeeded"
 
 
+def test_interrupted_cleanup_false_retries_until_job_is_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, job_id, _ = queued_store(tmp_path)
+    assert store.claim_job(job_id)
+    sleeps: list[float] = []
+    runner = _runner(
+        store,
+        FakePipeline(),
+        FakeAtomicIndexer(),
+        sleep_fn=sleeps.append,
+    )
+    real_cleanup = runner._cleanup_attempts
+    cleanup_calls = 0
+
+    def cleanup_after_first_failure(job: dict[str, object]) -> bool:
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        if cleanup_calls == 1:
+            return False
+        return real_cleanup(job)
+
+    monkeypatch.setattr(runner, "_cleanup_attempts", cleanup_after_first_failure)
+
+    runner.recover_after_restart()
+    runner.start()
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and store.get_job(job_id)["status"] != "failed":
+        time.sleep(0.01)
+    runner.stop()
+
+    assert cleanup_calls == 2
+    assert sleeps == [2.0]
+    assert store.get_job(job_id)["status"] == "failed"
+    assert store.get_job(job_id)["error_code"] == "service_restarted"
+
+
 def test_delete_recovery_retries_without_finishing_store_early(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -824,6 +824,35 @@ def test_lifespan_recovers_ingestion_before_start_and_stops_both() -> None:
     assert events[-2:] == ["ingestion.stop", "batch.stop"]
 
 
+def test_lifespan_scans_creating_workspaces_before_runner_recovery(monkeypatch) -> None:
+    events: list[str] = []
+    ingestion_store = object()
+    monkeypatch.setattr(
+        web_app,
+        "cleanup_abandoned_creates",
+        lambda selected_store: events.append(
+            "ingestion.scan" if selected_store is ingestion_store else "wrong-store"
+        ),
+    )
+    app = web_app.create_app(
+        batch_store=_LifecycleStore(events, "batch"),
+        batch_runner=_LifecycleRunner(events, "batch"),
+        ingestion_store=ingestion_store,
+        ingestion_runner=_LifecycleRunner(events, "ingestion"),
+    )
+
+    with TestClient(app):
+        pass
+
+    assert events[:5] == [
+        "batch.recover",
+        "batch.start",
+        "ingestion.scan",
+        "ingestion.recover",
+        "ingestion.start",
+    ]
+
+
 def test_lifespan_batch_failure_does_not_disable_ingestion() -> None:
     events: list[str] = []
 

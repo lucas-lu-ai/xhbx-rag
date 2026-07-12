@@ -168,6 +168,8 @@ def test_create_uses_uuid_workspace_and_never_trusts_client_path(
     assert source_path == store.jobs_root / job_id / "source" / "course.txt"
     assert source_path.read_bytes() == b"course"
     assert not any(path.is_symlink() for path in (store.jobs_root, source_path.parent, source_path))
+    assert not (store.jobs_root / job_id / ".creating").exists()
+    assert list(store.jobs_root.glob(".creating-*")) == []
 
 
 def test_create_rejects_preexisting_job_symlink_without_writing_through_it(
@@ -250,6 +252,31 @@ def test_upload_close_error_after_draft_rolls_back_database_and_workspace(
     assert list(store.jobs_root.iterdir()) == []
 
 
+@pytest.mark.parametrize("delete_result", ["conflict", "error"])
+def test_close_failure_preserves_db_owned_draft_when_delete_ownership_is_unclear(
+    tmp_path: Path, monkeypatch, delete_result: str
+) -> None:
+    _, store, runner = make_client(tmp_path)
+    upload = FaultyUpload(close_error=OSError("close /private/source token=secret"))
+
+    def uncertain_delete(_: str) -> str:
+        if delete_result == "error":
+            raise sqlite3.OperationalError("ownership lookup failed")
+        return "conflict"
+
+    monkeypatch.setattr(store, "begin_delete", uncertain_delete)
+
+    with pytest.raises(HTTPException) as caught:
+        invoke_direct_create(store, runner, upload)
+
+    assert caught.value.status_code == 500
+    jobs = store.list_jobs()
+    assert len(jobs) == 1
+    assert jobs[0]["status"] == "draft"
+    source = store.jobs_root / jobs[0]["job_id"] / "source" / "course.txt"
+    assert source.read_bytes() == b"course"
+
+
 @pytest.mark.parametrize("phase", ["read", "close"])
 def test_upload_cancellation_before_or_after_draft_reraises_and_leaves_no_state(
     tmp_path: Path, phase: str
@@ -324,6 +351,174 @@ def test_create_cleanup_failure_keeps_deleting_recovery_state_and_safe_error(
     assert "secret" not in str(caught.value.detail)
 
 
+@pytest.mark.parametrize(
+    "fatal",
+    [KeyboardInterrupt("stop"), SystemExit("stop"), GeneratorExit("stop")],
+)
+def test_non_exception_baseexceptions_are_rolled_back_and_reraised(
+    tmp_path: Path, fatal: BaseException
+) -> None:
+    _, store, runner = make_client(tmp_path)
+    upload = FaultyUpload(read_error=fatal)
+
+    with pytest.raises(type(fatal)):
+        invoke_direct_create(store, runner, upload)
+
+    assert upload.closed is True
+    assert store.list_jobs() == []
+    assert not store.jobs_root.exists() or list(store.jobs_root.iterdir()) == []
+
+
+def test_close_baseexception_overrides_ordinary_primary_error(tmp_path: Path) -> None:
+    class FatalClose(BaseException):
+        pass
+
+    _, store, runner = make_client(tmp_path)
+    upload = FaultyUpload(
+        read_error=OSError("read failed"),
+        close_error=FatalClose("shutdown"),
+    )
+
+    with pytest.raises(FatalClose, match="shutdown"):
+        invoke_direct_create(store, runner, upload)
+
+    assert store.list_jobs() == []
+    assert not store.jobs_root.exists() or list(store.jobs_root.iterdir()) == []
+
+
+def test_invalid_request_before_workspace_never_reserves_database_delete(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _, store, runner = make_client(tmp_path)
+    upload = FaultyUpload()
+    request = DirectRequest(store, runner, upload)
+    request._form = FormData([("target", "course")])
+    begin_calls: list[str] = []
+    monkeypatch.setattr(
+        store,
+        "begin_delete",
+        lambda job_id: begin_calls.append(job_id) or "not_found",
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(
+            ingestion_routes.create_ingestion_job(request, upload, "course")
+        )
+
+    assert caught.value.status_code == 400
+    assert begin_calls == []
+
+
+def test_asgi_reraises_custom_baseexception_after_cleanup(
+    tmp_path: Path, monkeypatch
+) -> None:
+    client, store, _ = make_client(tmp_path)
+
+    class FatalSignal(BaseException):
+        pass
+
+    async def fatal_upload(*args, **kwargs):
+        del args, kwargs
+        raise FatalSignal("fatal /private/source token=secret")
+
+    monkeypatch.setattr(ingestion_routes, "save_upload_file", fatal_upload)
+
+    with pytest.raises(FatalSignal):
+        client.post(
+            "/api/ingestion-jobs",
+            data={"target": "course"},
+            files={"file": ("course.txt", b"course", "text/plain")},
+        )
+
+    assert store.list_jobs() == []
+    assert not store.jobs_root.exists() or list(store.jobs_root.iterdir()) == []
+
+
+def test_predraft_cleanup_failure_is_recovered_on_next_startup(
+    tmp_path: Path, monkeypatch
+) -> None:
+    client, store, runner = make_client(tmp_path)
+    real_delete = ingestion_routes.delete_job_workspace
+
+    def fail_delete(_: Path) -> None:
+        raise OSError("delete /private/creating token=secret")
+
+    monkeypatch.setattr(ingestion_routes, "delete_job_workspace", fail_delete)
+    response = client.post(
+        "/api/ingestion-jobs",
+        data={"target": "course"},
+        files={"file": ("unsupported.exe", b"bad", "application/octet-stream")},
+    )
+
+    assert response.status_code == 400
+    assert store.list_jobs() == []
+    creating = list(store.jobs_root.glob(".creating-*"))
+    assert len(creating) == 1
+    assert (creating[0] / ".creating").is_file()
+
+    monkeypatch.setattr(ingestion_routes, "delete_job_workspace", real_delete)
+    app = create_app(ingestion_store=store, ingestion_runner=runner)
+    app.state.ingestion_limits = IngestionLimits()
+    with TestClient(app):
+        assert not creating[0].exists()
+        assert runner.lifecycle[:2] == ["recover", "start"]
+
+
+def test_postrename_create_failure_marker_is_recovered_on_next_startup(
+    tmp_path: Path, monkeypatch
+) -> None:
+    client, store, runner = make_client(tmp_path)
+    real_delete = ingestion_routes.delete_job_workspace
+
+    def fail_create(**kwargs):
+        raise sqlite3.OperationalError("create failed")
+
+    def fail_delete(_: Path) -> None:
+        raise OSError("delete /private/final token=secret")
+
+    monkeypatch.setattr(store, "create_draft", fail_create)
+    monkeypatch.setattr(ingestion_routes, "delete_job_workspace", fail_delete)
+    response = client.post(
+        "/api/ingestion-jobs",
+        data={"target": "course"},
+        files={"file": ("course.txt", b"course", "text/plain")},
+    )
+
+    assert response.status_code == 500
+    assert store.list_jobs() == []
+    final_dirs = [
+        path
+        for path in store.jobs_root.iterdir()
+        if len(path.name) == 32 and (path / ".creating").is_file()
+    ]
+    assert len(final_dirs) == 1
+
+    monkeypatch.setattr(store, "create_draft", IngestionStore.create_draft.__get__(store))
+    monkeypatch.setattr(ingestion_routes, "delete_job_workspace", real_delete)
+    app = create_app(ingestion_store=store, ingestion_runner=runner)
+    app.state.ingestion_limits = IngestionLimits()
+    with TestClient(app):
+        assert not final_dirs[0].exists()
+
+
+def test_startup_scanner_preserves_orphan_when_database_query_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _, store, _ = make_client(tmp_path)
+    orphan = store.jobs_root / ("e" * 32)
+    orphan.mkdir(parents=True)
+    (orphan / ".creating").write_text("creating", encoding="utf-8")
+
+    def fail_lookup(_: str):
+        raise sqlite3.OperationalError("database unavailable")
+
+    monkeypatch.setattr(store, "get_job", fail_lookup)
+
+    ingestion_routes.cleanup_abandoned_creates(store)
+
+    assert orphan.is_dir()
+
+
 def test_duplicate_file_parts_are_rejected_and_all_uploads_closed(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -351,6 +546,21 @@ def test_duplicate_file_parts_are_rejected_and_all_uploads_closed(
     assert {"first.txt", "second.txt"}.issubset(closed)
     assert store.list_jobs() == []
     assert not store.jobs_root.exists() or list(store.jobs_root.iterdir()) == []
+
+
+def test_upload_close_is_safe_when_handler_and_framework_both_close() -> None:
+    class IdempotentUpload:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    upload = IdempotentUpload()
+
+    assert asyncio.run(ingestion_routes._close_uploads([upload])) is None
+    assert asyncio.run(ingestion_routes._close_uploads([upload])) is None
+    assert upload.close_calls == 2
 
 
 def test_create_maps_only_stream_byte_overflow_to_413(tmp_path: Path) -> None:
