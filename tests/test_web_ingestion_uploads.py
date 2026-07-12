@@ -466,3 +466,35 @@ def test_delete_job_workspace_is_idempotent(tmp_path: Path) -> None:
     delete_job_workspace(job_dir)
 
     assert not job_dir.exists()
+
+
+def test_delete_job_workspace_treats_concurrent_disappearance_as_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_dir = tmp_path / "job"
+    (job_dir / "source").mkdir(parents=True)
+    real_rmtree = __import__("shutil").rmtree
+
+    def concurrent_rmtree(path: Path) -> None:
+        real_rmtree(path)
+        raise FileNotFoundError(path)
+
+    monkeypatch.setattr("xhbx_rag.web.ingestion_uploads.shutil.rmtree", concurrent_rmtree)
+
+    delete_job_workspace(job_dir)
+
+    assert not job_dir.exists()
+
+
+def test_delete_job_workspace_verifies_path_is_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_dir = tmp_path / "job"
+    (job_dir / "source").mkdir(parents=True)
+    monkeypatch.setattr(
+        "xhbx_rag.web.ingestion_uploads.shutil.rmtree",
+        lambda _: None,
+    )
+
+    with pytest.raises(OSError, match="删除后仍然存在"):
+        delete_job_workspace(job_dir)

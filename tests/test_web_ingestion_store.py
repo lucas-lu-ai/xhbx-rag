@@ -33,6 +33,34 @@ def _running_job(store: IngestionStore, tmp_path: Path) -> str:
     return job_id
 
 
+def test_store_rejects_jobs_root_symlink_before_database_write(tmp_path: Path) -> None:
+    real_root = tmp_path / "real-jobs"
+    real_root.mkdir()
+    linked_root = tmp_path / "linked-jobs"
+    linked_root.symlink_to(real_root, target_is_directory=True)
+    db_parent = tmp_path / "must-not-be-created"
+
+    with pytest.raises(ValueError, match="jobs_root.*符号链接"):
+        IngestionStore(db_parent / "ingestion.sqlite3", jobs_root=linked_root)
+
+    assert not db_parent.exists()
+
+
+def test_store_normalizes_symlinked_jobs_root_ancestor(tmp_path: Path) -> None:
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    alias_parent = tmp_path / "alias-parent"
+    alias_parent.symlink_to(real_parent, target_is_directory=True)
+
+    store = IngestionStore(
+        tmp_path / "ingestion.sqlite3",
+        jobs_root=alias_parent / "jobs",
+    )
+
+    assert store.jobs_root == real_parent / "jobs"
+    assert store.jobs_root.is_absolute()
+
+
 _SAFE_INGESTION_ERRORS = {
     "upload_invalid": "上传文件无效",
     "upload_too_large": "上传文件超过大小限制",
@@ -365,8 +393,16 @@ def test_create_draft_rejects_symlinked_strict_source_layout(
             foreign.mkdir()
             target.write_bytes(b"foreign")
             (source_dir / "cases.zip").symlink_to(target)
-    store = IngestionStore(tmp_path / "strict.sqlite3", jobs_root=jobs_root)
     source = jobs_root / job_id / "source/cases.zip"
+
+    if symlink_level == "jobs_root":
+        with pytest.raises(ValueError, match="符号链接"):
+            IngestionStore(tmp_path / "strict.sqlite3", jobs_root=jobs_root)
+        assert not (tmp_path / "strict.sqlite3").exists()
+        assert (foreign.rglob("cases.zip").__next__()).read_bytes() == b"foreign"
+        return
+
+    store = IngestionStore(tmp_path / "strict.sqlite3", jobs_root=jobs_root)
 
     with pytest.raises(ValueError, match="符号链接"):
         store.create_draft(preflight=_preflight(), source_path=source, job_id=job_id)

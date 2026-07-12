@@ -188,6 +188,27 @@ def _absolute_lexical_path(value: Path) -> str:
     return raw
 
 
+def _normalized_jobs_root(value: Path) -> Path:
+    raw = Path(value)
+    if not raw.is_absolute() or ".." in raw.parts:
+        raise ValueError("jobs_root 必须是无 dot segment 的绝对路径")
+    try:
+        metadata = raw.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValueError("jobs_root 不允许是符号链接")
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError("jobs_root 必须是目录")
+    # root 尚不存在时，resolve(strict=False) 只规范化已存在祖先的别名，
+    # 不创建目录，也不会越过上面的 root 自身 symlink 拒绝规则。
+    normalized = raw.resolve(strict=False)
+    if not normalized.is_absolute() or ".." in normalized.parts:
+        raise ValueError("jobs_root 规范化失败")
+    return normalized
+
+
 class IngestionStateError(RuntimeError):
     """入库任务或 attempt 不满足所请求的状态转换。"""
 
@@ -206,7 +227,7 @@ class IngestionStore:
         self.db_path = Path(db_path) if db_path is not None else _DEFAULT_DB_PATH
         if db_path is None:
             self.db_path = project_root_from_module() / self.db_path
-        self.jobs_root = (
+        configured_jobs_root = (
             Path(jobs_root)
             if jobs_root is not None
             else (
@@ -215,8 +236,7 @@ class IngestionStore:
                 else self.db_path.parent / "jobs"
             )
         )
-        if not self.jobs_root.is_absolute() or ".." in self.jobs_root.parts:
-            raise ValueError("jobs_root 必须是无 dot segment 的绝对路径")
+        self.jobs_root = _normalized_jobs_root(configured_jobs_root)
         self._strict_source_layout = jobs_root is not None or db_path is None
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:

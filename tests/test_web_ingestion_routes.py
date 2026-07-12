@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import stat
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from zipfile import ZipFile
 
+import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from starlette.datastructures import FormData, UploadFile as StarletteUploadFile
 
 import xhbx_rag.web.ingestion_routes as ingestion_routes
 from xhbx_rag.web.app import create_app
@@ -60,6 +65,55 @@ def create_draft(
     )
     assert response.status_code == 201, response.text
     return str(response.json()["job_id"])
+
+
+class FaultyUpload:
+    def __init__(
+        self,
+        *,
+        read_error: BaseException | None = None,
+        close_error: BaseException | None = None,
+    ) -> None:
+        self.filename = "course.txt"
+        self.read_error = read_error
+        self.close_error = close_error
+        self.read_count = 0
+        self.closed = False
+
+    async def read(self, _: int) -> bytes:
+        if self.read_error is not None:
+            raise self.read_error
+        self.read_count += 1
+        return b"course" if self.read_count == 1 else b""
+
+    async def close(self) -> None:
+        self.closed = True
+        if self.close_error is not None:
+            raise self.close_error
+
+
+class DirectRequest:
+    def __init__(self, store: IngestionStore, runner: FakeRunner, upload: FaultyUpload) -> None:
+        self.app = SimpleNamespace(
+            state=SimpleNamespace(
+                ingestion_store=store,
+                ingestion_runner=runner,
+                ingestion_limits=IngestionLimits(),
+            )
+        )
+        self._form = FormData([("file", upload), ("target", "course")])
+
+    async def form(self) -> FormData:
+        return self._form
+
+
+def invoke_direct_create(
+    store: IngestionStore, runner: FakeRunner, upload: FaultyUpload
+) -> dict[str, object]:
+    request = DirectRequest(store, runner, upload)
+    return asyncio.run(
+        ingestion_routes.create_ingestion_job(request, upload, "course")
+    )
 
 
 def fail_job(store: IngestionStore, job_id: str) -> Path:
@@ -167,6 +221,138 @@ def test_create_failure_removes_workspace_and_committed_draft(
     assert list(store.jobs_root.iterdir()) == []
 
 
+def test_upload_read_oserror_closes_and_rolls_back_all_state(tmp_path: Path) -> None:
+    _, store, runner = make_client(tmp_path)
+    upload = FaultyUpload(read_error=OSError("read /private/source token=secret"))
+
+    with pytest.raises(HTTPException) as caught:
+        invoke_direct_create(store, runner, upload)
+
+    assert caught.value.status_code == 500
+    assert caught.value.detail == "任务存储暂时不可用"
+    assert upload.closed is True
+    assert store.list_jobs() == []
+    assert list(store.jobs_root.iterdir()) == []
+
+
+def test_upload_close_error_after_draft_rolls_back_database_and_workspace(
+    tmp_path: Path,
+) -> None:
+    _, store, runner = make_client(tmp_path)
+    upload = FaultyUpload(close_error=OSError("close /private/source token=secret"))
+
+    with pytest.raises(HTTPException) as caught:
+        invoke_direct_create(store, runner, upload)
+
+    assert caught.value.status_code == 500
+    assert caught.value.detail == "任务存储暂时不可用"
+    assert store.list_jobs() == []
+    assert list(store.jobs_root.iterdir()) == []
+
+
+@pytest.mark.parametrize("phase", ["read", "close"])
+def test_upload_cancellation_before_or_after_draft_reraises_and_leaves_no_state(
+    tmp_path: Path, phase: str
+) -> None:
+    _, store, runner = make_client(tmp_path)
+    upload = FaultyUpload(
+        read_error=asyncio.CancelledError() if phase == "read" else None,
+        close_error=asyncio.CancelledError() if phase == "close" else None,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        invoke_direct_create(store, runner, upload)
+
+    assert upload.closed is True
+    assert store.list_jobs() == []
+    assert list(store.jobs_root.iterdir()) == []
+
+
+def test_outer_cancellation_waits_for_shielded_close_before_rollback(
+    tmp_path: Path,
+) -> None:
+    _, store, runner = make_client(tmp_path)
+
+    class CancellingCloseUpload(FaultyUpload):
+        def __init__(self) -> None:
+            super().__init__()
+            self.owner: asyncio.Task | None = None
+            self.close_finished = False
+
+        async def read(self, size: int) -> bytes:
+            self.owner = asyncio.current_task()
+            return await super().read(size)
+
+        async def close(self) -> None:
+            self.closed = True
+            assert self.owner is not None
+            self.owner.cancel()
+            await asyncio.sleep(0.05)
+            self.close_finished = True
+
+    upload = CancellingCloseUpload()
+
+    with pytest.raises(asyncio.CancelledError):
+        invoke_direct_create(store, runner, upload)
+
+    assert upload.close_finished is True
+    assert store.list_jobs() == []
+    assert list(store.jobs_root.iterdir()) == []
+
+
+def test_create_cleanup_failure_keeps_deleting_recovery_state_and_safe_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _, store, runner = make_client(tmp_path)
+    upload = FaultyUpload(close_error=OSError("close /private/source token=secret"))
+
+    def fail_delete(_: Path) -> None:
+        raise OSError("delete /private/job token=secret")
+
+    monkeypatch.setattr(ingestion_routes, "delete_job_workspace", fail_delete)
+
+    with pytest.raises(HTTPException) as caught:
+        invoke_direct_create(store, runner, upload)
+
+    assert caught.value.status_code == 500
+    assert caught.value.detail == "任务存储暂时不可用"
+    jobs = store.list_jobs()
+    assert len(jobs) == 1
+    assert jobs[0]["status"] == "deleting"
+    assert (store.jobs_root / jobs[0]["job_id"]).is_dir()
+    assert "private" not in str(caught.value.detail)
+    assert "secret" not in str(caught.value.detail)
+
+
+def test_duplicate_file_parts_are_rejected_and_all_uploads_closed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    client, store, _ = make_client(tmp_path)
+    closed: list[str] = []
+    original_close = StarletteUploadFile.close
+
+    async def recording_close(upload: StarletteUploadFile) -> None:
+        closed.append(str(upload.filename))
+        await original_close(upload)
+
+    monkeypatch.setattr(StarletteUploadFile, "close", recording_close)
+
+    response = client.post(
+        "/api/ingestion-jobs",
+        data={"target": "course"},
+        files=[
+            ("file", ("first.txt", b"first", "text/plain")),
+            ("file", ("second.txt", b"second", "text/plain")),
+        ],
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "上传文件无效"}
+    assert {"first.txt", "second.txt"}.issubset(closed)
+    assert store.list_jobs() == []
+    assert not store.jobs_root.exists() or list(store.jobs_root.iterdir()) == []
+
+
 def test_create_maps_only_stream_byte_overflow_to_413(tmp_path: Path) -> None:
     client, store, _ = make_client(tmp_path)
     client.app.state.ingestion_limits = IngestionLimits(max_upload_bytes=4)
@@ -237,9 +423,55 @@ def test_start_storage_failure_never_enqueues(tmp_path: Path, monkeypatch) -> No
     assert runner.enqueued == []
 
 
-def test_list_detail_and_progress_use_public_shapes(tmp_path: Path) -> None:
+def test_start_enqueue_failure_keeps_durable_queued_state(
+    tmp_path: Path, monkeypatch
+) -> None:
+    client, store, runner = make_client(tmp_path)
+    job_id = create_draft(client)
+
+    def fail_enqueue(_: str) -> None:
+        raise RuntimeError("queue unavailable /private/path token=secret")
+
+    monkeypatch.setattr(runner, "enqueue", fail_enqueue)
+
+    response = client.post(f"/api/ingestion-jobs/{job_id}/start")
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "任务存储暂时不可用"}
+    assert store.get_job(job_id)["status"] == "queued"
+
+
+def test_route_rejects_runtime_store_runner_mismatch(tmp_path: Path) -> None:
     client, _, _ = make_client(tmp_path)
     job_id = create_draft(client)
+    client.app.state.ingestion_store = IngestionStore(
+        tmp_path / "other.sqlite3", jobs_root=tmp_path / "other-jobs"
+    )
+
+    response = client.post(f"/api/ingestion-jobs/{job_id}/start")
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "任务存储暂时不可用"}
+
+
+def test_list_detail_and_progress_use_public_shapes(tmp_path: Path) -> None:
+    client, store, _ = make_client(tmp_path)
+    body_sentinel = "PRIVATE-BODY-SENTINEL-7341"
+    job_id = create_draft(client, content=body_sentinel.encode())
+    source_sentinel = str(
+        store.get_job_for_execution(job_id)["source_path"]
+    )
+    assert store.start_job(job_id) == "ok"
+    assert store.claim_job(job_id) is True
+    workspace = store.jobs_root / job_id / "attempts" / "1"
+    workspace.mkdir(parents=True)
+    store.begin_attempt(job_id, workspace)
+    digest_sentinel = "d" * 64
+    store.mark_content_identity(job_id, digest_sentinel)
+    journal = workspace / "rollback" / "journal.json"
+    journal.parent.mkdir()
+    journal.write_text("journal", encoding="utf-8")
+    store.mark_commit_state(job_id, "prepared", journal)
 
     listing = client.get("/api/ingestion-jobs")
     detail = client.get(f"/api/ingestion-jobs/{job_id}")
@@ -250,7 +482,17 @@ def test_list_detail_and_progress_use_public_shapes(tmp_path: Path) -> None:
     assert detail.json()["items"][0]["display_name"] == "course"
     assert progress.json()["job_id"] == job_id
     serialized = repr((listing.json(), detail.json(), progress.json()))
-    for forbidden in ("source_path", "workspace_path", "journal_path", "content_sha256"):
+    for forbidden in (
+        "source_path",
+        "workspace_path",
+        "journal_path",
+        "content_sha256",
+        body_sentinel,
+        source_sentinel,
+        str(workspace),
+        str(journal),
+        digest_sentinel,
+    ):
         assert forbidden not in serialized
 
 
@@ -347,6 +589,24 @@ def test_delete_removes_workspace_before_finishing_record(tmp_path: Path, monkey
     assert response.status_code == 200
     assert response.json() == {"ok": True, "job_id": job_id, "status": "deleted"}
     assert store.get_job(job_id) is None
+
+
+def test_concurrent_deletes_are_idempotent_without_500(tmp_path: Path) -> None:
+    client, store, _ = make_client(tmp_path)
+    job_id = create_draft(client)
+
+    def delete_once(_: int) -> int:
+        return TestClient(client.app).delete(
+            f"/api/ingestion-jobs/{job_id}"
+        ).status_code
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        statuses = list(executor.map(delete_once, range(8)))
+
+    assert set(statuses) <= {200, 404}
+    assert 500 not in statuses
+    assert store.get_job(job_id) is None
+    assert not (store.jobs_root / job_id).exists()
 
 
 def test_retry_and_delete_enforce_state_conflicts(tmp_path: Path) -> None:

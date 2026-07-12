@@ -38,7 +38,7 @@ from .services import (
     answer_question_stream_events,
     get_status,
 )
-from .source_paths import SourcePathError, reveal_in_finder
+from .source_paths import SourcePathError, project_root_from_module, reveal_in_finder
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +89,9 @@ _ALLOWED_BAD_CASE_PROBLEM_TAGS = {
 }
 _ALLOWED_EVIDENCE_FEEDBACK_JUDGEMENTS = {"should_use", "should_not_use", "ranking_low"}
 _COLLECTION_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_INGESTION_JOBS_ROOT = (
+    project_root_from_module() / ".local" / "web_ingestion" / "jobs"
+).resolve(strict=False)
 
 
 class AnswerRequest(BaseModel):
@@ -243,6 +246,16 @@ def create_app(
     ingestion_store: Any | None = None,
     ingestion_runner: Any | None = None,
 ) -> FastAPI:
+    if ingestion_runner is not None:
+        runner_has_store = hasattr(ingestion_runner, "store")
+        runner_store = getattr(ingestion_runner, "store", None)
+        if ingestion_store is None:
+            if not runner_has_store or runner_store is None:
+                raise ValueError("仅注入 ingestion_runner 时必须提供 ingestion_runner.store")
+            ingestion_store = runner_store
+        elif runner_has_store and runner_store is not ingestion_store:
+            raise ValueError("ingestion_store 与 ingestion_runner.store 必须是同一个对象")
+
     @asynccontextmanager
     async def lifespan(app_instance: FastAPI) -> AsyncIterator[None]:
         active_batch_runner = None
@@ -277,7 +290,9 @@ def create_app(
                 app_instance.state, "ingestion_store", None
             )
             if ingestion_runtime_store is None:
-                ingestion_runtime_store = IngestionStore()
+                ingestion_runtime_store = IngestionStore(
+                    jobs_root=_INGESTION_JOBS_ROOT
+                )
                 app_instance.state.ingestion_store = ingestion_runtime_store
             ingestion_runtime = getattr(app_instance.state, "ingestion_runner", None)
             if ingestion_runtime is None:
@@ -286,6 +301,11 @@ def create_app(
                     limits,
                 )
                 app_instance.state.ingestion_runner = ingestion_runtime
+            runner_store = getattr(
+                ingestion_runtime, "store", ingestion_runtime_store
+            )
+            if runner_store is not ingestion_runtime_store:
+                raise ValueError("ingestion Store/Runner 运行时绑定不一致")
             # 恢复项先进入优先队列，再启动 worker，避免新任务抢在恢复前执行。
             ingestion_runtime.recover_after_restart()
             ingestion_runtime.start()

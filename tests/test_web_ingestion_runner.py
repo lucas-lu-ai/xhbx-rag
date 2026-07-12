@@ -677,16 +677,25 @@ def test_execute_recovery_corruption_keeps_workspace_until_stop(tmp_path: Path) 
     assert any((job_dir / "attempts").iterdir())
 
 
-def test_recover_after_restart_immediately_fails_uncommitted_interruption(
+def test_recover_after_restart_worker_fails_uncommitted_interruption(
     tmp_path: Path,
 ) -> None:
     store, job_id, job_dir = queued_store(tmp_path)
     assert store.claim_job(job_id)
+    runner = _runner(store, FakePipeline(), FakeAtomicIndexer())
 
-    _runner(store, FakePipeline(), FakeAtomicIndexer()).recover_after_restart()
+    runner.recover_after_restart()
 
     job = store.get_job(job_id)
     assert job is not None
+    assert job["status"] == "running"
+    assert [item.kind for item in runner._queue.queue] == ["interrupt"]
+    runner.start()
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and store.get_job(job_id)["status"] != "failed":
+        time.sleep(0.01)
+    runner.stop()
+    job = store.get_job(job_id)
     assert job["status"] == "failed"
     assert job["error_code"] == "service_restarted"
     assert (job_dir / "source" / "courses.zip").is_file()
@@ -706,6 +715,14 @@ def test_restart_treats_empty_workspace_before_begin_as_precommit_interruption(
 
     job = store.get_job(job_id)
     assert job is not None
+    assert job["status"] == "running"
+    assert [item.kind for item in runner._queue.queue] == ["interrupt"]
+    runner.start()
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and store.get_job(job_id)["status"] != "failed":
+        time.sleep(0.01)
+    runner.stop()
+    job = store.get_job(job_id)
     assert job["status"] == "failed"
     assert job["error_code"] == "service_restarted"
     assert list((job_dir / "attempts").iterdir()) == []
@@ -733,13 +750,62 @@ def test_restart_discovers_durable_journal_when_sqlite_is_still_not_started(
 
     job = store.get_job(job_id)
     assert job is not None
-    assert job["status"] == "rolling_back"
-    assert job["attempt"]["commit_state"] == "rolling_back"
+    assert job["status"] == "running"
+    assert [item.kind for item in runner._queue.queue] == ["interrupt"]
     assert journal.is_file()
     assert (journal.parent / "snapshot.jsonl").is_file()
 
-    runner.execute_recovery(job_id)
+    runner.start()
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and store.get_job(job_id)["status"] != "failed":
+        time.sleep(0.01)
+    runner.stop()
     assert store.get_job(job_id)["status"] == "failed"
+
+
+def test_recover_after_restart_only_enqueues_durable_interrupt_without_factory(
+    tmp_path: Path,
+) -> None:
+    store, job_id, job_dir = queued_store(tmp_path)
+    assert store.claim_job(job_id)
+    workspace = job_dir / "attempts" / "1"
+    workspace.mkdir(parents=True)
+    store.begin_attempt(job_id, workspace)
+    journal = (workspace / "rollback" / "journal.json").resolve()
+    journal.parent.mkdir(parents=True)
+    journal.write_text("fake", encoding="utf-8")
+    (journal.parent / "snapshot.jsonl").write_text("fake", encoding="utf-8")
+    store.mark_content_identity(job_id, "0" * 64)
+    indexer = FakeAtomicIndexer()
+    indexer.states[journal] = "rolling_back"
+    factory_calls: list[str] = []
+
+    def factory(target: str) -> FakeAtomicIndexer:
+        factory_calls.append(target)
+        return indexer
+
+    runner = IngestionRunner(
+        store=store,
+        pipeline=FakePipeline(),
+        indexer_factory=factory,
+    )
+    started = time.monotonic()
+
+    runner.recover_after_restart()
+
+    assert time.monotonic() - started < 0.2
+    assert factory_calls == []
+    queued = list(runner._queue.queue)
+    assert [(item.kind, item.priority, item.job_id) for item in queued] == [
+        ("interrupt", 0, job_id)
+    ]
+    runner.start()
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and not factory_calls:
+        time.sleep(0.01)
+    runner.stop()
+    assert factory_calls
+    assert set(factory_calls) == {"course"}
 
 
 def test_recovery_items_run_before_queued_jobs(tmp_path: Path) -> None:
@@ -809,7 +875,7 @@ def test_restart_actions_are_isolated_and_interrupted_store_failure_retries(
     runner.stop()
 
     assert interrupted_fail_calls == 2
-    assert sleeps == [2.0]
+    assert sleeps == [2.0, 4.0]
     assert store.get_job(interrupted_id)["error_code"] == "service_restarted"
     assert store.get_job(recovery_id)["status"] == "failed"
     assert store.get_job(queued_id)["status"] == "succeeded"
@@ -926,6 +992,13 @@ def test_rolled_back_cleanup_failure_restarts_as_index_failure(
 
     job = store.get_job(job_id)
     assert job is not None
+    assert job["status"] == "rolling_back"
+    runner.start()
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and store.get_job(job_id)["status"] != "failed":
+        time.sleep(0.01)
+    runner.stop()
+    job = store.get_job(job_id)
     assert job["status"] == "failed"
     assert job["error_code"] == "index_failed"
 

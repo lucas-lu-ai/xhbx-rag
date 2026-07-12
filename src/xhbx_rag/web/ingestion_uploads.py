@@ -534,7 +534,21 @@ def _verify_destination(
 
 
 def _remove_path(path: Path) -> None:
-    if path.is_symlink() or path.is_file():
-        path.unlink(missing_ok=True)
-    elif path.exists():
-        shutil.rmtree(path)
+    for _ in range(8):
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            return
+        try:
+            if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+        except FileNotFoundError:
+            # 另一请求可能已删除根目录或 rmtree 正在遍历的子项。
+            continue
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return
+    raise OSError(f"路径删除后仍然存在: {path.name}")

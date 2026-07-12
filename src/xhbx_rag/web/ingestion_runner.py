@@ -263,20 +263,12 @@ class IngestionRunner:
     def execute_interrupt(self, job_id: str) -> None:
         delay = 2.0
         while not self._stop_event.is_set():
-            job = self.store.get_job_for_execution(job_id)
-            if job is None or job["status"] != "running":
-                return
             try:
-                journal = self._journal_for_job(job)
-                if journal is not None:
+                disposition = self._fail_interrupted(
+                    RecoveryAction(job_id=job_id, action="fail_interrupted")
+                )
+                if disposition == "recovery":
                     self.execute_recovery(job_id)
-                    return
-                if not self._cleanup_attempts(job):
-                    raise RuntimeError("interrupted cleanup pending")
-                code, detail = safe_ingestion_error("service_restarted")
-                self.store.fail_job(job_id, code=code, detail=detail)
-                return
-            except _UntrustedRecoveryMaterial:
                 return
             except Exception:
                 if not self._sleep(delay):
@@ -285,42 +277,18 @@ class IngestionRunner:
 
     def recover_after_restart(self) -> None:
         actions = self.store.recovery_actions()
-        discovered_recovery: list[str] = []
-        interrupted_retry: list[str] = []
-        for action in actions:
-            if action.action == "fail_interrupted":
-                try:
-                    disposition = self._fail_interrupted(action)
-                    if disposition == "recovery":
-                        discovered_recovery.append(action.job_id)
-                    elif disposition == "done":
-                        current = self.store.get_job_for_execution(action.job_id)
-                        if current is not None and current["status"] == "running":
-                            interrupted_retry.append(action.job_id)
-                except Exception:
-                    interrupted_retry.append(action.job_id)
-
-        queued_recovery: set[str] = set()
         for action in actions:
             try:
                 if action.action in {"rollback", "finish_committed"}:
                     self._put("recovery", action.job_id, priority=0)
-                    queued_recovery.add(action.job_id)
+                elif action.action == "fail_interrupted":
+                    self._put("interrupt", action.job_id, priority=0)
                 elif action.action == "delete":
                     self._put("delete", action.job_id, priority=0)
+                elif action.action == "enqueue":
+                    self._put("job", action.job_id, priority=10)
             except Exception:
                 continue
-        for job_id in discovered_recovery:
-            if job_id not in queued_recovery:
-                self._put("recovery", job_id, priority=0)
-        for job_id in interrupted_retry:
-            self._put("interrupt", job_id, priority=0)
-        for action in actions:
-            if action.action == "enqueue":
-                try:
-                    self._put("job", action.job_id, priority=10)
-                except Exception:
-                    continue
 
     def _handle_commit_exception(
         self,

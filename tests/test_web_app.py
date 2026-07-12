@@ -943,3 +943,108 @@ def test_production_ingestion_factory_is_lazy_and_selects_target_collection(
         "case_collection",
         "course_collection",
     ]
+
+
+def test_create_app_runner_only_derives_its_store() -> None:
+    events: list[str] = []
+    store = object()
+    runner = _LifecycleRunner(events, "ingestion")
+    runner.store = store
+
+    app = web_app.create_app(ingestion_runner=runner)
+
+    assert app.state.ingestion_store is store
+    assert app.state.ingestion_runner is runner
+
+
+def test_create_app_runner_only_requires_store_attribute() -> None:
+    runner = _LifecycleRunner([], "ingestion")
+
+    with pytest.raises(ValueError, match="ingestion_runner.store"):
+        web_app.create_app(ingestion_runner=runner)
+
+
+def test_create_app_rejects_runner_with_none_store() -> None:
+    runner = _LifecycleRunner([], "ingestion")
+    runner.store = None
+
+    with pytest.raises(ValueError, match="ingestion_runner.store"):
+        web_app.create_app(ingestion_runner=runner)
+
+    with pytest.raises(ValueError, match="同一个对象"):
+        web_app.create_app(
+            ingestion_store=object(),
+            ingestion_runner=runner,
+        )
+
+
+def test_create_app_rejects_mismatched_ingestion_store_and_runner() -> None:
+    runner = _LifecycleRunner([], "ingestion")
+    runner.store = object()
+
+    with pytest.raises(ValueError, match="同一个对象"):
+        web_app.create_app(
+            ingestion_store=object(),
+            ingestion_runner=runner,
+        )
+
+
+def test_create_app_store_only_builds_runner_bound_to_same_store(monkeypatch) -> None:
+    events: list[str] = []
+    store = object()
+    built_with: list[object] = []
+
+    def fake_build(selected_store, limits):
+        del limits
+        built_with.append(selected_store)
+        runner = _LifecycleRunner(events, "ingestion")
+        runner.store = selected_store
+        return runner
+
+    monkeypatch.setattr(web_app, "_build_ingestion_runner", fake_build)
+    app = web_app.create_app(
+        batch_store=_LifecycleStore(events, "batch"),
+        batch_runner=_LifecycleRunner(events, "batch"),
+        ingestion_store=store,
+    )
+
+    with TestClient(app):
+        assert app.state.ingestion_store is store
+        assert app.state.ingestion_runner.store is store
+
+    assert built_with == [store]
+
+
+def test_production_app_passes_explicit_canonical_ingestion_jobs_root(
+    monkeypatch,
+) -> None:
+    events: list[str] = []
+    captured: list[dict[str, object]] = []
+
+    class FakeStore:
+        def __init__(self, *args, **kwargs) -> None:
+            captured.append({"args": args, **kwargs})
+
+    def fake_build(store, limits):
+        del limits
+        runner = _LifecycleRunner(events, "ingestion")
+        runner.store = store
+        return runner
+
+    monkeypatch.setattr(web_app, "IngestionStore", FakeStore)
+    monkeypatch.setattr(web_app, "_build_ingestion_runner", fake_build)
+    app = web_app.create_app(
+        batch_store=_LifecycleStore(events, "batch"),
+        batch_runner=_LifecycleRunner(events, "batch"),
+    )
+
+    with TestClient(app):
+        pass
+
+    expected = (
+        Path(web_app.__file__).resolve().parents[3]
+        / ".local"
+        / "web_ingestion"
+        / "jobs"
+    ).resolve(strict=False)
+    assert captured == [{"args": (), "jobs_root": expected}]

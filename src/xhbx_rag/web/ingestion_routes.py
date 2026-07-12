@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
-import sqlite3
 import unicodedata
 import uuid
 from pathlib import Path
@@ -33,9 +33,22 @@ _UPLOAD_TOO_LARGE_DETAIL = "上传文件超过大小限制"
 _STORAGE_UNAVAILABLE_DETAIL = "任务存储暂时不可用"
 
 
+class _ActualUploadTooLarge(UploadValidationError):
+    pass
+
+
+def _exception_info(exc: BaseException) -> tuple[type[BaseException], BaseException, object]:
+    return type(exc), exc, exc.__traceback__
+
+
 def _store(request: Request) -> IngestionStore:
     store = getattr(request.app.state, "ingestion_store", None)
     if store is None:
+        raise HTTPException(status_code=500, detail=_STORAGE_UNAVAILABLE_DETAIL)
+    runner = getattr(request.app.state, "ingestion_runner", None)
+    runner_store = getattr(runner, "store", store)
+    if runner_store is not store:
+        logger.error("ingestion Store/Runner 注入不一致")
         raise HTTPException(status_code=500, detail=_STORAGE_UNAVAILABLE_DETAIL)
     return store
 
@@ -99,20 +112,37 @@ def _create_source_layout(store: IngestionStore, job_id: str) -> tuple[Path, Pat
     return job_dir, source_dir
 
 
-def _discard_failed_draft(store: IngestionStore, job_id: str) -> None:
-    try:
-        if store.get_job(job_id) is not None:
-            result = store.begin_delete(job_id)
-            if result == "ok":
-                store.finish_delete(job_id)
-    except Exception:
-        logger.exception("清理失败 draft 数据库记录失败 job_id=%s", job_id)
-
-
-def _cleanup_create_failure(
+def _rollback_failed_create(
     store: IngestionStore, job_id: str, job_dir: Path, *, owns_job_dir: bool
 ) -> None:
-    _discard_failed_draft(store, job_id)
+    try:
+        existing = store.get_job(job_id)
+    except Exception:
+        logger.exception("检查失败 draft 数据库记录失败 job_id=%s", job_id)
+        existing = None
+
+    if existing is not None:
+        try:
+            result = store.begin_delete(job_id)
+        except Exception:
+            logger.exception("预留失败 draft 删除状态失败 job_id=%s", job_id)
+            return
+        if result != "ok":
+            logger.error("失败 draft 无法进入 deleting job_id=%s result=%s", job_id, result)
+            return
+        try:
+            delete_job_workspace(job_dir)
+            if store.jobs_root.is_dir():
+                _fsync_directory(store.jobs_root)
+        except Exception:
+            logger.exception("清理失败上传目录失败 job_id=%s", job_id)
+            return
+        try:
+            store.finish_delete(job_id)
+        except Exception:
+            logger.exception("完成失败 draft 删除失败 job_id=%s", job_id)
+        return
+
     if owns_job_dir:
         try:
             delete_job_workspace(job_dir)
@@ -120,6 +150,49 @@ def _cleanup_create_failure(
                 _fsync_directory(store.jobs_root)
         except Exception:
             logger.exception("清理失败上传目录失败 job_id=%s", job_id)
+
+
+async def _close_uploads(uploads: list[object]) -> BaseException | None:
+    first_error: BaseException | None = None
+    seen: set[int] = set()
+
+    def remember(exc: BaseException) -> None:
+        nonlocal first_error
+        if first_error is None or (
+            isinstance(exc, asyncio.CancelledError)
+            and not isinstance(first_error, asyncio.CancelledError)
+        ):
+            first_error = exc
+        else:
+            logger.error("关闭附加上传文件失败", exc_info=_exception_info(exc))
+
+    for upload in uploads:
+        if id(upload) in seen:
+            continue
+        seen.add(id(upload))
+        close = getattr(upload, "close", None)
+        if not callable(close):
+            continue
+        try:
+            close_task = asyncio.ensure_future(close())
+        except BaseException as exc:
+            remember(exc)
+            continue
+        while True:
+            try:
+                await asyncio.shield(close_task)
+                break
+            except asyncio.CancelledError as exc:
+                remember(exc)
+                if close_task.done():
+                    break
+                # 外层取消不得遗留仍在运行的 UploadFile.close；推迟重抛，
+                # 继续 shield 到 close 真正完成，再做同步数据库/目录回滚。
+                continue
+            except BaseException as exc:
+                remember(exc)
+                break
+    return first_error
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -130,13 +203,25 @@ async def create_ingestion_job(
 ) -> dict[str, Any]:
     store = _store(request)
     limits = _limits(request)
+    job_id = ""
+    uploads: list[object] = [file]
+    result: dict[str, Any] | None = None
+    primary_error: BaseException | None = None
     job_id = uuid.uuid4().hex
-    if not _JOB_ID_RE.fullmatch(job_id):
-        logger.error("uuid4 生成了无效 ingestion job_id")
-        raise HTTPException(status_code=500, detail=_STORAGE_UNAVAILABLE_DETAIL)
     job_dir = store.jobs_root / job_id
     owns_job_dir = False
     try:
+        form = await request.form()
+        file_parts = list(form.getlist("file"))
+        uploads = list(file_parts)
+        if all(candidate is not file for candidate in uploads):
+            uploads.append(file)
+        if not uploads:
+            uploads = [file]
+        if len(file_parts) != 1 or not callable(getattr(file_parts[0], "close", None)):
+            raise UploadValidationError("file 字段必须且只能出现一次")
+        if not _JOB_ID_RE.fullmatch(job_id):
+            raise ValueError("uuid4 生成了无效 ingestion job_id")
         job_dir, source_dir = _create_source_layout(store, job_id)
         owns_job_dir = True
         source_path = source_dir / _safe_original_name(file.filename)
@@ -147,37 +232,57 @@ async def create_ingestion_job(
                 max_bytes=limits.max_upload_bytes,
             )
         except UploadValidationError as exc:
-            _cleanup_create_failure(
-                store, job_id, job_dir, owns_job_dir=owns_job_dir
-            )
             if str(exc) == _UPLOAD_TOO_LARGE_DETAIL:
-                raise HTTPException(status_code=413, detail=_UPLOAD_TOO_LARGE_DETAIL) from exc
-            raise HTTPException(status_code=400, detail=_UPLOAD_INVALID_DETAIL) from exc
+                raise _ActualUploadTooLarge(str(exc)) from exc
+            raise
         _fsync_directory(source_dir)
-        try:
-            preflight = preflight_upload(source_path, target=target, limits=limits)
-        except UploadValidationError as exc:
-            _cleanup_create_failure(
-                store, job_id, job_dir, owns_job_dir=owns_job_dir
-            )
-            raise HTTPException(status_code=400, detail=_UPLOAD_INVALID_DETAIL) from exc
-        return store.create_draft(
+        preflight = preflight_upload(source_path, target=target, limits=limits)
+        result = store.create_draft(
             preflight=preflight,
             source_path=source_path,
             job_id=job_id,
         )
-    except HTTPException:
-        raise
-    except (sqlite3.Error, OSError, ValueError) as exc:
-        _cleanup_create_failure(store, job_id, job_dir, owns_job_dir=owns_job_dir)
-        logger.exception("创建入库任务失败 job_id=%s", job_id)
-        raise HTTPException(status_code=500, detail=_STORAGE_UNAVAILABLE_DETAIL) from exc
-    except Exception as exc:
-        _cleanup_create_failure(store, job_id, job_dir, owns_job_dir=owns_job_dir)
-        logger.exception("创建入库任务失败 job_id=%s", job_id)
-        raise HTTPException(status_code=500, detail=_STORAGE_UNAVAILABLE_DETAIL) from exc
-    finally:
-        await file.close()
+    except BaseException as exc:
+        primary_error = exc
+
+    close_error = await _close_uploads(uploads)
+    if close_error is not None and (
+        primary_error is None
+        or (
+            isinstance(close_error, asyncio.CancelledError)
+            and not isinstance(primary_error, asyncio.CancelledError)
+        )
+    ):
+        primary_error = close_error
+    elif close_error is not None:
+        logger.error(
+            "关闭上传文件失败 job_id=%s",
+            job_id,
+            exc_info=_exception_info(close_error),
+        )
+
+    if primary_error is not None:
+        _rollback_failed_create(
+            store,
+            job_id,
+            job_dir,
+            owns_job_dir=owns_job_dir,
+        )
+        if isinstance(primary_error, asyncio.CancelledError):
+            raise primary_error
+        if isinstance(primary_error, _ActualUploadTooLarge):
+            raise HTTPException(status_code=413, detail=_UPLOAD_TOO_LARGE_DETAIL) from primary_error
+        if isinstance(primary_error, UploadValidationError):
+            raise HTTPException(status_code=400, detail=_UPLOAD_INVALID_DETAIL) from primary_error
+        logger.error(
+            "创建入库任务失败 job_id=%s",
+            job_id,
+            exc_info=_exception_info(primary_error),
+        )
+        raise HTTPException(status_code=500, detail=_STORAGE_UNAVAILABLE_DETAIL) from primary_error
+
+    assert result is not None
+    return result
 
 
 @router.post("/{job_id}/start")
