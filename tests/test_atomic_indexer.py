@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import errno
 import hashlib
 import json
 import os
@@ -1089,6 +1090,28 @@ def test_snapshot_local_type_failures_are_untrusted(
 
     assert store.delete_calls == []
     assert store.upsert_calls == 0
+
+
+def test_snapshot_lstat_eio_remains_transient_atomic_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = FakeTransactionalStore(existing={})
+    journal = write_prepared_journal(
+        tmp_path / "rollback", store=store, chunk_ids=["new"], old_rows=[],
+        collection_existed=True,
+    )
+    snapshot = journal.parent / "snapshot.jsonl"
+    real_lstat = Path.lstat
+
+    def fail_lstat(path: Path):
+        if path == snapshot:
+            raise OSError(errno.EIO, "temporary storage error")
+        return real_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", fail_lstat)
+    with pytest.raises(AtomicIndexError) as caught:
+        AtomicIndexer(embedding_client=FakeEmbedding([]), store=store).inspect_journal_state(journal)
+    assert not isinstance(caught.value, UntrustedJournalError)
 
 
 @pytest.mark.parametrize("separator", ["\u2028", "\u2029"])

@@ -195,11 +195,8 @@ class AtomicIndexer:
         try:
             with _collection_write_context(self.store):
                 journal = _read_journal(journal_path)
-                try:
-                    _validate_journal(journal, self.store)
-                    _validate_expected_identity(journal, expected_identity)
-                except AtomicIndexError as exc:
-                    raise UntrustedJournalError(str(exc)) from exc
+                _validate_journal(journal, self.store)
+                _validate_expected_identity(journal, expected_identity)
                 state = str(journal["state"])
                 if state == "rolled_back":
                     return
@@ -211,14 +208,9 @@ class AtomicIndexer:
                         raise AtomicIndexError("committed journal 的 ID 集合校验失败")
                     return
 
-                try:
-                    snapshot_path = _resolve_snapshot_path(journal_path, journal)
-                    old_rows = _read_snapshot(snapshot_path, journal)
-                    _validate_snapshot(old_rows, journal)
-                except AtomicIndexError as exc:
-                    if str(exc) == "rollback snapshot 无法读取":
-                        raise
-                    raise UntrustedJournalError(str(exc)) from exc
+                snapshot_path = _resolve_snapshot_path(journal_path, journal)
+                old_rows = _read_snapshot(snapshot_path, journal)
+                _validate_snapshot(old_rows, journal)
                 self._rollback(journal_path, journal, old_rows)
         except AtomicIndexError:
             raise
@@ -236,11 +228,8 @@ class AtomicIndexer:
         try:
             with _collection_write_context(self.store):
                 journal = _read_journal(journal_path)
-                try:
-                    _validate_journal(journal, self.store)
-                    _validate_expected_identity(journal, expected_identity)
-                except AtomicIndexError as exc:
-                    raise UntrustedJournalError(str(exc)) from exc
+                _validate_journal(journal, self.store)
+                _validate_expected_identity(journal, expected_identity)
                 state = str(journal["state"])
                 if state == "committed":
                     chunk_ids = list(journal["chunk_ids"])
@@ -248,14 +237,9 @@ class AtomicIndexer:
                     if actual_ids != set(chunk_ids):
                         raise AtomicIndexError("committed journal 的 ID 集合校验失败")
                 elif state in {"prepared", "rolling_back"}:
-                    try:
-                        snapshot_path = _resolve_snapshot_path(journal_path, journal)
-                        old_rows = _read_snapshot(snapshot_path, journal)
-                        _validate_snapshot(old_rows, journal)
-                    except AtomicIndexError as exc:
-                        if str(exc) == "rollback snapshot 无法读取":
-                            raise
-                        raise UntrustedJournalError(str(exc)) from exc
+                    snapshot_path = _resolve_snapshot_path(journal_path, journal)
+                    old_rows = _read_snapshot(snapshot_path, journal)
+                    _validate_snapshot(old_rows, journal)
                 return cast(
                     Literal["prepared", "committed", "rolling_back", "rolled_back"],
                     state,
@@ -417,7 +401,7 @@ def _read_journal(path: Path) -> dict[str, Any]:
     return value
 
 
-def _validate_journal(journal: dict[str, Any], store: object) -> None:
+def _validate_journal_core(journal: dict[str, Any], store: object) -> None:
     if set(journal) != _JOURNAL_FIELDS:
         raise AtomicIndexError("commit journal 核心字段无效")
     expected_checksum = _journal_with_checksum(journal)["journal_sha256"]
@@ -497,6 +481,17 @@ def _validate_journal(journal: dict[str, Any], store: object) -> None:
         raise AtomicIndexError("commit journal raw schema 无效")
 
 
+def _validate_journal(journal: dict[str, Any], store: object) -> None:
+    try:
+        _validate_journal_core(journal, store)
+    except UntrustedJournalError:
+        raise
+    except UntrustedJournalError:
+        raise
+    except AtomicIndexError as exc:
+        raise UntrustedJournalError(str(exc)) from exc
+
+
 def _is_sha256(value: object) -> bool:
     if not isinstance(value, str) or len(value) != 64:
         return False
@@ -524,14 +519,17 @@ def _validate_expected_identity(
 ) -> None:
     if expected is None:
         return
-    _validate_identity(expected)
-    owner = journal["owner"]
-    if owner != {
-        "job_id": expected.job_id,
-        "attempt_no": expected.attempt_no,
-        "chunks_sha256": expected.chunks_sha256,
-    }:
-        raise AtomicIndexError("commit journal owner identity 不匹配")
+    try:
+        _validate_identity(expected)
+        owner = journal["owner"]
+        if owner != {
+            "job_id": expected.job_id,
+            "attempt_no": expected.attempt_no,
+            "chunks_sha256": expected.chunks_sha256,
+        }:
+            raise UntrustedJournalError("commit journal owner identity 不匹配")
+    except AtomicIndexError as exc:
+        raise UntrustedJournalError(str(exc)) from exc
 
 
 def _resolve_snapshot_path(
@@ -563,30 +561,30 @@ def _read_snapshot(path: Path, journal: dict[str, Any]) -> list[dict[str, Any]]:
     if len(payload) != journal["snapshot_size"] or not secrets.compare_digest(
         hashlib.sha256(payload).hexdigest(), journal["snapshot_sha256"]
     ):
-        raise AtomicIndexError("rollback snapshot 完整性校验失败")
+        raise UntrustedJournalError("rollback snapshot 完整性校验失败")
     if payload and not payload.endswith(b"\n"):
-        raise AtomicIndexError("rollback snapshot JSONL 结尾无效")
+        raise UntrustedJournalError("rollback snapshot JSONL 结尾无效")
     lines = [] if not payload else payload[:-1].split(b"\n")
 
     rows: list[dict[str, Any]] = []
     for raw_line in lines:
         if not raw_line.strip():
-            raise AtomicIndexError("rollback snapshot 不允许空行")
+            raise UntrustedJournalError("rollback snapshot 不允许空行")
         try:
             line = raw_line.decode("utf-8")
         except UnicodeError as exc:
-            raise AtomicIndexError("rollback snapshot 编码无效") from exc
+            raise UntrustedJournalError("rollback snapshot 编码无效") from exc
         try:
             value = json.loads(line)
         except json.JSONDecodeError as exc:
-            raise AtomicIndexError("rollback snapshot JSONL 格式无效") from exc
+            raise UntrustedJournalError("rollback snapshot JSONL 格式无效") from exc
         if not isinstance(value, dict):
-            raise AtomicIndexError("rollback snapshot 行必须是 JSON object")
+            raise UntrustedJournalError("rollback snapshot 行必须是 JSON object")
         rows.append(value)
     return rows
 
 
-def _validate_snapshot(
+def _validate_snapshot_core(
     rows: list[dict[str, Any]], journal: dict[str, Any]
 ) -> None:
     chunk_ids = set(journal["chunk_ids"])
@@ -624,6 +622,15 @@ def _validate_snapshot(
         raise AtomicIndexError("rollback snapshot chunk_id 重复")
     if not journal["collection_existed"] and rows:
         raise AtomicIndexError("原 collection 不存在时 snapshot 必须为空")
+
+
+def _validate_snapshot(rows: list[dict[str, Any]], journal: dict[str, Any]) -> None:
+    try:
+        _validate_snapshot_core(rows, journal)
+    except UntrustedJournalError:
+        raise
+    except AtomicIndexError as exc:
+        raise UntrustedJournalError(str(exc)) from exc
 
 
 def _atomic_write_bytes(path: Path, payload: bytes, *, replace: bool = True) -> None:
