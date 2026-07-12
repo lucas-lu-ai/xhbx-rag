@@ -199,7 +199,41 @@ def test_create_rejects_preexisting_job_symlink_without_writing_through_it(
     assert store.list_jobs() == []
 
 
-def test_create_failure_removes_workspace_and_committed_draft(
+def test_uuid_collision_preserves_existing_draft_and_source(
+    tmp_path: Path, monkeypatch
+) -> None:
+    client, store, _ = make_client(tmp_path)
+    fixed_job_id = "b" * 32
+    monkeypatch.setattr(
+        ingestion_routes.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex=fixed_job_id),
+    )
+    first = client.post(
+        "/api/ingestion-jobs",
+        data={"target": "course"},
+        files={"file": ("original.txt", b"original-body", "text/plain")},
+    )
+    assert first.status_code == 201
+    original_job = store.get_job(fixed_job_id)
+    original_source = store.jobs_root / fixed_job_id / "source" / "original.txt"
+    assert original_source.read_bytes() == b"original-body"
+
+    second = client.post(
+        "/api/ingestion-jobs",
+        data={"target": "course"},
+        files={"file": ("replacement.txt", b"replacement-body", "text/plain")},
+    )
+
+    assert second.status_code == 500
+    assert second.json() == {"detail": "任务存储暂时不可用"}
+    assert store.get_job(fixed_job_id) == original_job
+    assert original_source.read_bytes() == b"original-body"
+    assert not (store.jobs_root / fixed_job_id / "source" / "replacement.txt").exists()
+    assert not (store.jobs_root / f".creating-{fixed_job_id}").exists()
+
+
+def test_create_result_uncertain_preserves_database_owner_and_final_marker(
     tmp_path: Path, monkeypatch
 ) -> None:
     client, store, _ = make_client(tmp_path)
@@ -219,8 +253,18 @@ def test_create_failure_removes_workspace_and_committed_draft(
 
     assert response.status_code == 500
     assert response.json() == {"detail": "任务存储暂时不可用"}
-    assert store.list_jobs() == []
-    assert list(store.jobs_root.iterdir()) == []
+    jobs = store.list_jobs()
+    assert len(jobs) == 1
+    job_id = jobs[0]["job_id"]
+    job_dir = store.jobs_root / job_id
+    assert jobs[0]["status"] == "draft"
+    assert (job_dir / "source" / "course.txt").read_bytes() == b"course"
+    assert (job_dir / ".creating").read_text(encoding="ascii") == job_id
+
+    ingestion_routes.cleanup_abandoned_creates(store)
+
+    assert store.get_job(job_id) is not None
+    assert job_dir.is_dir()
 
 
 def test_upload_read_oserror_closes_and_rolls_back_all_state(tmp_path: Path) -> None:
@@ -517,6 +561,88 @@ def test_startup_scanner_preserves_orphan_when_database_query_fails(
     ingestion_routes.cleanup_abandoned_creates(store)
 
     assert orphan.is_dir()
+
+
+def test_startup_scanner_preserves_nonempty_temp_without_marker(tmp_path: Path) -> None:
+    _, store, _ = make_client(tmp_path)
+    job_id = "1" * 32
+    orphan = store.jobs_root / f".creating-{job_id}"
+    orphan.mkdir(parents=True)
+    valuable = orphan / ".valuable-hidden"
+    valuable.write_text("keep", encoding="utf-8")
+
+    ingestion_routes.cleanup_abandoned_creates(store)
+
+    assert valuable.read_text(encoding="utf-8") == "keep"
+
+
+def test_startup_scanner_preserves_temp_with_symlink_marker(tmp_path: Path) -> None:
+    _, store, _ = make_client(tmp_path)
+    job_id = "2" * 32
+    orphan = store.jobs_root / f".creating-{job_id}"
+    orphan.mkdir(parents=True)
+    external = tmp_path / "external-marker"
+    external.write_text(job_id, encoding="ascii")
+    (orphan / ".creating").symlink_to(external)
+
+    ingestion_routes.cleanup_abandoned_creates(store)
+
+    assert orphan.is_dir()
+    assert (orphan / ".creating").is_symlink()
+    assert external.read_text(encoding="ascii") == job_id
+
+
+def test_startup_scanner_cleans_valid_unowned_marker(tmp_path: Path) -> None:
+    _, store, _ = make_client(tmp_path)
+    job_id = "3" * 32
+    orphan = store.jobs_root / f".creating-{job_id}"
+    orphan.mkdir(parents=True)
+    (orphan / ".creating").write_text(job_id, encoding="ascii")
+
+    ingestion_routes.cleanup_abandoned_creates(store)
+
+    assert not orphan.exists()
+
+
+def test_startup_scanner_preserves_valid_marker_with_database_owner(
+    tmp_path: Path,
+) -> None:
+    client, store, _ = make_client(tmp_path)
+    job_id = create_draft(client)
+    job_dir = store.jobs_root / job_id
+    marker = job_dir / ".creating"
+    marker.write_text(job_id, encoding="ascii")
+
+    ingestion_routes.cleanup_abandoned_creates(store)
+
+    assert store.get_job(job_id) is not None
+    assert marker.read_text(encoding="ascii") == job_id
+    assert (job_dir / "source" / "course.txt").is_file()
+
+
+def test_startup_scanner_preserves_wrong_marker_content(tmp_path: Path) -> None:
+    _, store, _ = make_client(tmp_path)
+    job_id = "4" * 32
+    orphan = store.jobs_root / f".creating-{job_id}"
+    orphan.mkdir(parents=True)
+    (orphan / ".creating").write_text("wrong", encoding="ascii")
+
+    ingestion_routes.cleanup_abandoned_creates(store)
+
+    assert orphan.is_dir()
+
+
+def test_startup_scanner_cleans_strictly_empty_temp_without_marker(
+    tmp_path: Path,
+) -> None:
+    _, store, _ = make_client(tmp_path)
+    job_id = "5" * 32
+    orphan = store.jobs_root / f".creating-{job_id}"
+    orphan.mkdir(parents=True)
+
+    ingestion_routes.cleanup_abandoned_creates(store)
+
+    assert not orphan.exists()
 
 
 def test_duplicate_file_parts_are_rejected_and_all_uploads_closed(

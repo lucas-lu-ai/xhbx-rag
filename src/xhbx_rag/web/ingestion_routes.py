@@ -130,28 +130,38 @@ def _publish_source_layout(
     if final_dir.exists() or final_dir.is_symlink():
         raise FileExistsError("ingestion job workspace 已存在")
     creating_dir.replace(final_dir)
-    _fsync_directory(store.jobs_root)
     return final_dir, final_dir / "source" / source_name
 
 
 def _rollback_failed_create(
-    store: IngestionStore, job_id: str, job_dir: Path, *, owns_job_dir: bool
+    store: IngestionStore,
+    job_id: str,
+    *,
+    temp_dir: Path,
+    final_dir: Path,
+    owns_temp_dir: bool,
+    published_final_dir: bool,
+    draft_created: bool,
 ) -> None:
-    if not owns_job_dir:
-        return
-    try:
-        delete_result = store.begin_delete(job_id)
-    except Exception:
-        logger.exception("预留失败 draft 删除状态失败 job_id=%s", job_id)
-        return
-
-    if delete_result == "ok":
+    if draft_created:
         try:
-            delete_job_workspace(job_dir)
+            delete_result = store.begin_delete(job_id)
+        except Exception:
+            logger.exception("预留失败 draft 删除状态失败 job_id=%s", job_id)
+            return
+        if delete_result != "ok":
+            logger.error(
+                "失败 draft 所有权不明确，保留现场 job_id=%s result=%s",
+                job_id,
+                delete_result,
+            )
+            return
+        try:
+            delete_job_workspace(final_dir)
             if store.jobs_root.is_dir():
                 _fsync_directory(store.jobs_root)
         except Exception:
-            logger.exception("清理失败上传目录失败 job_id=%s", job_id)
+            logger.exception("清理失败 draft 目录失败 job_id=%s", job_id)
             return
         try:
             store.finish_delete(job_id)
@@ -159,20 +169,17 @@ def _rollback_failed_create(
             logger.exception("完成失败 draft 删除失败 job_id=%s", job_id)
         return
 
-    if delete_result == "not_found" and owns_job_dir:
+    if published_final_dir:
+        logger.error("create_draft 结果不确定，保留 final marker job_id=%s", job_id)
+        return
+
+    if owns_temp_dir:
         try:
-            delete_job_workspace(job_dir)
+            delete_job_workspace(temp_dir)
             if store.jobs_root.is_dir():
                 _fsync_directory(store.jobs_root)
         except Exception:
-            logger.exception("清理失败上传目录失败 job_id=%s", job_id)
-        return
-
-    logger.error(
-        "失败 create workspace 所有权不明确，保留现场 job_id=%s result=%s",
-        job_id,
-        delete_result,
-    )
+            logger.exception("清理失败 temp 上传目录失败 job_id=%s", job_id)
 
 
 def cleanup_abandoned_creates(store: object) -> None:
@@ -192,15 +199,6 @@ def cleanup_abandoned_creates(store: object) -> None:
         if name.startswith(_CREATING_PREFIX):
             job_id = name[len(_CREATING_PREFIX) :]
         elif _JOB_ID_RE.fullmatch(name):
-            marker = candidate / _CREATING_MARKER
-            try:
-                marker_metadata = marker.lstat()
-            except (FileNotFoundError, OSError):
-                continue
-            if not stat.S_ISREG(marker_metadata.st_mode) or stat.S_ISLNK(
-                marker_metadata.st_mode
-            ):
-                continue
             job_id = name
         else:
             continue
@@ -219,6 +217,30 @@ def cleanup_abandoned_creates(store: object) -> None:
             continue
         if existing is not None:
             continue
+        marker = candidate / _CREATING_MARKER
+        try:
+            marker_metadata = marker.lstat()
+        except FileNotFoundError:
+            try:
+                if any(candidate.iterdir()):
+                    continue
+            except OSError:
+                continue
+        except OSError:
+            continue
+        else:
+            if (
+                not stat.S_ISREG(marker_metadata.st_mode)
+                or stat.S_ISLNK(marker_metadata.st_mode)
+                or marker_metadata.st_size != len(job_id)
+            ):
+                continue
+            try:
+                marker_content = marker.read_bytes()
+            except OSError:
+                continue
+            if marker_content != job_id.encode("ascii"):
+                continue
         try:
             delete_job_workspace(candidate)
             _fsync_directory(jobs_root)
@@ -284,8 +306,11 @@ async def create_ingestion_job(
     result: dict[str, Any] | None = None
     primary_error: BaseException | None = None
     job_id = uuid.uuid4().hex
-    job_dir = store.jobs_root / job_id
-    owns_job_dir = False
+    temp_dir = store.jobs_root / f"{_CREATING_PREFIX}{job_id}"
+    final_dir = store.jobs_root / job_id
+    owns_temp_dir = False
+    published_final_dir = False
+    draft_created = False
     try:
         form = await request.form()
         file_parts = list(form.getlist("file"))
@@ -298,8 +323,8 @@ async def create_ingestion_job(
             raise UploadValidationError("file 字段必须且只能出现一次")
         if not _JOB_ID_RE.fullmatch(job_id):
             raise ValueError("uuid4 生成了无效 ingestion job_id")
-        job_dir, source_dir = _create_source_layout(store, job_id)
-        owns_job_dir = True
+        temp_dir, source_dir = _create_source_layout(store, job_id)
+        owns_temp_dir = True
         source_path = source_dir / _safe_original_name(file.filename)
         try:
             await save_upload_file(
@@ -313,19 +338,23 @@ async def create_ingestion_job(
             raise
         _fsync_directory(source_dir)
         preflight = preflight_upload(source_path, target=target, limits=limits)
-        job_dir, source_path = _publish_source_layout(
+        final_dir, source_path = _publish_source_layout(
             store,
             job_id,
-            job_dir,
+            temp_dir,
             source_path.name,
         )
+        owns_temp_dir = False
+        published_final_dir = True
+        _fsync_directory(store.jobs_root)
         result = store.create_draft(
             preflight=preflight,
             source_path=source_path,
             job_id=job_id,
         )
-        (job_dir / _CREATING_MARKER).unlink()
-        _fsync_directory(job_dir)
+        draft_created = True
+        (final_dir / _CREATING_MARKER).unlink()
+        _fsync_directory(final_dir)
     except BaseException as exc:
         primary_error = exc
 
@@ -349,8 +378,11 @@ async def create_ingestion_job(
         _rollback_failed_create(
             store,
             job_id,
-            job_dir,
-            owns_job_dir=owns_job_dir,
+            temp_dir=temp_dir,
+            final_dir=final_dir,
+            owns_temp_dir=owns_temp_dir,
+            published_final_dir=published_final_dir,
+            draft_created=draft_created,
         )
         if not isinstance(primary_error, Exception):
             raise primary_error
