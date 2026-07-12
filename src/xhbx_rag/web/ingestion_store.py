@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -14,6 +15,23 @@ from xhbx_rag.web.source_paths import project_root_from_module
 
 
 _DEFAULT_DB_PATH = Path(".local/web_ingestion/ingestion.sqlite3")
+_MAX_PERSISTED_TEXT_CHARS = 2_000
+_MAX_EVENT_PAYLOAD_BYTES = 16 * 1_024
+_REDACTED_PATH = "[已隐藏路径]"
+_REDACTED_SECRET = "[已隐藏敏感信息]"
+_SENSITIVE_KEY_RE = re.compile(r"^(?:api[_-]?key|token|secret|password)$", re.IGNORECASE)
+_SENSITIVE_VALUE_RE = re.compile(
+    r"\b(api[_-]?key|token|secret|password)\b\s*[:=]\s*"
+    r"(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)",
+    re.IGNORECASE,
+)
+_BEARER_TOKEN_RE = re.compile(r"\bBearer\s+[^\s,;]+", re.IGNORECASE)
+_WINDOWS_ABSOLUTE_PATH_RE = re.compile(
+    r"\b[A-Za-z]:[\\/](?:[^\\/\s]+[\\/])*[^\\/\s,;)\]}]+"
+)
+_POSIX_ABSOLUTE_PATH_RE = re.compile(
+    r"(?<![:\w])/(?:[^/\s]+/)*[^/\s,;)\]}]+"
+)
 
 _PUBLIC_JOB_FIELDS = (
     "job_id",
@@ -40,6 +58,50 @@ _PUBLIC_JOB_FIELDS = (
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _safe_text(value: object) -> str:
+    text = str(value)
+    text = _SENSITIVE_VALUE_RE.sub(lambda match: f"{match.group(1)}={_REDACTED_SECRET}", text)
+    text = _BEARER_TOKEN_RE.sub(f"Bearer {_REDACTED_SECRET}", text)
+    text = _WINDOWS_ABSOLUTE_PATH_RE.sub(_REDACTED_PATH, text)
+    text = _POSIX_ABSOLUTE_PATH_RE.sub(_REDACTED_PATH, text)
+    return text[:_MAX_PERSISTED_TEXT_CHARS]
+
+
+def _safe_payload_value(value: object) -> object:
+    if isinstance(value, str):
+        return _safe_text(value)
+    if isinstance(value, dict):
+        sanitized: dict[str, object] = {}
+        for raw_key, raw_value in value.items():
+            key = _safe_text(raw_key)
+            sanitized[key] = (
+                _REDACTED_SECRET
+                if _SENSITIVE_KEY_RE.fullmatch(str(raw_key))
+                else _safe_payload_value(raw_value)
+            )
+        return sanitized
+    if isinstance(value, (list, tuple)):
+        return [_safe_payload_value(item) for item in value]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return _safe_text(value)
+
+
+def _safe_payload_json(payload: object) -> str:
+    try:
+        sanitized = _safe_payload_value(payload)
+        encoded = json.dumps(sanitized, ensure_ascii=False, separators=(",", ":"))
+    except (RecursionError, TypeError, ValueError):
+        encoded = json.dumps({"truncated": True})
+    if len(encoded.encode("utf-8")) > _MAX_EVENT_PAYLOAD_BYTES:
+        return json.dumps({"truncated": True})
+    return encoded
+
+
+class IngestionStateError(RuntimeError):
+    """入库任务或 attempt 不满足所请求的状态转换。"""
 
 
 @dataclass(frozen=True)
@@ -474,6 +536,7 @@ class IngestionStore:
 
     def fail_item(self, job_id: str, item_index: int, detail: str) -> None:
         now = _utc_now()
+        safe_detail = _safe_text(detail)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = self._active_attempt_row(connection, job_id)
@@ -485,7 +548,7 @@ class IngestionStore:
                 SET status = 'failed', error_detail = ?, updated_at = ?
                 WHERE job_id = ? AND item_index = ? AND status IN ('pending', 'running')
                 """,
-                (detail, now, job_id, item_index),
+                (safe_detail, now, job_id, item_index),
             )
             if cursor.rowcount != 1:
                 return
@@ -494,7 +557,7 @@ class IngestionStore:
                 job_id,
                 row["attempt_count"],
                 event_type="item_failed",
-                message=detail,
+                message=safe_detail,
                 payload={"item_index": item_index},
             )
 
@@ -504,20 +567,69 @@ class IngestionStore:
         now = _utc_now()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            row = self._active_attempt_row(connection, job_id)
+            row = self._attempt_state_row(connection, job_id)
             if row is None:
+                raise IngestionStateError("任务或当前 attempt 不存在")
+            if state not in {
+                "not_started",
+                "prepared",
+                "committed",
+                "rolling_back",
+                "rolled_back",
+            }:
+                raise IngestionStateError(f"不支持的提交状态: {state}")
+            current_state = row["commit_state"]
+            job_status = row["job_status"]
+            attempt_status = row["attempt_status"]
+            coherent_statuses = {
+                "not_started": ("running", "running"),
+                "prepared": ("running", "running"),
+                "committed": ("running", "running"),
+                "rolling_back": ("rolling_back", "rolling_back"),
+                "rolled_back": ("rolling_back", "rolling_back"),
+            }
+            if state == current_state:
+                if (job_status, attempt_status) != coherent_statuses[state]:
+                    raise IngestionStateError("任务与 attempt 状态不一致")
                 return
+            allowed_transition = (current_state, state) in {
+                ("not_started", "prepared"),
+                ("prepared", "committed"),
+                ("prepared", "rolling_back"),
+                ("rolling_back", "rolled_back"),
+            }
+            if not allowed_transition:
+                raise IngestionStateError(f"非法提交状态转换: {current_state} -> {state}")
+            if current_state in ("not_started", "prepared") and (
+                job_status,
+                attempt_status,
+            ) != ("running", "running"):
+                raise IngestionStateError("提交状态转换要求 running job/attempt")
+            if current_state == "rolling_back" and (
+                job_status,
+                attempt_status,
+            ) != ("rolling_back", "rolling_back"):
+                raise IngestionStateError("回滚完成要求 rolling_back job/attempt")
+            if state == "prepared" and journal_path is None:
+                raise IngestionStateError("prepared 状态必须提供 journal_path")
             resolved_journal = str(journal_path.resolve()) if journal_path is not None else None
             connection.execute(
                 """
                 UPDATE ingestion_attempts
-                SET commit_state = ?, journal_path = COALESCE(?, journal_path)
+                SET commit_state = ?, journal_path = COALESCE(?, journal_path),
+                    status = CASE WHEN ? = 'rolling_back' THEN 'rolling_back' ELSE status END
                 WHERE job_id = ? AND attempt_no = ?
                 """,
-                (state, resolved_journal, job_id, row["attempt_count"]),
+                (state, resolved_journal, state, job_id, row["attempt_count"]),
             )
             connection.execute(
-                "UPDATE ingestion_jobs SET updated_at = ? WHERE job_id = ?", (now, job_id)
+                """
+                UPDATE ingestion_jobs
+                SET status = CASE WHEN ? = 'rolling_back' THEN 'rolling_back' ELSE status END,
+                    updated_at = ?
+                WHERE job_id = ?
+                """,
+                (state, now, job_id),
             )
             self._append_event(
                 connection,
@@ -532,9 +644,11 @@ class IngestionStore:
         now = _utc_now()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            row = self._active_attempt_row(connection, job_id)
-            if row is None:
-                return
+            row = self._attempt_state_row(connection, job_id)
+            if row is None or (
+                row["job_status"], row["attempt_status"], row["commit_state"]
+            ) != ("running", "running", "committed"):
+                raise IngestionStateError("成功状态要求 running job/attempt 且已 committed")
             connection.execute(
                 """
                 UPDATE ingestion_jobs
@@ -564,18 +678,30 @@ class IngestionStore:
 
     def mark_rolling_back(self, job_id: str, *, code: str, detail: str) -> None:
         now = _utc_now()
+        safe_code = _safe_text(code)
+        safe_detail = _safe_text(detail)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            row = self._active_attempt_row(connection, job_id)
+            row = self._attempt_state_row(connection, job_id)
             if row is None:
-                return
+                raise IngestionStateError("任务或当前 attempt 不存在")
+            state_tuple = (
+                row["job_status"],
+                row["attempt_status"],
+                row["commit_state"],
+            )
+            if state_tuple not in {
+                ("running", "running", "prepared"),
+                ("rolling_back", "rolling_back", "rolling_back"),
+            }:
+                raise IngestionStateError("回滚只允许从 prepared 或 rolling_back 状态开始")
             connection.execute(
                 """
                 UPDATE ingestion_jobs
                 SET status = 'rolling_back', error_code = ?, error_detail = ?, updated_at = ?
                 WHERE job_id = ?
                 """,
-                (code, detail, now, job_id),
+                (safe_code, safe_detail, now, job_id),
             )
             connection.execute(
                 """
@@ -584,29 +710,47 @@ class IngestionStore:
                     error_code = ?, error_detail = ?
                 WHERE job_id = ? AND attempt_no = ?
                 """,
-                (code, detail, job_id, row["attempt_count"]),
+                (safe_code, safe_detail, job_id, row["attempt_count"]),
             )
             self._append_event(
                 connection,
                 job_id,
                 row["attempt_count"],
                 event_type="rollback_started",
-                message=detail,
+                message=safe_detail,
             )
 
     def fail_job(self, job_id: str, *, code: str, detail: str) -> None:
         now = _utc_now()
+        safe_code = _safe_text(code)
+        safe_detail = _safe_text(detail)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """
-                SELECT attempt_count FROM ingestion_jobs
-                WHERE job_id = ? AND status IN ('running', 'rolling_back')
+                SELECT j.attempt_count, j.status AS job_status,
+                       a.status AS attempt_status, a.commit_state
+                FROM ingestion_jobs AS j
+                JOIN ingestion_attempts AS a
+                  ON a.job_id = j.job_id AND a.attempt_no = j.attempt_count
+                WHERE j.job_id = ?
                 """,
                 (job_id,),
             ).fetchone()
-            if row is None:
-                return
+            allowed = row is not None and (
+                (
+                    row["job_status"] == "running"
+                    and row["attempt_status"] == "running"
+                    and row["commit_state"] == "not_started"
+                )
+                or (
+                    row["job_status"] == "rolling_back"
+                    and row["attempt_status"] == "rolling_back"
+                    and row["commit_state"] == "rolled_back"
+                )
+            )
+            if not allowed:
+                raise IngestionStateError("失败状态要求提交前失败或已完成回滚")
             connection.execute(
                 """
                 UPDATE ingestion_jobs
@@ -614,7 +758,7 @@ class IngestionStore:
                     updated_at = ?, finished_at = ?
                 WHERE job_id = ?
                 """,
-                (code, detail, now, now, job_id),
+                (safe_code, safe_detail, now, now, job_id),
             )
             if row["attempt_count"]:
                 connection.execute(
@@ -623,15 +767,15 @@ class IngestionStore:
                     SET status = 'failed', error_code = ?, error_detail = ?, finished_at = ?
                     WHERE job_id = ? AND attempt_no = ?
                     """,
-                    (code, detail, now, job_id, row["attempt_count"]),
+                    (safe_code, safe_detail, now, job_id, row["attempt_count"]),
                 )
                 self._append_event(
                     connection,
                     job_id,
                     row["attempt_count"],
                     event_type="job_failed",
-                    message=detail,
-                    payload={"error_code": code},
+                    message=safe_detail,
+                    payload={"error_code": safe_code},
                 )
 
     def retry_job(self, job_id: str) -> dict[str, object]:
@@ -680,6 +824,7 @@ class IngestionStore:
 
     def abort_retry(self, job_id: str, attempt_no: int, detail: str) -> None:
         now = _utc_now()
+        safe_detail = _safe_text(detail)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -708,7 +853,7 @@ class IngestionStore:
                     error_detail = ?, updated_at = ?, finished_at = ?
                 WHERE job_id = ?
                 """,
-                (previous_attempt, detail, now, now, job_id),
+                (previous_attempt, safe_detail, now, now, job_id),
             )
             if previous_attempt > 0:
                 self._append_event(
@@ -716,7 +861,7 @@ class IngestionStore:
                     job_id,
                     previous_attempt,
                     event_type="retry_aborted",
-                    message=detail,
+                    message=safe_detail,
                 )
 
     def begin_delete(self, job_id: str) -> str:
@@ -855,6 +1000,22 @@ class IngestionStore:
         ).fetchone()
 
     @staticmethod
+    def _attempt_state_row(
+        connection: sqlite3.Connection, job_id: str
+    ) -> sqlite3.Row | None:
+        return connection.execute(
+            """
+            SELECT j.attempt_count, j.status AS job_status,
+                   a.status AS attempt_status, a.commit_state, a.journal_path
+            FROM ingestion_jobs AS j
+            JOIN ingestion_attempts AS a
+              ON a.job_id = j.job_id AND a.attempt_no = j.attempt_count
+            WHERE j.job_id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+
+    @staticmethod
     def _append_event(
         connection: sqlite3.Connection,
         job_id: str,
@@ -864,6 +1025,10 @@ class IngestionStore:
         message: str,
         payload: dict[str, Any] | None = None,
     ) -> None:
+        event_type = _safe_text(event_type)
+        message = _safe_text(message)
+        safe_payload_json = _safe_payload_json(payload or {})
+        safe_payload = json.loads(safe_payload_json)
         event_count = connection.execute(
             """
             SELECT COUNT(*) AS event_count FROM ingestion_events
@@ -888,7 +1053,7 @@ class IngestionStore:
                     int(compacted_payload.get("compacted_count", 1)) + 1
                 )
                 compacted_payload["latest_event_type"] = event_type
-                compacted_payload["latest_payload"] = payload or {}
+                compacted_payload["latest_payload"] = safe_payload
                 connection.execute(
                     """
                     UPDATE ingestion_events
@@ -897,7 +1062,7 @@ class IngestionStore:
                     """,
                     (
                         message,
-                        json.dumps(compacted_payload, ensure_ascii=False),
+                        _safe_payload_json(compacted_payload),
                         _utc_now(),
                         job_id,
                         attempt_no,
@@ -918,7 +1083,7 @@ class IngestionStore:
                 compacted_payload = {
                     "compacted_count": 2,
                     "latest_event_type": event_type,
-                    "latest_payload": payload or {},
+                    "latest_payload": safe_payload,
                 }
                 connection.execute(
                     """
@@ -929,7 +1094,7 @@ class IngestionStore:
                     """,
                     (
                         message,
-                        json.dumps(compacted_payload, ensure_ascii=False),
+                        _safe_payload_json(compacted_payload),
                         _utc_now(),
                         job_id,
                         attempt_no,
@@ -949,22 +1114,14 @@ class IngestionStore:
                 (job_id, attempt_no),
             ).fetchone()
             if disposable is None:
-                disposable = connection.execute(
-                    """
-                    SELECT sequence FROM ingestion_events
-                    WHERE job_id = ? AND attempt_no = ?
-                    ORDER BY sequence LIMIT 1
-                    """,
-                    (job_id, attempt_no),
-                ).fetchone()
-            if disposable is not None:
-                connection.execute(
-                    """
-                    DELETE FROM ingestion_events
-                    WHERE job_id = ? AND attempt_no = ? AND sequence = ?
-                    """,
-                    (job_id, attempt_no, disposable["sequence"]),
-                )
+                return
+            connection.execute(
+                """
+                DELETE FROM ingestion_events
+                WHERE job_id = ? AND attempt_no = ? AND sequence = ?
+                """,
+                (job_id, attempt_no, disposable["sequence"]),
+            )
 
         sequence = connection.execute(
             """
@@ -985,7 +1142,7 @@ class IngestionStore:
                 sequence,
                 event_type,
                 message,
-                json.dumps(payload or {}, ensure_ascii=False),
+                safe_payload_json,
                 _utc_now(),
             ),
         )

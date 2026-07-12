@@ -1,6 +1,9 @@
 import sqlite3
 from pathlib import Path
 
+import pytest
+
+import xhbx_rag.web.ingestion_store as ingestion_store
 from xhbx_rag.web.ingestion_store import IngestionStore
 from xhbx_rag.web.ingestion_uploads import PreflightItem, PreflightResult
 
@@ -21,6 +24,15 @@ def _preflight() -> PreflightResult:
     )
 
 
+def _running_job(store: IngestionStore, tmp_path: Path) -> str:
+    job = store.create_draft(preflight=_preflight(), source_path=tmp_path / "source.zip")
+    job_id = job["job_id"]
+    assert store.start_job(job_id) == "ok"
+    assert store.claim_job(job_id) is True
+    assert store.begin_attempt(job_id, tmp_path / "attempt") == 1
+    return job_id
+
+
 def test_job_lifecycle_requires_valid_state_transitions(tmp_path: Path) -> None:
     store = _store(tmp_path)
     job = store.create_draft(
@@ -32,6 +44,7 @@ def test_job_lifecycle_requires_valid_state_transitions(tmp_path: Path) -> None:
     assert store.start_job(job["job_id"]) == "conflict"
     assert store.claim_job(job["job_id"]) is True
     assert store.claim_job(job["job_id"]) is False
+    assert store.begin_attempt(job["job_id"], tmp_path / "attempt") == 1
     store.fail_job(job["job_id"], code="parse_failed", detail="案例解析失败")
     retried = store.retry_job(job["job_id"])
     assert retried == {"result": "ok", "attempt_no": 2}
@@ -153,6 +166,7 @@ def test_attempt_item_progress_and_success_are_persisted(tmp_path: Path) -> None
     assert store.mark_item_running(job_id, 2, "chunking") is True
     store.complete_item(job_id, 2, chunk_count=5, warning_count=2)
     store.mark_stage(job_id, "indexing", "正在入库")
+    store.mark_commit_state(job_id, "prepared", tmp_path / "attempt" / "journal.json")
     store.mark_commit_state(job_id, "committed")
     store.succeed_job(job_id, chunk_total=12, warning_count=3)
 
@@ -228,6 +242,7 @@ def test_recovery_actions_include_committed_and_deleting_jobs(tmp_path: Path) ->
     store.claim_job(committed["job_id"])
     store.begin_attempt(committed["job_id"], tmp_path / "committed")
     journal_path = tmp_path / "committed" / "journal.json"
+    store.mark_commit_state(committed["job_id"], "prepared", journal_path)
     store.mark_commit_state(committed["job_id"], "committed", journal_path)
     deleting = store.create_draft(preflight=_preflight(), source_path=tmp_path / "d.zip")
     store.begin_delete(deleting["job_id"])
@@ -303,3 +318,246 @@ def test_schema_uses_wal_and_state_conflicts_do_not_mutate_jobs(tmp_path: Path) 
     assert store.start_job(job_id) == "ok"
     assert store.begin_delete(job_id) == "conflict"
     assert store.get_job(job_id)["status"] == "queued"
+
+
+def test_store_exposes_a_clear_state_conflict_error() -> None:
+    assert issubclass(ingestion_store.IngestionStateError, RuntimeError)
+
+
+def test_succeed_job_rejects_success_without_committed_attempt(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    job_id = _running_job(store, tmp_path)
+
+    with pytest.raises(ingestion_store.IngestionStateError):
+        store.succeed_job(job_id, chunk_total=1, warning_count=0)
+
+    job = store.get_job(job_id)
+    assert job["status"] == "running"
+    assert job["attempt"]["status"] == "running"
+
+
+def test_succeed_job_rejects_success_while_rolling_back(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    job_id = _running_job(store, tmp_path)
+    store.mark_commit_state(job_id, "prepared", tmp_path / "journal.json")
+    store.mark_rolling_back(job_id, code="index_failed", detail="写入失败")
+
+    with pytest.raises(ingestion_store.IngestionStateError):
+        store.succeed_job(job_id, chunk_total=1, warning_count=0)
+
+    assert store.get_job(job_id)["status"] == "rolling_back"
+
+
+@pytest.mark.parametrize("commit_state", ["prepared", "committed"])
+def test_fail_job_rejects_failure_after_commit_started(
+    tmp_path: Path, commit_state: str
+) -> None:
+    store = _store(tmp_path)
+    job_id = _running_job(store, tmp_path)
+    store.mark_commit_state(job_id, "prepared", tmp_path / "journal.json")
+    if commit_state == "committed":
+        store.mark_commit_state(job_id, "committed")
+
+    with pytest.raises(ingestion_store.IngestionStateError):
+        store.fail_job(job_id, code="index_failed", detail="写入失败")
+
+    assert store.get_job(job_id)["status"] == "running"
+
+
+def test_fail_job_rejects_failure_before_rollback_finishes(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    job_id = _running_job(store, tmp_path)
+    store.mark_commit_state(job_id, "prepared", tmp_path / "journal.json")
+    store.mark_rolling_back(job_id, code="index_failed", detail="写入失败")
+
+    with pytest.raises(ingestion_store.IngestionStateError):
+        store.fail_job(job_id, code="index_failed", detail="写入失败")
+
+    assert store.get_job(job_id)["status"] == "rolling_back"
+
+
+def test_prepared_commit_requires_a_journal_path(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    job_id = _running_job(store, tmp_path)
+
+    with pytest.raises(ingestion_store.IngestionStateError):
+        store.mark_commit_state(job_id, "prepared")
+
+    assert store.get_job(job_id)["attempt"]["commit_state"] == "not_started"
+
+
+@pytest.mark.parametrize(
+    "state",
+    ["committed", "rolling_back", "rolled_back", "invalid"],
+)
+def test_illegal_commit_transitions_are_rejected(tmp_path: Path, state: str) -> None:
+    store = _store(tmp_path)
+    job_id = _running_job(store, tmp_path)
+
+    with pytest.raises(ingestion_store.IngestionStateError):
+        store.mark_commit_state(job_id, state)
+
+    assert store.get_job(job_id)["attempt"]["commit_state"] == "not_started"
+
+
+def test_fail_job_accepts_only_precommit_or_finished_rollback(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    precommit = _running_job(store, tmp_path / "precommit")
+    store.fail_job(precommit, code="parse_failed", detail="解析失败")
+    assert store.get_job(precommit)["status"] == "failed"
+
+    rolled_back = _running_job(store, tmp_path / "rolled-back")
+    store.mark_commit_state(rolled_back, "prepared", tmp_path / "journal.json")
+    store.mark_rolling_back(rolled_back, code="index_failed", detail="写入失败")
+    store.mark_commit_state(rolled_back, "rolled_back")
+    store.fail_job(rolled_back, code="index_failed", detail="写入失败")
+    assert store.get_job(rolled_back)["status"] == "failed"
+
+
+def test_persisted_details_and_event_content_are_safely_normalized(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    job_id = _running_job(store, tmp_path)
+    secret_value = "sk-live-super-secret-value"
+    posix_path = "/Users/alice/private/customer.txt"
+    windows_path = r"C:\Users\alice\private\customer.txt"
+    unsafe = (
+        f"读取 {posix_path} 和 {windows_path} 失败 "
+        f"token={secret_value} api_key: {secret_value} secret={secret_value} "
+        + "超长错误" * 800
+    )
+
+    store.mark_stage(job_id, "parsing", unsafe)
+    assert store.mark_item_running(job_id, 1, "parsing") is True
+    store.fail_item(job_id, 1, unsafe)
+    store.fail_job(job_id, code=f"token={secret_value}", detail=unsafe)
+
+    public = store.get_job(job_id)
+    serialized = repr(public)
+    for raw_value in (secret_value, posix_path, windows_path):
+        assert raw_value not in serialized
+    assert len(public["error_code"]) <= 2_000
+    assert len(public["error_detail"]) <= 2_000
+    assert len(public["items"][0]["error_detail"]) <= 2_000
+    assert all(len(event["message"]) <= 2_000 for event in public["events"])
+
+    with sqlite3.connect(store.db_path) as connection:
+        raw_values = [
+            value
+            for row in connection.execute(
+                """
+                SELECT error_code, error_detail FROM ingestion_jobs WHERE job_id = ?
+                UNION ALL
+                SELECT NULL, error_detail FROM ingestion_items WHERE job_id = ?
+                UNION ALL
+                SELECT NULL, message FROM ingestion_events WHERE job_id = ?
+                UNION ALL
+                SELECT NULL, payload_json FROM ingestion_events WHERE job_id = ?
+                """,
+                (job_id, job_id, job_id, job_id),
+            )
+            for value in row
+            if value is not None
+        ]
+    persisted = "\n".join(raw_values)
+    for raw_value in (secret_value, posix_path, windows_path):
+        assert raw_value not in persisted
+
+
+def test_event_payload_is_recursively_sanitized_and_limited_to_16_kib(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    job_id = _running_job(store, tmp_path)
+    secret_value = "nested-super-secret"
+
+    with store._connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        store._append_event(
+            connection,
+            job_id,
+            1,
+            event_type="nested_payload",
+            message="读取 /var/private/source.txt",
+            payload={
+                "nested": {
+                    "api_key": secret_value,
+                    "values": ["token=" + secret_value, r"C:\private\source.txt"],
+                }
+            },
+        )
+        store._append_event(
+            connection,
+            job_id,
+            1,
+            event_type="oversized_payload",
+            message="超大 payload",
+            payload={"values": ["内容" * 1_500 for _ in range(10)]},
+        )
+
+    events = store.get_job(job_id)["events"]
+    nested = next(event for event in events if event["event_type"] == "nested_payload")
+    oversized = next(event for event in events if event["event_type"] == "oversized_payload")
+    assert secret_value not in repr(nested)
+    assert "/var/private/source.txt" not in repr(nested)
+    assert r"C:\private\source.txt" not in repr(nested)
+    assert oversized["payload"] == {"truncated": True}
+
+    with sqlite3.connect(store.db_path) as connection:
+        payload_json = connection.execute(
+            """
+            SELECT payload_json FROM ingestion_events
+            WHERE job_id = ? AND event_type = 'oversized_payload'
+            """,
+            (job_id,),
+        ).fetchone()[0]
+    assert len(payload_json.encode("utf-8")) <= 16 * 1_024
+
+
+def test_cyclic_event_payload_uses_fixed_truncation_marker(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    job_id = _running_job(store, tmp_path)
+    cyclic: dict[str, object] = {}
+    cyclic["self"] = cyclic
+
+    with store._connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        store._append_event(
+            connection,
+            job_id,
+            1,
+            event_type="cyclic_payload",
+            message="循环 payload",
+            payload=cyclic,
+        )
+
+    event = next(
+        event
+        for event in store.get_job(job_id)["events"]
+        if event["event_type"] == "cyclic_payload"
+    )
+    assert event["payload"] == {"truncated": True}
+
+
+def test_full_milestone_log_drops_new_event_without_rolling_back_state(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    job_id = _running_job(store, tmp_path)
+    for index in range(1_999):
+        store.mark_stage(job_id, "parsing", f"解析里程碑 {index}")
+
+    store.mark_stage(job_id, "chunking", "事件已满但阶段仍需提交")
+
+    with sqlite3.connect(store.db_path) as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM ingestion_events WHERE job_id = ? AND attempt_no = 1",
+            (job_id,),
+        ).fetchone()[0]
+        attempt_started = connection.execute(
+            """
+            SELECT COUNT(*) FROM ingestion_events
+            WHERE job_id = ? AND attempt_no = 1 AND event_type = 'attempt_started'
+            """,
+            (job_id,),
+        ).fetchone()[0]
+    assert count == 2_000
+    assert attempt_started == 1
+    assert store.get_job(job_id)["current_stage"] == "chunking"
