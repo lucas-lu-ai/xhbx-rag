@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
+
+from xhbx_rag.web.ingestion_uploads import IngestionLimits
 
 
 class ConfigError(ValueError):
@@ -129,6 +132,54 @@ def load_env_values(
         values.update(_read_env_file(env_file))
     values.update(os.environ if env is None else env)
     return values
+
+
+def ingestion_limits_from_env(
+    env: Mapping[str, str] | None = None,
+) -> IngestionLimits:
+    values = os.environ if env is None else env
+    defaults = IngestionLimits()
+
+    def positive_int(key: str, default: int) -> int:
+        raw = values.get(key)
+        if raw is None or not raw.strip():
+            return default
+        try:
+            parsed = int(raw.strip())
+        except ValueError as exc:
+            raise ConfigError(f"{key} 必须是正整数") from exc
+        if parsed <= 0:
+            raise ConfigError(f"{key} 必须是正整数")
+        return parsed
+
+    ratio_key = "WEB_INGEST_MAX_COMPRESSION_RATIO"
+    ratio_raw = values.get(ratio_key)
+    if ratio_raw is None or not ratio_raw.strip():
+        ratio = defaults.max_compression_ratio
+    else:
+        try:
+            ratio = float(ratio_raw.strip())
+        except ValueError as exc:
+            raise ConfigError(f"{ratio_key} 必须是有限正数") from exc
+        if not math.isfinite(ratio) or ratio <= 0:
+            raise ConfigError(f"{ratio_key} 必须是有限正数")
+
+    return IngestionLimits(
+        max_upload_bytes=positive_int(
+            "WEB_INGEST_MAX_UPLOAD_BYTES", defaults.max_upload_bytes
+        ),
+        max_zip_entries=positive_int(
+            "WEB_INGEST_MAX_ZIP_ENTRIES", defaults.max_zip_entries
+        ),
+        max_extracted_bytes=positive_int(
+            "WEB_INGEST_MAX_EXTRACTED_BYTES", defaults.max_extracted_bytes
+        ),
+        max_entry_bytes=positive_int(
+            "WEB_INGEST_MAX_ENTRY_BYTES", defaults.max_entry_bytes
+        ),
+        max_compression_ratio=ratio,
+        max_path_chars=defaults.max_path_chars,
+    )
 
 
 def _strip_quotes(value: str) -> str:

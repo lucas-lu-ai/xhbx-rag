@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from xhbx_rag.config import ConfigError, RetrievalConfig
+from xhbx_rag.config import ConfigError, RetrievalConfig, ingestion_limits_from_env
 
 
 def _required_env(**overrides: str) -> dict[str, str]:
@@ -156,3 +156,45 @@ def test_retrieval_config_can_skip_chat_keys_for_mcp_retrieval() -> None:
     assert config.model_name == ""
     assert config.embedding_model_name == "embed"
     assert config.rerank_model_name == "rerank"
+
+
+def test_ingestion_limits_use_defaults_and_read_overrides() -> None:
+    defaults = ingestion_limits_from_env({})
+
+    assert defaults.max_upload_bytes == 536_870_912
+    assert defaults.max_zip_entries == 2_000
+    assert defaults.max_extracted_bytes == 2_147_483_648
+    assert defaults.max_entry_bytes == 536_870_912
+    assert defaults.max_compression_ratio == 100.0
+
+    custom = ingestion_limits_from_env(
+        {
+            "WEB_INGEST_MAX_UPLOAD_BYTES": "1024",
+            "WEB_INGEST_MAX_ZIP_ENTRIES": "12",
+            "WEB_INGEST_MAX_EXTRACTED_BYTES": "4096",
+            "WEB_INGEST_MAX_ENTRY_BYTES": "2048",
+            "WEB_INGEST_MAX_COMPRESSION_RATIO": "25.5",
+        }
+    )
+    assert custom.max_upload_bytes == 1024
+    assert custom.max_zip_entries == 12
+    assert custom.max_extracted_bytes == 4096
+    assert custom.max_entry_bytes == 2048
+    assert custom.max_compression_ratio == 25.5
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("WEB_INGEST_MAX_UPLOAD_BYTES", "0"),
+        ("WEB_INGEST_MAX_ZIP_ENTRIES", "-1"),
+        ("WEB_INGEST_MAX_EXTRACTED_BYTES", "1.5"),
+        ("WEB_INGEST_MAX_ENTRY_BYTES", "not-an-int"),
+        ("WEB_INGEST_MAX_COMPRESSION_RATIO", "0"),
+        ("WEB_INGEST_MAX_COMPRESSION_RATIO", "nan"),
+        ("WEB_INGEST_MAX_COMPRESSION_RATIO", "inf"),
+    ],
+)
+def test_ingestion_limits_reject_invalid_values(key: str, value: str) -> None:
+    with pytest.raises(ConfigError, match=key):
+        ingestion_limits_from_env({key: value})

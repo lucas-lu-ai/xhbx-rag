@@ -11,11 +11,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from xhbx_rag.atomic_indexer import AtomicIndexer
+from xhbx_rag.config import RetrievalConfig, ingestion_limits_from_env
+from xhbx_rag.embedding import EmbeddingClient
+from xhbx_rag.milvus_store import create_milvus_store
+
 from .bad_cases import save_bad_case
 from .batch_routes import router as batch_router
 from .a2a_routes import router as a2a_router
 from .batch_runner import BatchRunner
 from .batch_store import BatchRunStore
+from .ingestion_routes import router as ingestion_router
+from .ingestion_pipeline import IngestionPipeline
+from .ingestion_runner import IngestionRunner
+from .ingestion_store import IngestionStore
 from .safe_errors import (
     MISSING_CONFIG_ERROR_PREFIX,
     SAFE_ANSWER_ERROR_MESSAGES,
@@ -193,37 +202,112 @@ class BadCaseRequest(BaseModel):
         return self
 
 
+def _build_ingestion_runner(
+    store: IngestionStore, limits: Any
+) -> IngestionRunner:
+    pipeline = IngestionPipeline(limits=limits)
+
+    def indexer_factory(target: str) -> AtomicIndexer:
+        if target not in {"case", "course"}:
+            raise ValueError("不支持的入库目标")
+        config = RetrievalConfig.from_env()
+        embedding_client = EmbeddingClient(
+            base_url=config.embedding_base_url,
+            api_key=config.embedding_api_key,
+            model=config.embedding_model_name,
+        )
+        collection_name = (
+            config.milvus_course_collection
+            if target == "course"
+            else config.milvus_collection
+        )
+        milvus_store = create_milvus_store(
+            config,
+            collection_name=collection_name,
+        )
+        return AtomicIndexer(
+            embedding_client=embedding_client,
+            store=milvus_store,
+        )
+
+    return IngestionRunner(
+        store=store,
+        pipeline=pipeline,
+        indexer_factory=indexer_factory,
+    )
+
+
 def create_app(
     batch_store: Any | None = None,
     batch_runner: Any | None = None,
+    ingestion_store: Any | None = None,
+    ingestion_runner: Any | None = None,
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app_instance: FastAPI) -> AsyncIterator[None]:
-        runner = None
+        active_batch_runner = None
+        active_ingestion_runner = None
         try:
             store = getattr(app_instance.state, "batch_store", None)
             if store is None:
                 store = BatchRunStore()
                 app_instance.state.batch_store = store
-            runner = getattr(app_instance.state, "batch_runner", None)
-            if runner is None:
-                runner = BatchRunner(store=store)
-                app_instance.state.batch_runner = runner
+            batch_runtime = getattr(app_instance.state, "batch_runner", None)
+            if batch_runtime is None:
+                batch_runtime = BatchRunner(store=store)
+                app_instance.state.batch_runner = batch_runtime
             # 先恢复中断状态，再启动 worker，避免旧的 running 状态被并发读到。
             store.recover_after_restart()
-            runner.start()
+            batch_runtime.start()
+            active_batch_runner = batch_runtime
         except Exception:
             # 批量子系统初始化失败不应拖垮单问问答；清空 state 让批量路由
             # 一致返回 500「批量任务存储不可用」，其余功能照常启动。
             logger.exception("批量执行子系统初始化失败，Web 将在无批量能力下继续启动")
             app_instance.state.batch_store = None
             app_instance.state.batch_runner = None
-            runner = None
+            active_batch_runner = None
+
+        try:
+            limits = getattr(app_instance.state, "ingestion_limits", None)
+            if limits is None:
+                limits = ingestion_limits_from_env()
+                app_instance.state.ingestion_limits = limits
+            ingestion_runtime_store = getattr(
+                app_instance.state, "ingestion_store", None
+            )
+            if ingestion_runtime_store is None:
+                ingestion_runtime_store = IngestionStore()
+                app_instance.state.ingestion_store = ingestion_runtime_store
+            ingestion_runtime = getattr(app_instance.state, "ingestion_runner", None)
+            if ingestion_runtime is None:
+                ingestion_runtime = _build_ingestion_runner(
+                    ingestion_runtime_store,
+                    limits,
+                )
+                app_instance.state.ingestion_runner = ingestion_runtime
+            # 恢复项先进入优先队列，再启动 worker，避免新任务抢在恢复前执行。
+            ingestion_runtime.recover_after_restart()
+            ingestion_runtime.start()
+            active_ingestion_runner = ingestion_runtime
+        except Exception:
+            logger.exception("入库子系统初始化失败，Web 将在无入库能力下继续启动")
+            app_instance.state.ingestion_store = None
+            app_instance.state.ingestion_runner = None
+            active_ingestion_runner = None
         try:
             yield
         finally:
-            if runner is not None:
-                runner.stop()
+            if active_ingestion_runner is not None:
+                try:
+                    active_ingestion_runner.stop()
+                except Exception:
+                    logger.exception("入库 Runner 停止失败")
+            if active_batch_runner is not None:
+                try:
+                    active_batch_runner.stop()
+                except Exception:
+                    logger.exception("批量执行 Runner 停止失败")
 
     web_app = FastAPI(title="xhbx-rag Web", lifespan=lifespan)
     web_app.add_middleware(
@@ -238,6 +322,10 @@ def create_app(
         web_app.state.batch_store = batch_store
     if batch_runner is not None:
         web_app.state.batch_runner = batch_runner
+    if ingestion_store is not None:
+        web_app.state.ingestion_store = ingestion_store
+    if ingestion_runner is not None:
+        web_app.state.ingestion_runner = ingestion_runner
 
     @web_app.get("/api/status")
     def status() -> dict[str, Any]:
@@ -311,6 +399,7 @@ def create_app(
 
     web_app.include_router(a2a_router)
     web_app.include_router(batch_router)
+    web_app.include_router(ingestion_router)
 
     return web_app
 

@@ -227,3 +227,30 @@ def test_gitignore_excludes_mcp_env_and_offline_packages() -> None:
 
     assert ".env.mcp" in gitignore
     assert "dist/" in gitignore
+
+
+def test_web_ingestion_upload_limits_are_deployable_and_persistent() -> None:
+    pyproject = read_repo_file("pyproject.toml")
+    lock = read_repo_file("uv.lock")
+    env_template = read_repo_file(".env.example")
+    compose = read_repo_file("docker-compose.yml")
+    nginx = read_repo_file("web/nginx.conf")
+
+    assert '"python-multipart>=0.0.20"' in pyproject
+    project_lock = lock[lock.index('name = "xhbx-rag"') :]
+    assert '{ name = "python-multipart" }' in project_lock
+    assert 'name = "python-multipart"' in lock
+
+    expected_limits = {
+        "WEB_INGEST_MAX_UPLOAD_BYTES": "536870912",
+        "WEB_INGEST_MAX_ZIP_ENTRIES": "2000",
+        "WEB_INGEST_MAX_EXTRACTED_BYTES": "2147483648",
+        "WEB_INGEST_MAX_ENTRY_BYTES": "536870912",
+        "WEB_INGEST_MAX_COMPRESSION_RATIO": "100",
+    }
+    for key, value in expected_limits.items():
+        assert f"{key}={value}" in env_template
+        assert f"{key}: ${{{key}:-{value}}}" in compose
+
+    assert "./.local:/app/.local" in compose
+    assert "client_max_body_size 512m;" in nginx

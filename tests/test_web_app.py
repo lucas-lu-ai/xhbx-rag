@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import logging
 
@@ -6,6 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from xhbx_rag.answer import IncompleteModelOutputError
+from xhbx_rag.web.ingestion_uploads import IngestionLimits
 import xhbx_rag.web.app as web_app
 
 
@@ -771,3 +773,173 @@ def test_cors_preflight_rejects_unlisted_origin() -> None:
 
     assert response.status_code == 400
     assert "access-control-allow-origin" not in response.headers
+
+
+class _LifecycleStore:
+    def __init__(self, events: list[str], name: str) -> None:
+        self.events = events
+        self.name = name
+
+    def recover_after_restart(self) -> None:
+        self.events.append(f"{self.name}.recover")
+
+
+class _LifecycleRunner:
+    def __init__(self, events: list[str], name: str) -> None:
+        self.events = events
+        self.name = name
+
+    def recover_after_restart(self) -> None:
+        self.events.append(f"{self.name}.recover")
+
+    def start(self) -> None:
+        self.events.append(f"{self.name}.start")
+
+    def stop(self) -> None:
+        self.events.append(f"{self.name}.stop")
+
+
+def test_lifespan_recovers_ingestion_before_start_and_stops_both() -> None:
+    events: list[str] = []
+    batch_store = _LifecycleStore(events, "batch")
+    batch_runner = _LifecycleRunner(events, "batch")
+    ingestion_store = object()
+    ingestion_runner = _LifecycleRunner(events, "ingestion")
+    app = web_app.create_app(
+        batch_store=batch_store,
+        batch_runner=batch_runner,
+        ingestion_store=ingestion_store,
+        ingestion_runner=ingestion_runner,
+    )
+
+    with TestClient(app) as client:
+        assert client.get("/api/status").status_code == 200
+        assert events[:4] == [
+            "batch.recover",
+            "batch.start",
+            "ingestion.recover",
+            "ingestion.start",
+        ]
+
+    assert events[-2:] == ["ingestion.stop", "batch.stop"]
+
+
+def test_lifespan_batch_failure_does_not_disable_ingestion() -> None:
+    events: list[str] = []
+
+    class FailingBatchStore:
+        def recover_after_restart(self) -> None:
+            raise RuntimeError("batch unavailable")
+
+    app = web_app.create_app(
+        batch_store=FailingBatchStore(),
+        batch_runner=_LifecycleRunner(events, "batch"),
+        ingestion_store=object(),
+        ingestion_runner=_LifecycleRunner(events, "ingestion"),
+    )
+
+    with TestClient(app):
+        assert app.state.batch_store is None
+        assert app.state.ingestion_store is not None
+        assert events == ["ingestion.recover", "ingestion.start"]
+
+    assert events[-1] == "ingestion.stop"
+
+
+def test_lifespan_ingestion_failure_does_not_disable_batch() -> None:
+    events: list[str] = []
+
+    class FailingIngestionRunner(_LifecycleRunner):
+        def recover_after_restart(self) -> None:
+            raise RuntimeError("ingestion unavailable")
+
+    app = web_app.create_app(
+        batch_store=_LifecycleStore(events, "batch"),
+        batch_runner=_LifecycleRunner(events, "batch"),
+        ingestion_store=object(),
+        ingestion_runner=FailingIngestionRunner(events, "ingestion"),
+    )
+
+    with TestClient(app):
+        assert app.state.batch_store is not None
+        assert app.state.ingestion_store is None
+        assert events[:2] == ["batch.recover", "batch.start"]
+
+    assert events[-1] == "batch.stop"
+
+
+def test_lifespan_stop_failures_are_isolated(caplog) -> None:
+    events: list[str] = []
+
+    class FailingBatchRunner(_LifecycleRunner):
+        def stop(self) -> None:
+            self.events.append("batch.stop")
+            raise RuntimeError("batch stop failed")
+
+    app = web_app.create_app(
+        batch_store=_LifecycleStore(events, "batch"),
+        batch_runner=FailingBatchRunner(events, "batch"),
+        ingestion_store=object(),
+        ingestion_runner=_LifecycleRunner(events, "ingestion"),
+    )
+
+    with TestClient(app):
+        pass
+
+    assert events[-2:] == ["ingestion.stop", "batch.stop"]
+    assert any(record.message == "批量执行 Runner 停止失败" for record in caplog.records)
+
+
+def test_production_ingestion_factory_is_lazy_and_selects_target_collection(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config_calls: list[str] = []
+    constructed: list[tuple[str, object]] = []
+    config = SimpleNamespace(
+        embedding_base_url="https://embedding.example/v1",
+        embedding_api_key="secret",
+        embedding_model_name="embed-model",
+        milvus_collection="case_collection",
+        milvus_course_collection="course_collection",
+    )
+
+    class FakeEmbeddingClient:
+        def __init__(self, **kwargs) -> None:
+            constructed.append(("embedding", kwargs))
+
+    class FakeAtomicIndexer:
+        def __init__(self, *, embedding_client, store) -> None:
+            self.embedding_client = embedding_client
+            self.store = store
+
+    def fake_config_from_env():
+        config_calls.append("config")
+        return config
+
+    def fake_create_milvus_store(selected_config, *, collection_name):
+        assert selected_config is config
+        store = SimpleNamespace(collection_name=collection_name)
+        constructed.append(("milvus", collection_name))
+        return store
+
+    monkeypatch.setattr(web_app.RetrievalConfig, "from_env", fake_config_from_env)
+    monkeypatch.setattr(web_app, "EmbeddingClient", FakeEmbeddingClient)
+    monkeypatch.setattr(web_app, "AtomicIndexer", FakeAtomicIndexer)
+    monkeypatch.setattr(web_app, "create_milvus_store", fake_create_milvus_store)
+
+    store = web_app.IngestionStore(
+        tmp_path / "ingestion.sqlite3", jobs_root=tmp_path / "jobs"
+    )
+    runner = web_app._build_ingestion_runner(store, IngestionLimits())
+
+    assert config_calls == []
+    case_indexer = runner.indexer_factory("case")
+    course_indexer = runner.indexer_factory("course")
+
+    assert config_calls == ["config", "config"]
+    assert case_indexer.store.collection_name == "case_collection"
+    assert course_indexer.store.collection_name == "course_collection"
+    assert [value for kind, value in constructed if kind == "milvus"] == [
+        "case_collection",
+        "course_collection",
+    ]
