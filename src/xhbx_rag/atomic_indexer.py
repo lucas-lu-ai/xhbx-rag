@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import errno
 import json
 import math
 import os
 import secrets
+import stat
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -535,19 +537,28 @@ def _validate_expected_identity(
 def _resolve_snapshot_path(
     journal_path: Path, journal: dict[str, Any]
 ) -> Path:
-    journal_dir = journal_path.resolve(strict=False).parent
+    journal_dir = journal_path.parent
     raw_path = Path(str(journal["snapshot_path"]))
     candidate = raw_path if raw_path.is_absolute() else journal_dir / raw_path
-    resolved = candidate.resolve(strict=False)
-    if resolved.parent != journal_dir:
-        raise AtomicIndexError("commit journal snapshot_path 必须位于 journal 目录")
-    return resolved
+    if candidate.parent != journal_dir or ".." in raw_path.parts:
+        raise UntrustedJournalError("commit journal snapshot_path 必须位于 journal 目录")
+    try:
+        metadata = candidate.lstat()
+    except OSError as exc:
+        if exc.errno in {errno.ENOENT, errno.ENOTDIR, errno.ELOOP}:
+            raise UntrustedJournalError("rollback snapshot 缺失或路径类型无效") from exc
+        raise AtomicIndexError("rollback snapshot 暂时无法检查") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise UntrustedJournalError("rollback snapshot 必须是常规非 symlink 文件")
+    return candidate
 
 
 def _read_snapshot(path: Path, journal: dict[str, Any]) -> list[dict[str, Any]]:
     try:
         payload = path.read_bytes()
     except OSError as exc:
+        if exc.errno in {errno.ENOENT, errno.ENOTDIR, errno.EISDIR, errno.ELOOP}:
+            raise UntrustedJournalError("rollback snapshot 缺失或路径类型无效") from exc
         raise AtomicIndexError("rollback snapshot 无法读取") from exc
     if len(payload) != journal["snapshot_size"] or not secrets.compare_digest(
         hashlib.sha256(payload).hexdigest(), journal["snapshot_sha256"]

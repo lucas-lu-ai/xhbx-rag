@@ -16,6 +16,7 @@ from xhbx_rag.atomic_indexer import (
     AtomicIndexer,
     AtomicJournalIdentity,
     RollbackPendingError,
+    UntrustedJournalError,
 )
 from xhbx_rag.chunk_io import chunk_text_hash
 from xhbx_rag.index_lock import _normalize_uri, collection_write_lock
@@ -1058,6 +1059,36 @@ def test_expected_owner_mismatch_is_rejected_before_any_store_write(tmp_path: Pa
     assert store.delete_calls == []
     assert store.upsert_calls == 0
     assert store.flush_calls == 0
+
+
+@pytest.mark.parametrize("kind", ["missing", "directory", "symlink"])
+def test_snapshot_local_type_failures_are_untrusted(
+    tmp_path: Path, kind: str
+) -> None:
+    store = FakeTransactionalStore(existing={})
+    journal = write_prepared_journal(
+        tmp_path / "rollback",
+        store=store,
+        chunk_ids=["new"],
+        old_rows=[],
+        collection_existed=True,
+    )
+    snapshot = journal.parent / "snapshot.jsonl"
+    snapshot.unlink()
+    if kind == "directory":
+        snapshot.mkdir()
+    elif kind == "symlink":
+        target = tmp_path / "foreign.snapshot"
+        target.write_bytes(b"")
+        snapshot.symlink_to(target)
+
+    with pytest.raises(UntrustedJournalError):
+        AtomicIndexer(
+            embedding_client=FakeEmbedding([]), store=store
+        ).inspect_journal_state(journal)
+
+    assert store.delete_calls == []
+    assert store.upsert_calls == 0
 
 
 @pytest.mark.parametrize("separator", ["\u2028", "\u2029"])

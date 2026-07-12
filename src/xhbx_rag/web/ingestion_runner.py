@@ -254,7 +254,8 @@ class IngestionRunner:
                 self.store.fail_job(job_id, code=code, detail=detail)
                 return
 
-            self._ensure_rolling_back(job_id, journal)
+            if state in {"prepared", "rolling_back"}:
+                self._ensure_rolling_back(job_id, journal)
             if not self._sleep(delay):
                 return
             delay = min(delay * 2.0, 60.0)
@@ -362,7 +363,10 @@ class IngestionRunner:
         except UntrustedJournalError:
             return
         except Exception:
-            self._ensure_rolling_back(job_id, journal)
+            if isinstance(exc, RollbackPendingError):
+                self._ensure_rolling_back(job_id, journal)
+            else:
+                self._put("recovery", job_id, priority=0)
             return
 
         if state == "committed":
@@ -654,7 +658,6 @@ class IngestionRunner:
             except _UntrustedRecoveryMaterial:
                 return "quarantined"
             except Exception:
-                self._ensure_rolling_back(action.job_id, journal)
                 return "recovery"
             if state == "committed":
                 self._reconcile_committed(action.job_id, journal)
