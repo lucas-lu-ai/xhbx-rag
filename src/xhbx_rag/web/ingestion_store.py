@@ -1,0 +1,1018 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+import uuid
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterator, Literal
+
+from xhbx_rag.web.ingestion_uploads import PreflightResult
+from xhbx_rag.web.source_paths import project_root_from_module
+
+
+_DEFAULT_DB_PATH = Path(".local/web_ingestion/ingestion.sqlite3")
+
+_PUBLIC_JOB_FIELDS = (
+    "job_id",
+    "source_name",
+    "source_kind",
+    "target",
+    "status",
+    "current_stage",
+    "attempt_count",
+    "item_total",
+    "item_done",
+    "document_total",
+    "chunk_total",
+    "ignored_total",
+    "warning_count",
+    "error_code",
+    "error_detail",
+    "created_at",
+    "updated_at",
+    "started_at",
+    "finished_at",
+)
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+@dataclass(frozen=True)
+class RecoveryAction:
+    job_id: str
+    action: Literal["enqueue", "fail_interrupted", "rollback", "finish_committed", "delete"]
+    journal_path: Path | None = None
+
+
+class IngestionStore:
+    def __init__(self, db_path: Path | None = None) -> None:
+        self.db_path = Path(db_path) if db_path is not None else _DEFAULT_DB_PATH
+        if db_path is None:
+            self.db_path = project_root_from_module() / self.db_path
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as connection:
+            connection.execute("PRAGMA journal_mode = WAL")
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS ingestion_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    source_name TEXT NOT NULL,
+                    source_kind TEXT NOT NULL CHECK (source_kind IN ('file', 'zip')),
+                    source_path TEXT NOT NULL,
+                    target TEXT NOT NULL CHECK (target IN ('case', 'course')),
+                    status TEXT NOT NULL CHECK (
+                        status IN (
+                            'draft', 'queued', 'running', 'rolling_back',
+                            'succeeded', 'failed', 'deleting'
+                        )
+                    ),
+                    current_stage TEXT NOT NULL CHECK (
+                        current_stage IN ('uploaded', 'parsing', 'chunking', 'indexing', 'completed')
+                    ),
+                    attempt_count INTEGER NOT NULL,
+                    item_total INTEGER NOT NULL,
+                    item_done INTEGER NOT NULL,
+                    document_total INTEGER NOT NULL,
+                    chunk_total INTEGER NOT NULL,
+                    ignored_total INTEGER NOT NULL,
+                    ignored_entries_json TEXT NOT NULL,
+                    warning_count INTEGER NOT NULL,
+                    error_code TEXT,
+                    error_detail TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    started_at TEXT,
+                    finished_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS ingestion_items (
+                    job_id TEXT NOT NULL REFERENCES ingestion_jobs(job_id) ON DELETE CASCADE,
+                    item_index INTEGER NOT NULL,
+                    unit_key TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    relative_paths_json TEXT NOT NULL,
+                    document_count INTEGER NOT NULL,
+                    status TEXT NOT NULL CHECK (
+                        status IN ('pending', 'running', 'succeeded', 'failed', 'skipped')
+                    ),
+                    current_stage TEXT NOT NULL,
+                    chunk_count INTEGER NOT NULL,
+                    warning_count INTEGER NOT NULL,
+                    error_detail TEXT,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (job_id, item_index)
+                );
+
+                CREATE TABLE IF NOT EXISTS ingestion_attempts (
+                    job_id TEXT NOT NULL REFERENCES ingestion_jobs(job_id) ON DELETE CASCADE,
+                    attempt_no INTEGER NOT NULL,
+                    status TEXT NOT NULL CHECK (
+                        status IN ('queued', 'running', 'succeeded', 'failed', 'rolling_back')
+                    ),
+                    current_stage TEXT NOT NULL,
+                    commit_state TEXT NOT NULL CHECK (
+                        commit_state IN (
+                            'not_started', 'prepared', 'committed', 'rolling_back', 'rolled_back'
+                        )
+                    ),
+                    workspace_path TEXT,
+                    journal_path TEXT,
+                    error_code TEXT,
+                    error_detail TEXT,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    PRIMARY KEY (job_id, attempt_no)
+                );
+
+                CREATE TABLE IF NOT EXISTS ingestion_events (
+                    job_id TEXT NOT NULL,
+                    attempt_no INTEGER NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (job_id, attempt_no, sequence),
+                    FOREIGN KEY (job_id, attempt_no)
+                        REFERENCES ingestion_attempts(job_id, attempt_no) ON DELETE CASCADE
+                );
+                """
+            )
+
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        connection = sqlite3.connect(self.db_path, timeout=5)
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("PRAGMA foreign_keys = ON")
+            yield connection
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def create_draft(self, *, preflight: PreflightResult, source_path: Path) -> dict[str, Any]:
+        job_id = uuid.uuid4().hex
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO ingestion_jobs (
+                    job_id, source_name, source_kind, source_path, target, status,
+                    current_stage, attempt_count, item_total, item_done, document_total,
+                    chunk_total, ignored_total, ignored_entries_json, warning_count,
+                    error_code, error_detail, created_at, updated_at, started_at, finished_at
+                ) VALUES (?, ?, ?, ?, ?, 'draft', 'uploaded', 0, ?, 0, ?, 0, ?, ?, 0,
+                          NULL, NULL, ?, ?, NULL, NULL)
+                """,
+                (
+                    job_id,
+                    preflight.source_name,
+                    preflight.source_kind,
+                    str(source_path.resolve()),
+                    preflight.target,
+                    len(preflight.items),
+                    preflight.document_total,
+                    preflight.ignored_total,
+                    json.dumps(preflight.ignored_entries, ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+            connection.executemany(
+                """
+                INSERT INTO ingestion_items (
+                    job_id, item_index, unit_key, display_name, relative_paths_json,
+                    document_count, status, current_stage, chunk_count, warning_count,
+                    error_detail, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', 'uploaded', 0, 0, NULL, ?)
+                """,
+                (
+                    (
+                        job_id,
+                        item.item_index,
+                        item.unit_key,
+                        item.display_name,
+                        json.dumps(item.relative_paths, ensure_ascii=False),
+                        item.document_count,
+                        now,
+                    )
+                    for item in preflight.items
+                ),
+            )
+        job = self.get_job(job_id)
+        assert job is not None
+        return job
+
+    def get_job(self, job_id: str, *, include_events: bool = True) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM ingestion_jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            result = self._public_job(row)
+            result["ignored_entries"] = json.loads(row["ignored_entries_json"])
+            result["items"] = self._items(connection, job_id)
+            result["attempt"] = self._current_attempt(connection, row, internal=False)
+            result["events"] = self._events(connection, job_id) if include_events else []
+            return result
+
+    def list_jobs(self, limit: int = 200) -> list[dict[str, Any]]:
+        safe_limit = max(0, min(int(limit), 200))
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM ingestion_jobs
+                ORDER BY created_at DESC, job_id DESC
+                LIMIT ?
+                """,
+                (safe_limit,),
+            ).fetchall()
+            return [self._public_job(row) for row in rows]
+
+    def get_job_for_execution(self, job_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM ingestion_jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            result = self._public_job(row)
+            result["source_path"] = Path(row["source_path"])
+            result["ignored_entries"] = json.loads(row["ignored_entries_json"])
+            result["items"] = self._items(connection, job_id)
+            result["attempt"] = self._current_attempt(connection, row, internal=True)
+            return result
+
+    def get_progress(self, job_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM ingestion_jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            active_item = connection.execute(
+                """
+                SELECT item_index FROM ingestion_items
+                WHERE job_id = ? AND status = 'running'
+                ORDER BY item_index LIMIT 1
+                """,
+                (job_id,),
+            ).fetchone()
+            message = connection.execute(
+                """
+                SELECT message FROM ingestion_events
+                WHERE job_id = ? AND attempt_no = ?
+                ORDER BY created_at DESC, sequence DESC LIMIT 1
+                """,
+                (job_id, row["attempt_count"]),
+            ).fetchone()
+            return {
+                "job_id": row["job_id"],
+                "status": row["status"],
+                "current_stage": row["current_stage"],
+                "attempt_no": row["attempt_count"] or None,
+                "item_total": row["item_total"],
+                "item_done": row["item_done"],
+                "document_total": row["document_total"],
+                "chunk_total": row["chunk_total"],
+                "warning_count": row["warning_count"],
+                "active_item_index": active_item["item_index"] if active_item else None,
+                "message": message["message"] if message else None,
+                "updated_at": row["updated_at"],
+            }
+
+    def start_job(self, job_id: str) -> str:
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE ingestion_jobs
+                SET status = 'queued', attempt_count = 1, updated_at = ?,
+                    error_code = NULL, error_detail = NULL, finished_at = NULL
+                WHERE job_id = ? AND status = 'draft'
+                """,
+                (now, job_id),
+            )
+            if cursor.rowcount != 1:
+                return "conflict"
+            connection.execute(
+                """
+                INSERT INTO ingestion_attempts (
+                    job_id, attempt_no, status, current_stage, commit_state,
+                    workspace_path, journal_path, error_code, error_detail,
+                    started_at, finished_at
+                ) VALUES (?, 1, 'queued', 'uploaded', 'not_started',
+                          NULL, NULL, NULL, NULL, NULL, NULL)
+                """,
+                (job_id,),
+            )
+        return "ok"
+
+    def claim_job(self, job_id: str) -> bool:
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE ingestion_jobs
+                SET status = 'running', started_at = COALESCE(started_at, ?), updated_at = ?
+                WHERE job_id = ? AND status = 'queued'
+                """,
+                (now, now, job_id),
+            )
+            return cursor.rowcount == 1
+
+    def begin_attempt(self, job_id: str, workspace_path: Path) -> int:
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT attempt_count FROM ingestion_jobs
+                WHERE job_id = ? AND status = 'running'
+                """,
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("任务不在可开始 attempt 的状态")
+            attempt_no = int(row["attempt_count"])
+            cursor = connection.execute(
+                """
+                UPDATE ingestion_attempts
+                SET status = 'running', workspace_path = ?, started_at = ?
+                WHERE job_id = ? AND attempt_no = ? AND status = 'queued'
+                """,
+                (str(workspace_path.resolve()), now, job_id, attempt_no),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("当前 attempt 不在 queued 状态")
+            self._append_event(
+                connection,
+                job_id,
+                attempt_no,
+                event_type="attempt_started",
+                message="任务开始执行",
+            )
+            return attempt_no
+
+    def mark_stage(self, job_id: str, stage: str, message: str) -> None:
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = self._active_attempt_row(connection, job_id)
+            if row is None:
+                return
+            connection.execute(
+                "UPDATE ingestion_jobs SET current_stage = ?, updated_at = ? WHERE job_id = ?",
+                (stage, now, job_id),
+            )
+            connection.execute(
+                """
+                UPDATE ingestion_attempts SET current_stage = ?
+                WHERE job_id = ? AND attempt_no = ?
+                """,
+                (stage, job_id, row["attempt_count"]),
+            )
+            self._append_event(
+                connection,
+                job_id,
+                row["attempt_count"],
+                event_type="stage_changed",
+                message=message,
+                payload={"stage": stage},
+            )
+
+    def mark_item_running(self, job_id: str, item_index: int, stage: str) -> bool:
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = self._active_attempt_row(connection, job_id)
+            if row is None:
+                return False
+            cursor = connection.execute(
+                """
+                UPDATE ingestion_items
+                SET status = 'running', current_stage = ?, updated_at = ?
+                WHERE job_id = ? AND item_index = ? AND status = 'pending'
+                """,
+                (stage, now, job_id, item_index),
+            )
+            if cursor.rowcount != 1:
+                return False
+            connection.execute(
+                "UPDATE ingestion_jobs SET current_stage = ?, updated_at = ? WHERE job_id = ?",
+                (stage, now, job_id),
+            )
+            connection.execute(
+                """
+                UPDATE ingestion_attempts SET current_stage = ?
+                WHERE job_id = ? AND attempt_no = ?
+                """,
+                (stage, job_id, row["attempt_count"]),
+            )
+            self._append_event(
+                connection,
+                job_id,
+                row["attempt_count"],
+                event_type="item_running",
+                message=f"开始处理输入项 {item_index}",
+                payload={"item_index": item_index, "stage": stage},
+            )
+            return True
+
+    def complete_item(
+        self, job_id: str, item_index: int, chunk_count: int, warning_count: int
+    ) -> None:
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = self._active_attempt_row(connection, job_id)
+            if row is None:
+                return
+            cursor = connection.execute(
+                """
+                UPDATE ingestion_items
+                SET status = 'succeeded', chunk_count = ?, warning_count = ?, updated_at = ?
+                WHERE job_id = ? AND item_index = ? AND status = 'running'
+                """,
+                (chunk_count, warning_count, now, job_id, item_index),
+            )
+            if cursor.rowcount != 1:
+                return
+            connection.execute(
+                """
+                UPDATE ingestion_jobs
+                SET item_done = item_done + 1, chunk_total = chunk_total + ?,
+                    warning_count = warning_count + ?, updated_at = ?
+                WHERE job_id = ?
+                """,
+                (chunk_count, warning_count, now, job_id),
+            )
+            self._append_event(
+                connection,
+                job_id,
+                row["attempt_count"],
+                event_type="item_completed",
+                message=f"输入项 {item_index} 处理完成",
+                payload={
+                    "item_index": item_index,
+                    "chunk_count": chunk_count,
+                    "warning_count": warning_count,
+                },
+            )
+
+    def fail_item(self, job_id: str, item_index: int, detail: str) -> None:
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = self._active_attempt_row(connection, job_id)
+            if row is None:
+                return
+            cursor = connection.execute(
+                """
+                UPDATE ingestion_items
+                SET status = 'failed', error_detail = ?, updated_at = ?
+                WHERE job_id = ? AND item_index = ? AND status IN ('pending', 'running')
+                """,
+                (detail, now, job_id, item_index),
+            )
+            if cursor.rowcount != 1:
+                return
+            self._append_event(
+                connection,
+                job_id,
+                row["attempt_count"],
+                event_type="item_failed",
+                message=detail,
+                payload={"item_index": item_index},
+            )
+
+    def mark_commit_state(
+        self, job_id: str, state: str, journal_path: Path | None = None
+    ) -> None:
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = self._active_attempt_row(connection, job_id)
+            if row is None:
+                return
+            resolved_journal = str(journal_path.resolve()) if journal_path is not None else None
+            connection.execute(
+                """
+                UPDATE ingestion_attempts
+                SET commit_state = ?, journal_path = COALESCE(?, journal_path)
+                WHERE job_id = ? AND attempt_no = ?
+                """,
+                (state, resolved_journal, job_id, row["attempt_count"]),
+            )
+            connection.execute(
+                "UPDATE ingestion_jobs SET updated_at = ? WHERE job_id = ?", (now, job_id)
+            )
+            self._append_event(
+                connection,
+                job_id,
+                row["attempt_count"],
+                event_type="commit_state_changed",
+                message=f"提交状态更新为 {state}",
+                payload={"commit_state": state},
+            )
+
+    def succeed_job(self, job_id: str, chunk_total: int, warning_count: int) -> None:
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = self._active_attempt_row(connection, job_id)
+            if row is None:
+                return
+            connection.execute(
+                """
+                UPDATE ingestion_jobs
+                SET status = 'succeeded', current_stage = 'completed', item_done = item_total,
+                    chunk_total = ?, warning_count = ?, error_code = NULL, error_detail = NULL,
+                    updated_at = ?, finished_at = ?
+                WHERE job_id = ?
+                """,
+                (chunk_total, warning_count, now, now, job_id),
+            )
+            connection.execute(
+                """
+                UPDATE ingestion_attempts
+                SET status = 'succeeded', current_stage = 'completed', finished_at = ?
+                WHERE job_id = ? AND attempt_no = ?
+                """,
+                (now, job_id, row["attempt_count"]),
+            )
+            self._append_event(
+                connection,
+                job_id,
+                row["attempt_count"],
+                event_type="job_succeeded",
+                message="任务执行成功",
+                payload={"chunk_total": chunk_total, "warning_count": warning_count},
+            )
+
+    def mark_rolling_back(self, job_id: str, *, code: str, detail: str) -> None:
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = self._active_attempt_row(connection, job_id)
+            if row is None:
+                return
+            connection.execute(
+                """
+                UPDATE ingestion_jobs
+                SET status = 'rolling_back', error_code = ?, error_detail = ?, updated_at = ?
+                WHERE job_id = ?
+                """,
+                (code, detail, now, job_id),
+            )
+            connection.execute(
+                """
+                UPDATE ingestion_attempts
+                SET status = 'rolling_back', commit_state = 'rolling_back',
+                    error_code = ?, error_detail = ?
+                WHERE job_id = ? AND attempt_no = ?
+                """,
+                (code, detail, job_id, row["attempt_count"]),
+            )
+            self._append_event(
+                connection,
+                job_id,
+                row["attempt_count"],
+                event_type="rollback_started",
+                message=detail,
+            )
+
+    def fail_job(self, job_id: str, *, code: str, detail: str) -> None:
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT attempt_count FROM ingestion_jobs
+                WHERE job_id = ? AND status IN ('running', 'rolling_back')
+                """,
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                return
+            connection.execute(
+                """
+                UPDATE ingestion_jobs
+                SET status = 'failed', error_code = ?, error_detail = ?,
+                    updated_at = ?, finished_at = ?
+                WHERE job_id = ?
+                """,
+                (code, detail, now, now, job_id),
+            )
+            if row["attempt_count"]:
+                connection.execute(
+                    """
+                    UPDATE ingestion_attempts
+                    SET status = 'failed', error_code = ?, error_detail = ?, finished_at = ?
+                    WHERE job_id = ? AND attempt_no = ?
+                    """,
+                    (code, detail, now, job_id, row["attempt_count"]),
+                )
+                self._append_event(
+                    connection,
+                    job_id,
+                    row["attempt_count"],
+                    event_type="job_failed",
+                    message=detail,
+                    payload={"error_code": code},
+                )
+
+    def retry_job(self, job_id: str) -> dict[str, object]:
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT attempt_count FROM ingestion_jobs WHERE job_id = ? AND status = 'failed'",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                return {"result": "conflict"}
+            attempt_no = int(row["attempt_count"]) + 1
+            connection.execute(
+                """
+                UPDATE ingestion_jobs
+                SET status = 'queued', current_stage = 'uploaded', attempt_count = ?,
+                    item_done = 0, chunk_total = 0, warning_count = 0,
+                    error_code = NULL, error_detail = NULL, updated_at = ?,
+                    started_at = NULL, finished_at = NULL
+                WHERE job_id = ?
+                """,
+                (attempt_no, now, job_id),
+            )
+            connection.execute(
+                """
+                UPDATE ingestion_items
+                SET status = 'pending', current_stage = 'uploaded', chunk_count = 0,
+                    warning_count = 0, error_detail = NULL, updated_at = ?
+                WHERE job_id = ?
+                """,
+                (now, job_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO ingestion_attempts (
+                    job_id, attempt_no, status, current_stage, commit_state,
+                    workspace_path, journal_path, error_code, error_detail,
+                    started_at, finished_at
+                ) VALUES (?, ?, 'queued', 'uploaded', 'not_started',
+                          NULL, NULL, NULL, NULL, NULL, NULL)
+                """,
+                (job_id, attempt_no),
+            )
+        return {"result": "ok", "attempt_no": attempt_no}
+
+    def abort_retry(self, job_id: str, attempt_no: int, detail: str) -> None:
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT attempt_count FROM ingestion_jobs
+                WHERE job_id = ? AND status = 'queued' AND attempt_count = ?
+                """,
+                (job_id, attempt_no),
+            ).fetchone()
+            if row is None:
+                return
+            cursor = connection.execute(
+                """
+                DELETE FROM ingestion_attempts
+                WHERE job_id = ? AND attempt_no = ? AND status = 'queued'
+                """,
+                (job_id, attempt_no),
+            )
+            if cursor.rowcount != 1:
+                return
+            previous_attempt = attempt_no - 1
+            connection.execute(
+                """
+                UPDATE ingestion_jobs
+                SET status = 'failed', attempt_count = ?, error_code = 'storage_unavailable',
+                    error_detail = ?, updated_at = ?, finished_at = ?
+                WHERE job_id = ?
+                """,
+                (previous_attempt, detail, now, now, job_id),
+            )
+            if previous_attempt > 0:
+                self._append_event(
+                    connection,
+                    job_id,
+                    previous_attempt,
+                    event_type="retry_aborted",
+                    message=detail,
+                )
+
+    def begin_delete(self, job_id: str) -> str:
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT status FROM ingestion_jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                return "not_found"
+            if row["status"] == "deleting":
+                return "ok"
+            if row["status"] not in ("draft", "succeeded", "failed"):
+                return "conflict"
+            connection.execute(
+                "UPDATE ingestion_jobs SET status = 'deleting', updated_at = ? WHERE job_id = ?",
+                (now, job_id),
+            )
+        return "ok"
+
+    def finish_delete(self, job_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "DELETE FROM ingestion_jobs WHERE job_id = ? AND status = 'deleting'", (job_id,)
+            )
+
+    def recovery_actions(self) -> list[RecoveryAction]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT j.job_id, j.status, a.commit_state, a.journal_path
+                FROM ingestion_jobs AS j
+                LEFT JOIN ingestion_attempts AS a
+                    ON a.job_id = j.job_id AND a.attempt_no = j.attempt_count
+                WHERE j.status IN ('queued', 'running', 'rolling_back', 'deleting')
+                ORDER BY j.created_at, j.job_id
+                """
+            ).fetchall()
+
+        actions: list[RecoveryAction] = []
+        for row in rows:
+            status = row["status"]
+            commit_state = row["commit_state"]
+            journal_path = Path(row["journal_path"]) if row["journal_path"] else None
+            if status == "queued":
+                action = "enqueue"
+                journal_path = None
+            elif status == "deleting":
+                action = "delete"
+                journal_path = None
+            elif commit_state == "committed":
+                action = "finish_committed"
+            elif commit_state in ("prepared", "rolling_back"):
+                action = "rollback"
+            else:
+                action = "fail_interrupted"
+                journal_path = None
+            actions.append(
+                RecoveryAction(job_id=row["job_id"], action=action, journal_path=journal_path)
+            )
+        return actions
+
+    @staticmethod
+    def _public_job(row: sqlite3.Row) -> dict[str, Any]:
+        return {field: row[field] for field in _PUBLIC_JOB_FIELDS}
+
+    @staticmethod
+    def _items(connection: sqlite3.Connection, job_id: str) -> list[dict[str, Any]]:
+        rows = connection.execute(
+            "SELECT * FROM ingestion_items WHERE job_id = ? ORDER BY item_index", (job_id,)
+        ).fetchall()
+        return [
+            {
+                "item_index": row["item_index"],
+                "unit_key": row["unit_key"],
+                "display_name": row["display_name"],
+                "relative_paths": json.loads(row["relative_paths_json"]),
+                "document_count": row["document_count"],
+                "status": row["status"],
+                "current_stage": row["current_stage"],
+                "chunk_count": row["chunk_count"],
+                "warning_count": row["warning_count"],
+                "error_detail": row["error_detail"],
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
+
+    @staticmethod
+    def _current_attempt(
+        connection: sqlite3.Connection, row: sqlite3.Row, *, internal: bool
+    ) -> dict[str, Any] | None:
+        attempt_count = int(row["attempt_count"])
+        if attempt_count == 0:
+            return None
+        attempt = connection.execute(
+            """
+            SELECT * FROM ingestion_attempts
+            WHERE job_id = ? AND attempt_no = ?
+            """,
+            (row["job_id"], attempt_count),
+        ).fetchone()
+        if attempt is None:
+            return None
+        fields = [
+            "attempt_no",
+            "status",
+            "current_stage",
+            "commit_state",
+            "error_code",
+            "error_detail",
+            "started_at",
+            "finished_at",
+        ]
+        if internal:
+            fields.extend(("workspace_path", "journal_path"))
+        result = {field: attempt[field] for field in fields}
+        if internal:
+            for path_field in ("workspace_path", "journal_path"):
+                if result[path_field] is not None:
+                    result[path_field] = Path(result[path_field])
+        return result
+
+    @staticmethod
+    def _active_attempt_row(
+        connection: sqlite3.Connection, job_id: str
+    ) -> sqlite3.Row | None:
+        return connection.execute(
+            """
+            SELECT attempt_count FROM ingestion_jobs
+            WHERE job_id = ? AND status IN ('running', 'rolling_back')
+            """,
+            (job_id,),
+        ).fetchone()
+
+    @staticmethod
+    def _append_event(
+        connection: sqlite3.Connection,
+        job_id: str,
+        attempt_no: int,
+        *,
+        event_type: str,
+        message: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        event_count = connection.execute(
+            """
+            SELECT COUNT(*) AS event_count FROM ingestion_events
+            WHERE job_id = ? AND attempt_no = ?
+            """,
+            (job_id, attempt_no),
+        ).fetchone()["event_count"]
+        compactable_types = ("item_running", "item_completed")
+        if event_count >= 2_000 and event_type in compactable_types:
+            compacted = connection.execute(
+                """
+                SELECT sequence, payload_json FROM ingestion_events
+                WHERE job_id = ? AND attempt_no = ? AND event_type = 'progress_compacted'
+                ORDER BY sequence DESC LIMIT 1
+                """,
+                (job_id, attempt_no),
+            ).fetchone()
+            compacted_payload: dict[str, Any]
+            if compacted is not None:
+                compacted_payload = json.loads(compacted["payload_json"])
+                compacted_payload["compacted_count"] = (
+                    int(compacted_payload.get("compacted_count", 1)) + 1
+                )
+                compacted_payload["latest_event_type"] = event_type
+                compacted_payload["latest_payload"] = payload or {}
+                connection.execute(
+                    """
+                    UPDATE ingestion_events
+                    SET message = ?, payload_json = ?, created_at = ?
+                    WHERE job_id = ? AND attempt_no = ? AND sequence = ?
+                    """,
+                    (
+                        message,
+                        json.dumps(compacted_payload, ensure_ascii=False),
+                        _utc_now(),
+                        job_id,
+                        attempt_no,
+                        compacted["sequence"],
+                    ),
+                )
+                return
+            replaceable = connection.execute(
+                """
+                SELECT sequence FROM ingestion_events
+                WHERE job_id = ? AND attempt_no = ?
+                  AND event_type IN ('item_running', 'item_completed')
+                ORDER BY sequence DESC LIMIT 1
+                """,
+                (job_id, attempt_no),
+            ).fetchone()
+            if replaceable is not None:
+                compacted_payload = {
+                    "compacted_count": 2,
+                    "latest_event_type": event_type,
+                    "latest_payload": payload or {},
+                }
+                connection.execute(
+                    """
+                    UPDATE ingestion_events
+                    SET event_type = 'progress_compacted', message = ?,
+                        payload_json = ?, created_at = ?
+                    WHERE job_id = ? AND attempt_no = ? AND sequence = ?
+                    """,
+                    (
+                        message,
+                        json.dumps(compacted_payload, ensure_ascii=False),
+                        _utc_now(),
+                        job_id,
+                        attempt_no,
+                        replaceable["sequence"],
+                    ),
+                )
+                return
+
+        if event_count >= 2_000:
+            disposable = connection.execute(
+                """
+                SELECT sequence FROM ingestion_events
+                WHERE job_id = ? AND attempt_no = ?
+                  AND event_type IN ('item_running', 'item_completed', 'progress_compacted')
+                ORDER BY sequence LIMIT 1
+                """,
+                (job_id, attempt_no),
+            ).fetchone()
+            if disposable is None:
+                disposable = connection.execute(
+                    """
+                    SELECT sequence FROM ingestion_events
+                    WHERE job_id = ? AND attempt_no = ?
+                    ORDER BY sequence LIMIT 1
+                    """,
+                    (job_id, attempt_no),
+                ).fetchone()
+            if disposable is not None:
+                connection.execute(
+                    """
+                    DELETE FROM ingestion_events
+                    WHERE job_id = ? AND attempt_no = ? AND sequence = ?
+                    """,
+                    (job_id, attempt_no, disposable["sequence"]),
+                )
+
+        sequence = connection.execute(
+            """
+            SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence
+            FROM ingestion_events WHERE job_id = ? AND attempt_no = ?
+            """,
+            (job_id, attempt_no),
+        ).fetchone()["next_sequence"]
+        connection.execute(
+            """
+            INSERT INTO ingestion_events (
+                job_id, attempt_no, sequence, event_type, message, payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                job_id,
+                attempt_no,
+                sequence,
+                event_type,
+                message,
+                json.dumps(payload or {}, ensure_ascii=False),
+                _utc_now(),
+            ),
+        )
+
+    @staticmethod
+    def _events(connection: sqlite3.Connection, job_id: str) -> list[dict[str, Any]]:
+        rows = connection.execute(
+            """
+            SELECT * FROM (
+                SELECT attempt_no, sequence, event_type, message, payload_json, created_at
+                FROM ingestion_events
+                WHERE job_id = ?
+                ORDER BY created_at DESC, attempt_no DESC, sequence DESC
+                LIMIT 200
+            )
+            ORDER BY created_at, attempt_no, sequence
+            """,
+            (job_id,),
+        ).fetchall()
+        return [
+            {
+                "attempt_no": row["attempt_no"],
+                "sequence": row["sequence"],
+                "event_type": row["event_type"],
+                "message": row["message"],
+                "payload": json.loads(row["payload_json"]),
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
