@@ -10,6 +10,12 @@ import type {
   BatchRunProgress,
   BatchRunSummary,
   CreateBatchRunRequest,
+  IngestionDeleteResponse,
+  IngestionJobDetail,
+  IngestionJobListResponse,
+  IngestionJobProgress,
+  IngestionRetryResponse,
+  IngestionStartResponse,
   OkResponse,
   RevealRequest,
   RevealResponse,
@@ -246,6 +252,71 @@ export function saveBatchRowBadCase(
       method: "POST",
       body: JSON.stringify(request)
     },
+    options
+  );
+}
+
+export function listIngestionJobs(
+  options: ApiOptions = {}
+): Promise<IngestionJobListResponse> {
+  return requestJson<IngestionJobListResponse>(
+    "/api/ingestion-jobs",
+    { method: "GET" },
+    options
+  );
+}
+
+export function getIngestionJob(
+  jobId: string,
+  options: ApiOptions = {}
+): Promise<IngestionJobDetail> {
+  return requestJson<IngestionJobDetail>(
+    `/api/ingestion-jobs/${encodeURIComponent(jobId)}`,
+    { method: "GET" },
+    options
+  );
+}
+
+export function getIngestionJobProgress(
+  jobId: string,
+  options: ApiOptions = {}
+): Promise<IngestionJobProgress> {
+  return requestJson<IngestionJobProgress>(
+    `/api/ingestion-jobs/${encodeURIComponent(jobId)}/progress`,
+    { method: "GET" },
+    options
+  );
+}
+
+export function startIngestionJob(
+  jobId: string,
+  options: ApiOptions = {}
+): Promise<IngestionStartResponse> {
+  return requestJson<IngestionStartResponse>(
+    `/api/ingestion-jobs/${encodeURIComponent(jobId)}/start`,
+    { method: "POST" },
+    options
+  );
+}
+
+export function retryIngestionJob(
+  jobId: string,
+  options: ApiOptions = {}
+): Promise<IngestionRetryResponse> {
+  return requestJson<IngestionRetryResponse>(
+    `/api/ingestion-jobs/${encodeURIComponent(jobId)}/retry`,
+    { method: "POST" },
+    options
+  );
+}
+
+export function deleteIngestionJob(
+  jobId: string,
+  options: ApiOptions = {}
+): Promise<IngestionDeleteResponse> {
+  return requestJson<IngestionDeleteResponse>(
+    `/api/ingestion-jobs/${encodeURIComponent(jobId)}`,
+    { method: "DELETE" },
     options
   );
 }

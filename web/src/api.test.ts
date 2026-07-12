@@ -3,21 +3,30 @@ import {
   answerQuestionStream,
   createBatchRun,
   deleteBatchRun,
+  deleteIngestionJob,
   getBatchRunDetail,
   getBatchRunProgress,
+  getIngestionJob,
+  getIngestionJobProgress,
   getStatus,
+  listIngestionJobs,
   listBatchRuns,
   resumeBatchRun,
   retryBatchRow,
+  retryIngestionJob,
   revealSource,
   saveBatchRowBadCase,
+  startIngestionJob,
   submitBadCase
 } from "./api";
 import type {
   AnswerStreamEvent,
   BadCaseRequest,
   BatchRowBadCaseRequest,
-  CreateBatchRunRequest
+  CreateBatchRunRequest,
+  IngestionJobDetail,
+  IngestionJobProgress,
+  IngestionJobSummary
 } from "./types";
 
 function jsonResponse(body: unknown, init: ResponseInit = {}): Response {
@@ -36,6 +45,84 @@ function sseResponse(events: Array<{ event: string; data: unknown }>): Response 
     status: 200,
     headers: { "Content-Type": "text/event-stream" }
   });
+}
+
+function ingestionDraftPayload(
+  overrides: Partial<IngestionJobDetail> = {}
+): IngestionJobDetail {
+  return {
+    job_id: "job-1",
+    source_name: "course.txt",
+    source_kind: "file",
+    target: "course",
+    status: "draft",
+    current_stage: "uploaded",
+    attempt_count: 0,
+    item_total: 1,
+    item_done: 0,
+    document_total: 1,
+    chunk_total: 0,
+    ignored_total: 0,
+    warning_count: 0,
+    error_code: null,
+    error_detail: null,
+    created_at: "2026-07-12T08:00:00+00:00",
+    updated_at: "2026-07-12T08:00:00+00:00",
+    started_at: null,
+    finished_at: null,
+    ignored_entries: [],
+    items: [
+      {
+        item_index: 1,
+        unit_key: "course.txt",
+        display_name: "course",
+        relative_paths: ["course.txt"],
+        document_count: 1,
+        status: "pending",
+        current_stage: "uploaded",
+        chunk_count: 0,
+        warning_count: 0,
+        error_detail: null,
+        updated_at: "2026-07-12T08:00:00+00:00"
+      }
+    ],
+    attempt: null,
+    events: [],
+    ...overrides
+  };
+}
+
+function ingestionSummary(
+  overrides: Partial<IngestionJobSummary> = {}
+): IngestionJobSummary {
+  const {
+    ignored_entries: _ignoredEntries,
+    items: _items,
+    attempt: _attempt,
+    events: _events,
+    ...summary
+  } = ingestionDraftPayload(overrides);
+  return summary;
+}
+
+function progressPayload(
+  overrides: Partial<IngestionJobProgress> = {}
+): IngestionJobProgress {
+  return {
+    job_id: "job-1",
+    status: "running",
+    current_stage: "parsing",
+    attempt_no: 1,
+    item_total: 1,
+    item_done: 0,
+    document_total: 1,
+    chunk_total: 0,
+    warning_count: 0,
+    active_item_index: 1,
+    message: "正在解析文档",
+    updated_at: "2026-07-12T08:01:00+00:00",
+    ...overrides
+  };
 }
 
 test("getStatus calls status endpoint", async () => {
@@ -395,6 +482,95 @@ test("batch api errors expose backend detail", async () => {
   ).rejects.toMatchObject({
     status: 404,
     detail: "批量会话不存在"
+  });
+});
+
+test("listIngestionJobs gets typed job summaries", async () => {
+  const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    expect(input).toBe("/api/ingestion-jobs");
+    expect(init?.method).toBe("GET");
+    return jsonResponse({ jobs: [ingestionSummary()] });
+  });
+
+  const result = await listIngestionJobs({ fetcher });
+
+  expect(result.jobs[0]?.status).toBe("draft");
+});
+
+test("getIngestionJob encodes the job ID and returns detail", async () => {
+  const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    expect(input).toBe("/api/ingestion-jobs/job%2Fwith%20space%3F");
+    expect(init?.method).toBe("GET");
+    return jsonResponse(ingestionDraftPayload({ job_id: "job/with space?" }));
+  });
+
+  const result = await getIngestionJob("job/with space?", { fetcher });
+
+  expect(result.items[0]?.display_name).toBe("course");
+});
+
+test("getIngestionJobProgress gets the lightweight progress response", async () => {
+  const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    expect(input).toBe("/api/ingestion-jobs/job-1/progress");
+    expect(init?.method).toBe("GET");
+    return jsonResponse(progressPayload());
+  });
+
+  const result = await getIngestionJobProgress("job-1", { fetcher });
+
+  expect(result.current_stage).toBe("parsing");
+});
+
+test("startIngestionJob posts to the encoded start endpoint", async () => {
+  const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    expect(input).toBe("/api/ingestion-jobs/job%2F1/start");
+    expect(init?.method).toBe("POST");
+    return jsonResponse({ ok: true, job_id: "job/1", status: "queued" });
+  });
+
+  const result = await startIngestionJob("job/1", { fetcher });
+
+  expect(result).toEqual({ ok: true, job_id: "job/1", status: "queued" });
+});
+
+test("retryIngestionJob returns the reserved attempt", async () => {
+  const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    expect(input).toBe("/api/ingestion-jobs/job-1/retry");
+    expect(init?.method).toBe("POST");
+    return jsonResponse({
+      ok: true,
+      job_id: "job-1",
+      attempt_no: 2,
+      status: "queued"
+    });
+  });
+
+  const result = await retryIngestionJob("job-1", { fetcher });
+
+  expect(result.attempt_no).toBe(2);
+});
+
+test("deleteIngestionJob issues DELETE and surfaces backend detail", async () => {
+  const okFetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    expect(input).toBe("/api/ingestion-jobs/job-1");
+    expect(init?.method).toBe("DELETE");
+    return jsonResponse({ ok: true, job_id: "job-1", status: "deleted" });
+  });
+
+  await expect(deleteIngestionJob("job-1", { fetcher: okFetcher })).resolves.toEqual({
+    ok: true,
+    job_id: "job-1",
+    status: "deleted"
+  });
+
+  const conflictFetcher = vi.fn(async () =>
+    jsonResponse({ detail: "当前任务状态不允许此操作" }, { status: 409 })
+  );
+  await expect(
+    deleteIngestionJob("job-1", { fetcher: conflictFetcher })
+  ).rejects.toMatchObject({
+    status: 409,
+    detail: "当前任务状态不允许此操作"
   });
 });
 

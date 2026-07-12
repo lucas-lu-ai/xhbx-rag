@@ -330,6 +330,145 @@ export type OkResponse = {
   ok: boolean;
 };
 
+export type IngestionTarget = "case" | "course";
+
+export type IngestionSourceKind = "file" | "zip";
+
+export type IngestionJobStatus =
+  | "draft"
+  | "queued"
+  | "running"
+  | "rolling_back"
+  | "succeeded"
+  | "failed"
+  | "deleting";
+
+export type IngestionStage =
+  | "uploaded"
+  | "parsing"
+  | "chunking"
+  | "indexing"
+  | "completed";
+
+export type IngestionItemStatus =
+  | "pending"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "skipped";
+
+export type IngestionAttemptStatus =
+  | "queued"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "rolling_back";
+
+export type IngestionCommitState =
+  | "not_started"
+  | "prepared"
+  | "committed"
+  | "rolling_back"
+  | "rolled_back";
+
+export type IngestionPreflightItem = {
+  item_index: number;
+  unit_key: string;
+  display_name: string;
+  relative_paths: string[];
+  document_count: number;
+  status: IngestionItemStatus;
+  current_stage: IngestionStage;
+  chunk_count: number;
+  warning_count: number;
+  error_detail: string | null;
+  updated_at: string;
+};
+
+export type IngestionJobSummary = {
+  job_id: string;
+  source_name: string;
+  source_kind: IngestionSourceKind;
+  target: IngestionTarget;
+  status: IngestionJobStatus;
+  current_stage: IngestionStage;
+  attempt_count: number;
+  item_total: number;
+  item_done: number;
+  document_total: number;
+  chunk_total: number;
+  ignored_total: number;
+  warning_count: number;
+  error_code: string | null;
+  error_detail: string | null;
+  created_at: string;
+  updated_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+};
+
+export type IngestionAttempt = {
+  attempt_no: number;
+  status: IngestionAttemptStatus;
+  current_stage: IngestionStage;
+  commit_state: IngestionCommitState;
+  error_code: string | null;
+  error_detail: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+};
+
+export type IngestionEvent = {
+  attempt_no: number;
+  sequence: number;
+  event_type: string;
+  message: string;
+  payload: Record<string, unknown>;
+  created_at: string;
+};
+
+export type IngestionJobDetail = IngestionJobSummary & {
+  ignored_entries: string[];
+  items: IngestionPreflightItem[];
+  attempt: IngestionAttempt | null;
+  events: IngestionEvent[];
+};
+
+export type IngestionJobProgress = {
+  job_id: string;
+  status: IngestionJobStatus;
+  current_stage: IngestionStage;
+  attempt_no: number | null;
+  item_total: number;
+  item_done: number;
+  document_total: number;
+  chunk_total: number;
+  warning_count: number;
+  active_item_index: number | null;
+  message: string | null;
+  updated_at: string;
+};
+
+export type IngestionJobListResponse = {
+  jobs: IngestionJobSummary[];
+};
+
+export type IngestionStartResponse = {
+  ok: boolean;
+  job_id: string;
+  status: "queued";
+};
+
+export type IngestionRetryResponse = IngestionStartResponse & {
+  attempt_no: number;
+};
+
+export type IngestionDeleteResponse = {
+  ok: boolean;
+  job_id: string;
+  status: "deleted";
+};
+
 export type SessionSelection = {
   kind: "chat" | "batch";
   id: string;
