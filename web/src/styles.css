@@ -2426,7 +2426,7 @@ progress { width: 100%; height: 10px; accent-color: var(--color-accent); }
 .ingestion-dialog-actions { display: flex; justify-content: flex-end; gap: 10px; }
 .ingestion-dialog-actions button { min-height: 44px; }
 
-@media (max-width: 1179px) {
+@media (max-width: 1180px) {
   .ingestion-shell {
     grid-template-columns: minmax(230px, 270px) minmax(0, 1fr);
     grid-template-areas: "sidebar main" "sidebar detail";
@@ -2452,7 +2452,7 @@ progress { width: 100%; height: 10px; accent-color: var(--color-accent); }
   .ingestion-detail-scroll { overflow: visible; }
 }
 
-@media (max-width: 767px) {
+@media (max-width: 768px) {
   .ingestion-shell {
     grid-template-columns: minmax(0, 1fr);
     grid-template-areas: "sidebar" "main" "detail";
