@@ -9,7 +9,7 @@ from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 from .chunk_io import chunk_text_hash, load_chunks_jsonl
 from .index_lock import _normalize_uri, collection_write_lock
@@ -189,6 +189,34 @@ class AtomicIndexer:
             raise
         except Exception as exc:
             raise AtomicIndexError("知识库恢复失败") from exc
+
+    def inspect_journal_state(
+        self, journal_path: Path
+    ) -> Literal["prepared", "committed", "rolling_back", "rolled_back"]:
+        """只读校验恢复材料，并返回 durable journal 状态。"""
+        journal_path = Path(journal_path)
+        try:
+            with _collection_write_context(self.store):
+                journal = _read_journal(journal_path)
+                _validate_journal(journal, self.store)
+                state = str(journal["state"])
+                if state == "committed":
+                    chunk_ids = list(journal["chunk_ids"])
+                    actual_ids = set(self.store.fetch_raw_rows_by_ids(chunk_ids))
+                    if actual_ids != set(chunk_ids):
+                        raise AtomicIndexError("committed journal 的 ID 集合校验失败")
+                elif state in {"prepared", "rolling_back"}:
+                    snapshot_path = _resolve_snapshot_path(journal_path, journal)
+                    old_rows = _read_snapshot(snapshot_path, journal)
+                    _validate_snapshot(old_rows, journal)
+                return cast(
+                    Literal["prepared", "committed", "rolling_back", "rolled_back"],
+                    state,
+                )
+        except AtomicIndexError:
+            raise
+        except Exception as exc:
+            raise AtomicIndexError("commit journal 状态检查失败") from exc
 
     def _rollback(
         self,

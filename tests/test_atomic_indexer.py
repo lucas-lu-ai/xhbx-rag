@@ -960,6 +960,77 @@ def test_recover_prepared_journal_rolls_back(tmp_path: Path) -> None:
     assert read_journal(journal.parent)["state"] == "rolled_back"
 
 
+def test_inspect_journal_state_validates_prepared_snapshot_without_writing(
+    tmp_path: Path,
+) -> None:
+    old = raw_row("same", "旧文本", [0.1, 0.2])
+    store = FakeTransactionalStore(existing={"same": raw_row("same", "新文本", [0.9, 0.8])})
+    journal = write_prepared_journal(
+        tmp_path / "rollback",
+        store=store,
+        chunk_ids=["same"],
+        old_rows=[old],
+        collection_existed=True,
+    )
+    indexer = AtomicIndexer(embedding_client=FakeEmbedding([]), store=store)
+
+    assert indexer.inspect_journal_state(journal) == "prepared"
+    assert store.delete_calls == []
+    assert store.upsert_calls == 0
+    assert store.flush_calls == 0
+
+    (journal.parent / "snapshot.jsonl").write_text("损坏快照\n", encoding="utf-8")
+    with pytest.raises(AtomicIndexError, match="snapshot"):
+        indexer.inspect_journal_state(journal)
+
+
+def test_inspect_committed_journal_verifies_durable_ids(tmp_path: Path) -> None:
+    current = raw_row("new", "新文本", [0.9, 0.8])
+    store = FakeTransactionalStore(existing={"new": current})
+    journal = write_prepared_journal(
+        tmp_path / "rollback",
+        store=store,
+        chunk_ids=["new"],
+        old_rows=[],
+        collection_existed=True,
+        state="committed",
+    )
+    indexer = AtomicIndexer(embedding_client=FakeEmbedding([]), store=store)
+
+    assert indexer.inspect_journal_state(journal) == "committed"
+    store.rows.clear()
+    with pytest.raises(AtomicIndexError, match="ID 集合"):
+        indexer.inspect_journal_state(journal)
+
+
+def test_inspect_journal_state_wraps_store_errors_with_safe_detail(tmp_path: Path) -> None:
+    current = raw_row("new", "新文本", [0.9, 0.8])
+    store = FakeTransactionalStore(existing={"new": current})
+    journal = write_prepared_journal(
+        tmp_path / "rollback",
+        store=store,
+        chunk_ids=["new"],
+        old_rows=[],
+        collection_existed=True,
+        state="committed",
+    )
+
+    def fail_fetch(chunk_ids: list[str]) -> dict[str, dict[str, Any]]:
+        del chunk_ids
+        raise RuntimeError("raw /private/path token=secret")
+
+    store.fetch_raw_rows_by_ids = fail_fetch  # type: ignore[method-assign]
+
+    with pytest.raises(AtomicIndexError) as caught:
+        AtomicIndexer(
+            embedding_client=FakeEmbedding([]), store=store
+        ).inspect_journal_state(journal)
+
+    assert str(caught.value) == "commit journal 状态检查失败"
+    assert "/private/path" not in str(caught.value)
+    assert "secret" not in str(caught.value)
+
+
 @pytest.mark.parametrize("separator", ["\u2028", "\u2029"])
 def test_recover_preserves_unicode_line_separator_inside_snapshot_text(
     tmp_path: Path, separator: str
