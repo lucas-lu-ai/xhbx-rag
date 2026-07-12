@@ -608,7 +608,11 @@ test("任务 A 使用迟到 raw 列表完成对账且不受任务 B 新版列表
     listA.resolve(jsonResponse({
       jobs: [
         ingestionSummary({ ...failedB }),
-        ingestionSummary({ ...draftA, status: "queued" })
+        ingestionSummary({
+          ...draftA,
+          status: "queued",
+          updated_at: "2026-07-10T08:06:00+00:00"
+        })
       ]
     }));
   });
@@ -734,7 +738,11 @@ test("尾随详情挂起时切换任务会释放动作 waiter 与 pending", asyn
           jsonResponse(draftA),
           slowFirst.promise,
           slowTrailing.promise,
-          jsonResponse(draftA)
+          jsonResponse({
+            ...draftA,
+            status: "queued",
+            updated_at: "2026-07-10T08:07:00+00:00"
+          })
         ],
         "job-b": [jsonResponse(detailB)]
       },
@@ -788,9 +796,286 @@ test("尾随详情挂起时切换任务会释放动作 waiter 与 pending", asyn
   await screen.findByRole("heading", { name: "课程B.pdf" });
   await user.click(screen.getByRole("button", { name: /案例A\.zip/ }));
 
-  const startButton = await screen.findByRole("button", { name: "确认并开始" });
-  await waitFor(() => expect(startButton).toBeEnabled());
-  expect(screen.getByText("案例A启动超时")).toBeInTheDocument();
+  expect(await screen.findByText("案例A启动超时")).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "确认并开始" })).not.toBeInTheDocument();
+});
+
+test("较新详情先返回后不会被较早读取的慢列表回退", async () => {
+  const user = userEvent.setup();
+  const running = ingestionDetail({
+    status: "running",
+    current_stage: "parsing",
+    item_done: 1,
+    updated_at: "2026-07-10T08:05:00+00:00"
+  });
+  const succeeded = ingestionDetail({
+    status: "succeeded",
+    current_stage: "completed",
+    item_done: 3,
+    updated_at: "2026-07-10T08:10:00+00:00"
+  });
+  const slowList = deferredResponse();
+  const progress = deferredResponse();
+  const succeededDetail = deferredResponse();
+  const stub = installIngestionApiStub({
+    jobs: [ingestionSummary({ ...running })],
+    details: { "job-1": running },
+    responses: {
+      list: [
+        jsonResponse({ jobs: [ingestionSummary({ ...running })] }),
+        slowList.promise
+      ],
+      detail: { "job-1": [jsonResponse(running), succeededDetail.promise] },
+      progress: { "job-1": [progress.promise] }
+    }
+  });
+  const listRequestCount = () =>
+    stub.requests.filter(
+      ({ url, method }) => method === "GET" && url.endsWith("/api/ingestion-jobs")
+    ).length;
+  const detailRequestCount = () =>
+    stub.requests.filter(
+      ({ url, method }) => method === "GET" && /\/api\/ingestion-jobs\/job-1$/.test(url)
+    ).length;
+
+  window.history.replaceState(null, "", "/?view=ingestion&job=job-1");
+  render(<App ingestionPollIntervalMs={1000} listPollIntervalMs={5000} />);
+
+  await screen.findByRole("heading", { name: "优秀案例.zip" });
+  await user.click(screen.getByRole("button", { name: "刷新任务列表" }));
+  await waitFor(() => expect(listRequestCount()).toBe(2));
+  await act(async () => {
+    progress.resolve(jsonResponse({
+      job_id: "job-1",
+      status: "running",
+      current_stage: "chunking",
+      attempt_no: 1,
+      item_total: 3,
+      item_done: 2,
+      document_total: 6,
+      chunk_total: 16,
+      warning_count: 0,
+      active_item_index: 3,
+      message: "正在切分",
+      updated_at: "2026-07-10T08:06:00+00:00"
+    }));
+  });
+  await waitFor(() => expect(detailRequestCount()).toBe(2));
+  await act(async () => {
+    succeededDetail.resolve(jsonResponse(succeeded));
+  });
+  expect(await screen.findByText("任务状态：已完成")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /优秀案例\.zip.*已完成/ })).toBeInTheDocument();
+
+  await act(async () => {
+    slowList.resolve(jsonResponse({
+      jobs: [ingestionSummary({ ...running, updated_at: "2026-07-10T08:07:00+00:00" })]
+    }));
+  });
+  expect(screen.getByText("任务状态：已完成")).toBeInTheDocument();
+  expect(screen.queryByText("任务状态：运行中")).not.toBeInTheDocument();
+});
+
+test("新版全局 succeeded 不被旧动作 raw queued 覆盖", async () => {
+  const user = userEvent.setup();
+  const draft = ingestionDraftPayload({ updated_at: "2026-07-10T08:05:00+00:00" });
+  const oldActionList = deferredResponse();
+  const startResponse = deferredResponse();
+  const progressResponse = deferredResponse();
+  const stub = installIngestionApiStub({
+    jobs: [ingestionSummary({ ...draft })],
+    details: { "job-1": draft },
+    responses: {
+      list: [
+        jsonResponse({ jobs: [ingestionSummary({ ...draft })] }),
+        oldActionList.promise,
+        jsonResponse({ jobs: [ingestionSummary({
+          ...draft,
+          status: "succeeded",
+          current_stage: "completed",
+          item_done: 3,
+          updated_at: "2026-07-10T08:10:00+00:00"
+        })] })
+      ],
+      detail: {
+        "job-1": [
+          jsonResponse(draft),
+          jsonResponse({ detail: "详情对账失败" }, { status: 503 })
+        ]
+      },
+      progress: { "job-1": [progressResponse.promise] },
+      start: { "job-1": [startResponse.promise] }
+    }
+  });
+  const listRequestCount = () =>
+    stub.requests.filter(
+      ({ url, method }) => method === "GET" && url.endsWith("/api/ingestion-jobs")
+    ).length;
+
+  window.history.replaceState(null, "", "/?view=ingestion&job=job-1");
+  render(<App />);
+  await user.click(await screen.findByRole("button", { name: "确认并开始" }));
+  await act(async () => {
+    startResponse.resolve(jsonResponse({ detail: "启动请求超时" }, { status: 500 }));
+  });
+  await waitFor(() => expect(listRequestCount()).toBe(2));
+  await user.click(screen.getByRole("button", { name: "刷新任务列表" }));
+  expect(await screen.findByText("任务状态：已完成")).toBeInTheDocument();
+
+  await act(async () => {
+    oldActionList.resolve(jsonResponse({ jobs: [ingestionSummary({
+      ...draft,
+      status: "queued",
+      updated_at: "2026-07-10T08:06:00+00:00"
+    })] }));
+  });
+  expect(screen.getByText("任务状态：已完成")).toBeInTheDocument();
+  expect(screen.queryByText("排队中")).not.toBeInTheDocument();
+});
+
+test("新版全局 absence 建立 tombstone 后旧动作 raw deleting 不会复活任务", async () => {
+  const user = userEvent.setup();
+  const succeeded = ingestionDetail({ updated_at: "2026-07-10T08:05:00+00:00" });
+  const deleteResponse = deferredResponse();
+  const oldActionList = deferredResponse();
+  const progressResponse = deferredResponse();
+  const stub = installIngestionApiStub({
+    jobs: [ingestionSummary({ ...succeeded })],
+    details: { "job-1": succeeded },
+    responses: {
+      list: [
+        jsonResponse({ jobs: [ingestionSummary({ ...succeeded })] }),
+        oldActionList.promise,
+        jsonResponse({ jobs: [] })
+      ],
+      detail: {
+        "job-1": [
+          jsonResponse(succeeded),
+          jsonResponse({ detail: "详情对账失败" }, { status: 503 })
+        ]
+      },
+      progress: { "job-1": [progressResponse.promise] },
+      delete: { "job-1": [deleteResponse.promise] }
+    }
+  });
+  const listRequestCount = () =>
+    stub.requests.filter(
+      ({ url, method }) => method === "GET" && url.endsWith("/api/ingestion-jobs")
+    ).length;
+
+  window.history.replaceState(null, "", "/?view=ingestion&job=job-1");
+  render(<App />);
+  await user.click(await screen.findByRole("button", { name: "删除任务" }));
+  await user.click(screen.getByRole("button", { name: "确认删除" }));
+  await act(async () => {
+    deleteResponse.resolve(jsonResponse({ detail: "删除请求超时" }, { status: 500 }));
+  });
+  await waitFor(() => expect(listRequestCount()).toBe(2));
+  await user.click(screen.getByRole("button", { name: "刷新任务列表" }));
+
+  await act(async () => {
+    oldActionList.resolve(jsonResponse({ jobs: [ingestionSummary({
+      ...succeeded,
+      status: "deleting",
+      updated_at: "2026-07-10T08:06:00+00:00"
+    })] }));
+  });
+  await waitFor(() => expect(window.location.search).toBe("?view=ingestion"));
+  expect(screen.getByText("创建入库任务")).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /优秀案例\.zip/ })).not.toBeInTheDocument();
+  expect(screen.queryByText("删除中")).not.toBeInTheDocument();
+});
+
+test("无效时间时较新 progress generation 仍阻止迟到详情覆盖状态与 events", async () => {
+  const running = ingestionDetail({
+    status: "running",
+    current_stage: "parsing",
+    item_done: 1,
+    updated_at: "invalid-initial-time",
+    events: [{
+      attempt_no: 1,
+      sequence: 1,
+      event_type: "attempt_started",
+      message: "保留的已有事件",
+      payload: {},
+      created_at: "2026-07-10T08:05:00+00:00"
+    }]
+  });
+  const staleDetail = ingestionDetail({
+    status: "running",
+    current_stage: "chunking",
+    item_done: 2,
+    updated_at: "invalid-stale-detail-time",
+    events: [{
+      attempt_no: 1,
+      sequence: 2,
+      event_type: "item_processed",
+      message: "迟到详情不应覆盖",
+      payload: {},
+      created_at: "2026-07-10T08:07:00+00:00"
+    }]
+  });
+  const slowDetail = deferredResponse();
+  const slowTrailing = deferredResponse();
+  const stub = installIngestionApiStub({
+    jobs: [ingestionSummary({ ...running })],
+    details: { "job-1": running },
+    responses: {
+      detail: {
+        "job-1": [jsonResponse(running), slowDetail.promise, slowTrailing.promise]
+      },
+      progress: {
+        "job-1": [
+          jsonResponse({
+            job_id: "job-1",
+            status: "running",
+            current_stage: "chunking",
+            attempt_no: 1,
+            item_total: 3,
+            item_done: 2,
+            document_total: 6,
+            chunk_total: 16,
+            warning_count: 0,
+            active_item_index: 3,
+            message: "正在切分",
+            updated_at: "invalid-progress-one"
+          }),
+          jsonResponse({
+            job_id: "job-1",
+            status: "succeeded",
+            current_stage: "completed",
+            attempt_no: 1,
+            item_total: 3,
+            item_done: 3,
+            document_total: 6,
+            chunk_total: 24,
+            warning_count: 0,
+            active_item_index: null,
+            message: "入库完成",
+            updated_at: "invalid-progress-two"
+          })
+        ]
+      }
+    }
+  });
+  const detailRequestCount = () =>
+    stub.requests.filter(
+      ({ url, method }) => method === "GET" && /\/api\/ingestion-jobs\/job-1$/.test(url)
+    ).length;
+
+  window.history.replaceState(null, "", "/?view=ingestion&job=job-1");
+  render(<App ingestionPollIntervalMs={20} listPollIntervalMs={5000} />);
+  expect(await screen.findByText("保留的已有事件")).toBeInTheDocument();
+  await waitFor(() => expect(detailRequestCount()).toBe(2));
+  expect(await screen.findByText("任务状态：已完成")).toBeInTheDocument();
+
+  await act(async () => {
+    slowDetail.resolve(jsonResponse(staleDetail));
+  });
+  await waitFor(() => expect(detailRequestCount()).toBe(3));
+  expect(screen.getByText("任务状态：已完成")).toBeInTheDocument();
+  expect(screen.getByText("保留的已有事件")).toBeInTheDocument();
+  expect(screen.queryByText("迟到详情不应覆盖")).not.toBeInTheDocument();
 });
 
 test("DELETE 成功后列表刷新失败仍关闭对话框并保持已删除", async () => {

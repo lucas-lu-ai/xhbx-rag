@@ -101,9 +101,15 @@ type IngestionActionState = {
 };
 
 type RefreshResult<T> =
-  | { status: "success"; value: T }
+  | { status: "success"; value: T; requestGeneration: number }
   | { status: "error"; error: string }
   | { status: "stale" };
+
+type IngestionJobFreshness = {
+  updatedAt: string | null;
+  requestGeneration: number;
+  tombstoned: boolean;
+};
 
 type IngestionDetailRefreshMode = "automatic" | "manual";
 
@@ -161,9 +167,10 @@ export function App({
   const ingestionActionTokensRef = useRef(new Map<string, number>());
   const ingestionPendingJobsRef = useRef(new Set<string>());
   const ingestionListRequestRef = useRef(0);
+  const ingestionGlobalGenerationRef = useRef(0);
+  const ingestionFreshnessRef = useRef(new Map<string, IngestionJobFreshness>());
   const ingestionJobsRef = useRef<IngestionJobSummary[]>([]);
   const ingestionJobVersionsRef = useRef(new Map<string, number>());
-  const ingestionJobTombstonesRef = useRef(new Set<string>());
   const ingestionDetailRequestRef = useRef(0);
   const ingestionDetailRefreshesRef = useRef(
     new Map<string, IngestionDetailRefreshCoordinator>()
@@ -191,21 +198,83 @@ export function App({
     };
   }, []);
 
+  const nextIngestionGeneration = useCallback(
+    () => ++ingestionGlobalGenerationRef.current,
+    []
+  );
+
+  const acceptIngestionFreshness = useCallback((
+    jobId: string,
+    updatedAt: string | null,
+    requestGeneration: number,
+    tombstoned = false
+  ): boolean => {
+    const candidate: IngestionJobFreshness = {
+      updatedAt,
+      requestGeneration,
+      tombstoned
+    };
+    const current = ingestionFreshnessRef.current.get(jobId);
+    if (!isAcceptedIngestionFreshness(candidate, current)) return false;
+    ingestionFreshnessRef.current.set(jobId, candidate);
+    return true;
+  }, []);
+
+  const bumpIngestionJobVersion = useCallback((jobId: string) => {
+    const version = (ingestionJobVersionsRef.current.get(jobId) ?? 0) + 1;
+    ingestionJobVersionsRef.current.set(jobId, version);
+  }, []);
+
   const refetchIngestionJobs = useCallback(async (): Promise<RefreshResult<IngestionJobSummary[]>> => {
     const requestId = ++ingestionListRequestRef.current;
+    const requestGeneration = nextIngestionGeneration();
     const versionSnapshot = new Map(ingestionJobVersionsRef.current);
     setIngestionJobsLoading(true);
     try {
       const payload = await listIngestionJobs();
       if (!appMountedRef.current) return { status: "stale" };
       if (requestId === ingestionListRequestRef.current) {
-        const mergedJobs = mergeIngestionJobList(
-          payload.jobs,
-          ingestionJobsRef.current,
-          versionSnapshot,
-          ingestionJobVersionsRef.current,
-          ingestionJobTombstonesRef.current
-        );
+        const currentJobs = ingestionJobsRef.current;
+        const currentById = new Map(currentJobs.map((job) => [job.job_id, job]));
+        const serverIds = new Set<string>();
+        const removedJobIds: string[] = [];
+        const mergedJobs: IngestionJobSummary[] = [];
+        for (const serverJob of payload.jobs) {
+          const jobId = serverJob.job_id;
+          if (serverIds.has(jobId)) continue;
+          serverIds.add(jobId);
+          if (acceptIngestionFreshness(
+            jobId,
+            serverJob.updated_at,
+            requestGeneration
+          )) {
+            mergedJobs.push(serverJob);
+          } else {
+            const localJob = currentById.get(jobId);
+            if (
+              localJob &&
+              !ingestionFreshnessRef.current.get(jobId)?.tombstoned
+            ) mergedJobs.push(localJob);
+          }
+        }
+        for (const localJob of currentJobs) {
+          const jobId = localJob.job_id;
+          if (serverIds.has(jobId)) continue;
+          const changedWithoutFreshness =
+            (ingestionJobVersionsRef.current.get(jobId) ?? 0) !==
+              (versionSnapshot.get(jobId) ?? 0) &&
+            !ingestionFreshnessRef.current.has(jobId);
+          if (changedWithoutFreshness) {
+            mergedJobs.push(localJob);
+            continue;
+          }
+          if (acceptIngestionFreshness(jobId, null, requestGeneration, true)) {
+            bumpIngestionJobVersion(jobId);
+            removedJobIds.push(jobId);
+          } else if (!ingestionFreshnessRef.current.get(jobId)?.tombstoned) {
+            mergedJobs.push(localJob);
+          }
+        }
         ingestionJobsRef.current = mergedJobs;
         setIngestionJobs(mergedJobs);
         setIngestionJobsLoaded(true);
@@ -218,9 +287,11 @@ export function App({
               ? mergeSummaryIntoDetail(current, selectedSummary)
               : current
           );
+        } else if (selectedJobId && removedJobIds.includes(selectedJobId)) {
+          clearTombstonedIngestionJobSelection(selectedJobId);
         }
       }
-      return { status: "success", value: payload.jobs };
+      return { status: "success", value: payload.jobs, requestGeneration };
     } catch (error) {
       if (!appMountedRef.current || requestId !== ingestionListRequestRef.current) {
         return { status: "stale" };
@@ -233,30 +304,54 @@ export function App({
         setIngestionJobsLoading(false);
       }
     }
-  }, []);
+  }, [
+    acceptIngestionFreshness,
+    bumpIngestionJobVersion,
+    nextIngestionGeneration
+  ]);
 
   const applyOptimisticIngestionJobs = useCallback(
     (
       jobId: string,
-      updater: (current: IngestionJobSummary[]) => IngestionJobSummary[],
-      tombstone = false
-    ) => {
-      const version = (ingestionJobVersionsRef.current.get(jobId) ?? 0) + 1;
-      ingestionJobVersionsRef.current.set(jobId, version);
-      if (tombstone) ingestionJobTombstonesRef.current.add(jobId);
-      else ingestionJobTombstonesRef.current.delete(jobId);
+      updatedAt: string | null,
+      updater: (current: IngestionJobSummary[]) => IngestionJobSummary[]
+    ): boolean => {
+      const requestGeneration = nextIngestionGeneration();
+      if (!acceptIngestionFreshness(jobId, updatedAt, requestGeneration)) return false;
+      bumpIngestionJobVersion(jobId);
       const next = updater(ingestionJobsRef.current);
       ingestionJobsRef.current = next;
       setIngestionJobs(next);
       setIngestionJobsLoaded(true);
+      return true;
     },
-    []
+    [acceptIngestionFreshness, bumpIngestionJobVersion, nextIngestionGeneration]
   );
+
+  const applyIngestionSummaryCandidate = useCallback((
+    summary: IngestionJobSummary,
+    requestGeneration: number
+  ): boolean => {
+    const jobId = summary.job_id;
+    if (!acceptIngestionFreshness(jobId, summary.updated_at, requestGeneration)) return false;
+    bumpIngestionJobVersion(jobId);
+    const next = upsertIngestionSummary(ingestionJobsRef.current, summary);
+    ingestionJobsRef.current = next;
+    setIngestionJobs(next);
+    setIngestionJobsLoaded(true);
+    if (selectedIngestionJobIdRef.current === jobId) {
+      setIngestionDetail((current) =>
+        current?.job_id === jobId ? mergeSummaryIntoDetail(current, summary) : current
+      );
+    }
+    return true;
+  }, [acceptIngestionFreshness, bumpIngestionJobVersion]);
 
   const performIngestionDetailRefresh = useCallback(async (
     jobId: string
   ): Promise<RefreshResult<IngestionJobDetail>> => {
     const requestId = ++ingestionDetailRequestRef.current;
+    const requestGeneration = nextIngestionGeneration();
     setIngestionDetailError("");
     setIngestionDetail((current) => current?.job_id === jobId ? current : null);
     setIngestionDetailLoading(true);
@@ -267,9 +362,18 @@ export function App({
         requestId !== ingestionDetailRequestRef.current ||
         selectedIngestionJobIdRef.current !== jobId
       ) return { status: "stale" };
+      if (!acceptIngestionFreshness(jobId, payload.updated_at, requestGeneration)) {
+        return { status: "stale" };
+      }
       setIngestionDetail(payload);
       setIngestionDetailError("");
-      return { status: "success", value: payload };
+      bumpIngestionJobVersion(jobId);
+      const summary = summaryFromIngestionDetail(payload);
+      const nextJobs = upsertIngestionSummary(ingestionJobsRef.current, summary);
+      ingestionJobsRef.current = nextJobs;
+      setIngestionJobs(nextJobs);
+      setIngestionJobsLoaded(true);
+      return { status: "success", value: payload, requestGeneration };
     } catch (error) {
       if (
         !appMountedRef.current ||
@@ -285,7 +389,11 @@ export function App({
         setIngestionDetailLoading(false);
       }
     }
-  }, []);
+  }, [
+    acceptIngestionFreshness,
+    bumpIngestionJobVersion,
+    nextIngestionGeneration
+  ]);
 
   const launchIngestionDetailRefresh = useCallback(function launch(
     jobId: string,
@@ -683,11 +791,13 @@ export function App({
   }
 
   function handleIngestionCreated(detail: IngestionJobDetail) {
-    setIngestionDetail(detail);
-    applyOptimisticIngestionJobs(
+    const accepted = applyOptimisticIngestionJobs(
       detail.job_id,
+      detail.updated_at,
       (current) => upsertIngestionJob(current, detail)
     );
+    if (!accepted) return;
+    setIngestionDetail(detail);
     selectIngestionJob(detail.job_id);
   }
 
@@ -697,6 +807,7 @@ export function App({
   ): number | null {
     if (ingestionPendingJobsRef.current.has(jobId)) return null;
     const token = ++ingestionActionTokenRef.current;
+    nextIngestionGeneration();
     ingestionActionTokensRef.current.set(jobId, token);
     ingestionPendingJobsRef.current.add(jobId);
     setIngestionActions((current) => ({
@@ -726,16 +837,6 @@ export function App({
     });
   }
 
-  function mergeSummaryIntoSelectedDetail(
-    jobId: string,
-    summary: IngestionJobSummary
-  ) {
-    if (selectedIngestionJobIdRef.current !== jobId) return;
-    setIngestionDetail((current) =>
-      current?.job_id === jobId ? mergeSummaryIntoDetail(current, summary) : current
-    );
-  }
-
   async function runIngestionAction(
     kind: "start" | "retry",
     jobId: string,
@@ -753,13 +854,14 @@ export function App({
 
     if (!appMountedRef.current) return;
     if (!actionError) {
-      applyOptimisticIngestionJobs(
+      const accepted = applyOptimisticIngestionJobs(
         jobId,
+        ingestionJobsRef.current.find((job) => job.job_id === jobId)?.updated_at ?? null,
         (current) => current.map((job) =>
           job.job_id === jobId ? { ...job, status: "queued" } : job
         )
       );
-      if (selectedIngestionJobIdRef.current === jobId) {
+      if (accepted && selectedIngestionJobIdRef.current === jobId) {
         setIngestionDetail((current) =>
           current?.job_id === jobId ? { ...current, status: "queued" } : current
         );
@@ -771,38 +873,25 @@ export function App({
       actionError && selectedIngestionJobIdRef.current === jobId
         ? requestIngestionDetailRefresh(jobId, "manual")
         : Promise.resolve({ status: "stale" });
-    const [listResult, detailResult] = await Promise.all([listPromise, detailPromise]);
+    const [listResult] = await Promise.all([listPromise, detailPromise]);
     if (
       ingestionActionTokensRef.current.get(jobId) === token &&
       actionError &&
-      listResult.status === "success" &&
-      detailResult.status !== "success"
+      listResult.status === "success"
     ) {
       const summary = listResult.value.find((job) => job.job_id === jobId);
-      if (summary) mergeSummaryIntoSelectedDetail(jobId, summary);
+      if (summary) {
+        applyIngestionSummaryCandidate(summary, listResult.requestGeneration);
+      }
     }
     if (appMountedRef.current) finishIngestionAction(jobId, token, actionError);
   }
 
   const handleIngestionProgress = useCallback(
     (progress: IngestionJobProgress) => {
-      setIngestionDetail((current) =>
-        current?.job_id === progress.job_id
-          ? {
-              ...current,
-              status: progress.status,
-              current_stage: progress.current_stage,
-              item_total: progress.item_total,
-              item_done: progress.item_done,
-              document_total: progress.document_total,
-              chunk_total: progress.chunk_total,
-              warning_count: progress.warning_count,
-              updated_at: progress.updated_at
-            }
-          : current
-      );
-      applyOptimisticIngestionJobs(
+      const accepted = applyOptimisticIngestionJobs(
         progress.job_id,
+        progress.updated_at,
         (current) => current.map((job) =>
           job.job_id === progress.job_id
             ? {
@@ -819,16 +908,27 @@ export function App({
             : job
         )
       );
+      if (!accepted) return;
+      setIngestionDetail((current) =>
+        current?.job_id === progress.job_id
+          ? {
+              ...current,
+              status: progress.status,
+              current_stage: progress.current_stage,
+              item_total: progress.item_total,
+              item_done: progress.item_done,
+              document_total: progress.document_total,
+              chunk_total: progress.chunk_total,
+              warning_count: progress.warning_count,
+              updated_at: progress.updated_at
+            }
+          : current
+      );
     },
     [applyOptimisticIngestionJobs]
   );
 
-  function commitDeletedIngestion(jobId: string): boolean {
-    applyOptimisticIngestionJobs(
-      jobId,
-      (current) => current.filter((job) => job.job_id !== jobId),
-      true
-    );
+  function clearTombstonedIngestionJobSelection(jobId: string): boolean {
     const currentLocation = parseWorkspaceLocation(window.location.search);
     const wasSelected =
       currentLocation.view === "ingestion" && currentLocation.jobId === jobId;
@@ -840,6 +940,26 @@ export function App({
       navigateWorkspaceLocation({ view: "ingestion" }, { replace: true });
     }
     return wasSelected;
+  }
+
+  function commitDeletedIngestion(
+    jobId: string,
+    requestGeneration = nextIngestionGeneration()
+  ): { accepted: boolean; wasSelected: boolean } {
+    const alreadyTombstoned = ingestionFreshnessRef.current.get(jobId)?.tombstoned === true;
+    const accepted =
+      alreadyTombstoned ||
+      acceptIngestionFreshness(jobId, null, requestGeneration, true);
+    if (!accepted) return { accepted: false, wasSelected: false };
+    if (!alreadyTombstoned) bumpIngestionJobVersion(jobId);
+    const next = ingestionJobsRef.current.filter((job) => job.job_id !== jobId);
+    ingestionJobsRef.current = next;
+    setIngestionJobs(next);
+    setIngestionJobsLoaded(true);
+    return {
+      accepted: true,
+      wasSelected: clearTombstonedIngestionJobSelection(jobId)
+    };
   }
 
   async function reconcileDeletedIngestion(wasSelected: boolean) {
@@ -869,7 +989,7 @@ export function App({
         !appMountedRef.current ||
         ingestionActionTokensRef.current.get(jobId) !== token
       ) return false;
-      const wasSelected = commitDeletedIngestion(jobId);
+      const { wasSelected } = commitDeletedIngestion(jobId);
       finishIngestionAction(jobId, token, "");
       void reconcileDeletedIngestion(wasSelected);
       return true;
@@ -889,11 +1009,22 @@ export function App({
         !appMountedRef.current ||
         ingestionActionTokensRef.current.get(jobId) !== token
       ) return false;
+      if (ingestionFreshnessRef.current.get(jobId)?.tombstoned) {
+        finishIngestionAction(jobId, token, "");
+        return true;
+      }
       if (
         jobsResult.status === "success" &&
         !jobsResult.value.some((job) => job.job_id === jobId)
       ) {
-        const wasSelected = commitDeletedIngestion(jobId);
+        const { accepted, wasSelected } = commitDeletedIngestion(
+          jobId,
+          jobsResult.requestGeneration
+        );
+        if (!accepted) {
+          finishIngestionAction(jobId, token, actionError);
+          return false;
+        }
         finishIngestionAction(jobId, token, "");
         if (wasSelected) navigateToIngestionFallback(jobsResult.value);
         return true;
@@ -902,11 +1033,15 @@ export function App({
         jobsResult.status === "success"
           ? jobsResult.value.find((job) => job.job_id === jobId)
           : undefined;
-      if (summary && detailResult.status !== "success") {
-        mergeSummaryIntoSelectedDetail(jobId, summary);
-      }
+      const summaryAccepted = summary && jobsResult.status === "success"
+        ? applyIngestionSummaryCandidate(summary, jobsResult.requestGeneration)
+        : false;
       const reconciledStatus =
-        detailResult.status === "success" ? detailResult.value.status : summary?.status;
+        detailResult.status === "success"
+          ? detailResult.value.status
+          : summaryAccepted
+            ? summary?.status
+            : undefined;
       if (reconciledStatus === "deleting") {
         finishIngestionAction(jobId, token, actionError);
         return true;
@@ -1194,6 +1329,12 @@ function upsertIngestionJob(
   jobs: IngestionJobSummary[],
   detail: IngestionJobDetail
 ): IngestionJobSummary[] {
+  return upsertIngestionSummary(jobs, summaryFromIngestionDetail(detail));
+}
+
+function summaryFromIngestionDetail(
+  detail: IngestionJobDetail
+): IngestionJobSummary {
   const {
     ignored_entries: _ignoredEntries,
     items: _items,
@@ -1201,7 +1342,14 @@ function upsertIngestionJob(
     events: _events,
     ...summary
   } = detail;
-  return [summary, ...jobs.filter((job) => job.job_id !== detail.job_id)];
+  return summary;
+}
+
+function upsertIngestionSummary(
+  jobs: IngestionJobSummary[],
+  summary: IngestionJobSummary
+): IngestionJobSummary[] {
+  return [summary, ...jobs.filter((job) => job.job_id !== summary.job_id)];
 }
 
 function mergeSummaryIntoDetail(
@@ -1218,39 +1366,25 @@ function mergeSummaryIntoDetail(
   };
 }
 
-function mergeIngestionJobList(
-  serverJobs: IngestionJobSummary[],
-  currentJobs: IngestionJobSummary[],
-  versionSnapshot: ReadonlyMap<string, number>,
-  currentVersions: ReadonlyMap<string, number>,
-  tombstones: ReadonlySet<string>
-): IngestionJobSummary[] {
-  const currentById = new Map(currentJobs.map((job) => [job.job_id, job]));
-  const serverIds = new Set<string>();
-  const merged: IngestionJobSummary[] = [];
-
-  for (const serverJob of serverJobs) {
-    const jobId = serverJob.job_id;
-    if (serverIds.has(jobId)) continue;
-    serverIds.add(jobId);
-    if (tombstones.has(jobId)) continue;
-    const changedLocally =
-      (currentVersions.get(jobId) ?? 0) !== (versionSnapshot.get(jobId) ?? 0);
-    const localJob = currentById.get(jobId);
-    if (changedLocally) {
-      if (localJob) merged.push(localJob);
-    } else {
-      merged.push(serverJob);
-    }
+function isAcceptedIngestionFreshness(
+  candidate: IngestionJobFreshness,
+  current: IngestionJobFreshness | undefined
+): boolean {
+  if (!current) return true;
+  if (current.tombstoned) {
+    return candidate.tombstoned &&
+      candidate.requestGeneration >= current.requestGeneration;
   }
-
-  for (const localJob of currentJobs) {
-    const jobId = localJob.job_id;
-    if (serverIds.has(jobId) || tombstones.has(jobId)) continue;
-    const changedLocally =
-      (currentVersions.get(jobId) ?? 0) !== (versionSnapshot.get(jobId) ?? 0);
-    if (changedLocally) merged.push(localJob);
+  const candidateTime = validIsoTimestamp(candidate.updatedAt);
+  const currentTime = validIsoTimestamp(current.updatedAt);
+  if (candidateTime !== null && currentTime !== null) {
+    if (candidateTime !== currentTime) return candidateTime > currentTime;
   }
+  return candidate.requestGeneration >= current.requestGeneration;
+}
 
-  return merged;
+function validIsoTimestamp(value: string | null): number | null {
+  if (!value || !/^\d{4}-\d{2}-\d{2}T/.test(value)) return null;
+  const timestamp = Date.parse(value);
+  return Number.isNaN(timestamp) ? null : timestamp;
 }
