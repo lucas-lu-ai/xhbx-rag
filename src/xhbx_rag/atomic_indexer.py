@@ -5,13 +5,13 @@ import json
 import math
 import os
 import secrets
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .chunk_io import load_chunks_jsonl
+from .chunk_io import chunk_text_hash, load_chunks_jsonl
 from .index_lock import _normalize_uri, collection_write_lock
 from .milvus_store import MilvusChunkRecord
 
@@ -28,6 +28,21 @@ _RAW_ROW_STRING_FIELDS = (
     "citations_json",
 )
 _RAW_ROW_FIELDS = {*_RAW_ROW_STRING_FIELDS, "vector"}
+_RAW_SCHEMA = tuple(sorted(_RAW_ROW_FIELDS))
+_JOURNAL_FIELDS = {
+    "version",
+    "collection",
+    "collection_existed",
+    "chunk_ids",
+    "snapshot_path",
+    "snapshot_sha256",
+    "snapshot_size",
+    "snapshot_count",
+    "vector_dim",
+    "raw_schema",
+    "state",
+    "journal_sha256",
+}
 _ROLLBACK_PENDING_DETAIL = "知识库回滚尚未完成，请稍后重试"
 
 
@@ -59,16 +74,23 @@ class AtomicIndexer:
         journal_dir: Path,
         on_state: Callable[[str, Path], None] | None = None,
     ) -> AtomicIndexResult:
-        chunks = load_chunks_jsonl(chunks_path)
+        _require_empty_journal_dir(journal_dir)
+        try:
+            chunks = load_chunks_jsonl(chunks_path)
+        except Exception as exc:
+            raise AtomicIndexError("待入库 chunk 文件无效") from exc
         if not chunks:
-            return AtomicIndexResult(indexed=0, vector_dim=0)
+            raise AtomicIndexError("待入库 chunk 文件不能为空")
 
         chunk_ids = [chunk.chunk_id for chunk in chunks]
         if len(set(chunk_ids)) != len(chunk_ids):
             raise AtomicIndexError("待入库 chunk_id 存在重复")
 
-        embed_documents = getattr(self.embedding_client, "embed_documents")
-        vectors = embed_documents([chunk.text for chunk in chunks])
+        try:
+            embed_documents = getattr(self.embedding_client, "embed_documents")
+            vectors = embed_documents([chunk.text for chunk in chunks])
+        except Exception as exc:
+            raise AtomicIndexError("向量生成失败") from exc
         vector_dim = _validate_vectors(vectors, len(chunks))
         rows = [
             MilvusChunkRecord.from_chunk(chunk, vector).to_row()
@@ -79,69 +101,94 @@ class AtomicIndexer:
         snapshot_path = journal_dir / "snapshot.jsonl"
         prepared = False
         committed = False
-        with _collection_write_context(self.store):
-            collection_existed = bool(self.store.collection_exists())
-            old_rows_by_id = self.store.fetch_raw_rows_by_ids(chunk_ids)
-            old_rows = [old_rows_by_id[key] for key in sorted(old_rows_by_id)]
-            journal = _new_journal(
-                self.store,
-                collection_existed=collection_existed,
-                chunk_ids=chunk_ids,
-            )
-            _validate_snapshot(old_rows, journal)
-            try:
-                _write_snapshot(snapshot_path, old_rows)
-                _write_journal(journal_path, journal)
-                prepared = True
-                _notify(on_state, "prepared", journal_path)
+        try:
+            with _collection_write_context(self.store):
+                try:
+                    _require_empty_journal_dir(journal_dir)
+                    collection_existed = bool(self.store.collection_exists())
+                    old_rows_by_id = self.store.fetch_raw_rows_by_ids(chunk_ids)
+                    old_rows = [old_rows_by_id[key] for key in sorted(old_rows_by_id)]
+                    snapshot_payload = _snapshot_payload(old_rows)
+                    journal = _new_journal(
+                        self.store,
+                        collection_existed=collection_existed,
+                        chunk_ids=chunk_ids,
+                        snapshot_payload=snapshot_payload,
+                        snapshot_count=len(old_rows),
+                        vector_dim=vector_dim,
+                    )
+                    _validate_snapshot(old_rows, journal)
+                except AtomicIndexError:
+                    raise
+                except Exception as exc:
+                    raise AtomicIndexError("知识库提交准备失败") from exc
 
-                self.store.ensure_collection(vector_dim)
-                self.store.upsert_raw_rows(rows)
-                self.store.flush()
-                actual_ids = set(self.store.fetch_raw_rows_by_ids(chunk_ids))
-                if actual_ids != set(chunk_ids):
-                    raise AtomicIndexError("Milvus 写后 ID 集合校验失败")
+                try:
+                    _require_empty_journal_dir(journal_dir)
+                    _write_snapshot(snapshot_path, snapshot_payload)
+                    _write_journal(journal_path, journal, create=True)
+                    prepared = True
+                    _notify(on_state, "prepared", journal_path)
 
-                journal = {**journal, "state": "committed"}
-                _write_journal(journal_path, journal)
-                committed = True
-                _notify(on_state, "committed", journal_path)
-            except BaseException as exc:
-                if prepared and not committed:
-                    try:
-                        self._rollback(
-                            journal_path,
-                            journal,
-                            old_rows,
-                        )
-                    except RollbackPendingError as rollback_exc:
-                        raise rollback_exc from exc
-                elif not prepared and not journal_path.is_file():
-                    _remove_durable(snapshot_path)
-                raise
+                    self.store.ensure_collection(vector_dim)
+                    self.store.upsert_raw_rows(rows)
+                    self.store.flush()
+                    actual_ids = set(self.store.fetch_raw_rows_by_ids(chunk_ids))
+                    if actual_ids != set(chunk_ids):
+                        raise AtomicIndexError("Milvus 写后 ID 集合校验失败")
+
+                    journal = {**journal, "state": "committed"}
+                    _write_journal(journal_path, journal)
+                    committed = True
+                    _notify(on_state, "committed", journal_path)
+                except Exception as exc:
+                    if prepared and not committed:
+                        try:
+                            self._rollback(
+                                journal_path,
+                                journal,
+                                old_rows,
+                            )
+                        except RollbackPendingError:
+                            raise
+                        if isinstance(exc, AtomicIndexError):
+                            raise
+                        raise AtomicIndexError("知识库写入失败，已完成回滚") from exc
+                    if committed:
+                        raise AtomicIndexError("知识库已提交，但状态同步失败") from exc
+                    raise AtomicIndexError("知识库提交准备失败") from exc
+        except AtomicIndexError:
+            raise
+        except Exception as exc:
+            raise AtomicIndexError("知识库提交失败") from exc
 
         return AtomicIndexResult(indexed=len(chunks), vector_dim=vector_dim)
 
     def recover(self, journal_path: Path) -> None:
         journal_path = Path(journal_path)
-        with _collection_write_context(self.store):
-            journal = _read_journal(journal_path)
-            _validate_journal(journal, self.store)
-            state = str(journal["state"])
-            if state == "rolled_back":
-                return
+        try:
+            with _collection_write_context(self.store):
+                journal = _read_journal(journal_path)
+                _validate_journal(journal, self.store)
+                state = str(journal["state"])
+                if state == "rolled_back":
+                    return
 
-            chunk_ids = list(journal["chunk_ids"])
-            if state == "committed":
-                actual_ids = set(self.store.fetch_raw_rows_by_ids(chunk_ids))
-                if actual_ids != set(chunk_ids):
-                    raise AtomicIndexError("committed journal 的 ID 集合校验失败")
-                return
+                chunk_ids = list(journal["chunk_ids"])
+                if state == "committed":
+                    actual_ids = set(self.store.fetch_raw_rows_by_ids(chunk_ids))
+                    if actual_ids != set(chunk_ids):
+                        raise AtomicIndexError("committed journal 的 ID 集合校验失败")
+                    return
 
-            snapshot_path = _resolve_snapshot_path(journal_path, journal)
-            old_rows = _read_snapshot(snapshot_path)
-            _validate_snapshot(old_rows, journal)
-            self._rollback(journal_path, journal, old_rows)
+                snapshot_path = _resolve_snapshot_path(journal_path, journal)
+                old_rows = _read_snapshot(snapshot_path, journal)
+                _validate_snapshot(old_rows, journal)
+                self._rollback(journal_path, journal, old_rows)
+        except AtomicIndexError:
+            raise
+        except Exception as exc:
+            raise AtomicIndexError("知识库恢复失败") from exc
 
     def _rollback(
         self,
@@ -166,7 +213,7 @@ class AtomicIndexer:
 
             rolled_back = {**journal, "state": "rolled_back"}
             _write_journal(journal_path, rolled_back)
-        except BaseException as exc:
+        except Exception as exc:
             if isinstance(exc, RollbackPendingError):
                 raise
             raise RollbackPendingError(journal_path, _ROLLBACK_PENDING_DETAIL) from exc
@@ -180,7 +227,18 @@ def _validate_vectors(vectors: object, expected_count: int) -> int:
     vector_dim = len(vectors[0])
     if any(not isinstance(vector, list) or len(vector) != vector_dim for vector in vectors):
         raise AtomicIndexError("embedding 返回向量维度不一致")
+    if any(not _is_finite_number(value) for vector in vectors for value in vector):
+        raise AtomicIndexError("embedding 返回向量数值无效")
     return vector_dim
+
+
+def _is_finite_number(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except (OverflowError, TypeError):
+        return False
 
 
 def _collection_write_context(store: object):
@@ -196,6 +254,9 @@ def _new_journal(
     *,
     collection_existed: bool,
     chunk_ids: list[str],
+    snapshot_payload: bytes,
+    snapshot_count: int,
+    vector_dim: int,
 ) -> dict[str, Any]:
     uri = _normalize_uri(str(getattr(store, "uri", "")))
     return {
@@ -207,6 +268,11 @@ def _new_journal(
         "collection_existed": collection_existed,
         "chunk_ids": sorted(chunk_ids),
         "snapshot_path": "snapshot.jsonl",
+        "snapshot_sha256": hashlib.sha256(snapshot_payload).hexdigest(),
+        "snapshot_size": len(snapshot_payload),
+        "snapshot_count": snapshot_count,
+        "vector_dim": vector_dim,
+        "raw_schema": list(_RAW_SCHEMA),
         "state": "prepared",
     }
 
@@ -220,17 +286,38 @@ def _notify(
         on_state(state, journal_path)
 
 
-def _write_snapshot(path: Path, rows: Iterable[dict[str, Any]]) -> None:
-    payload = "".join(
+def _snapshot_payload(rows: list[dict[str, Any]]) -> bytes:
+    return "".join(
         json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
         for row in rows
-    )
-    _atomic_write_text(path, payload)
+    ).encode("utf-8")
 
 
-def _write_journal(path: Path, journal: dict[str, Any]) -> None:
-    payload = json.dumps(journal, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    _atomic_write_text(path, payload + "\n")
+def _write_snapshot(path: Path, payload: bytes) -> None:
+    _atomic_write_bytes(path, payload, replace=False)
+
+
+def _write_journal(
+    path: Path, journal: dict[str, Any], *, create: bool = False
+) -> None:
+    payload = _journal_payload(journal)
+    _atomic_write_bytes(path, payload, replace=not create)
+
+
+def _journal_payload(journal: dict[str, Any]) -> bytes:
+    checked = _journal_with_checksum(journal)
+    payload = json.dumps(
+        checked, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return payload + b"\n"
+
+
+def _journal_with_checksum(journal: dict[str, Any]) -> dict[str, Any]:
+    core = {key: value for key, value in journal.items() if key != "journal_sha256"}
+    payload = json.dumps(
+        core, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return {**core, "journal_sha256": hashlib.sha256(payload).hexdigest()}
 
 
 def _read_journal(path: Path) -> dict[str, Any]:
@@ -244,7 +331,16 @@ def _read_journal(path: Path) -> dict[str, Any]:
 
 
 def _validate_journal(journal: dict[str, Any], store: object) -> None:
-    if journal.get("version") != 1:
+    if set(journal) != _JOURNAL_FIELDS:
+        raise AtomicIndexError("commit journal 核心字段无效")
+    expected_checksum = _journal_with_checksum(journal)["journal_sha256"]
+    checksum = journal.get("journal_sha256")
+    if not isinstance(checksum, str) or not secrets.compare_digest(
+        checksum, expected_checksum
+    ):
+        raise AtomicIndexError("commit journal 自校验失败")
+    version = journal.get("version")
+    if isinstance(version, bool) or not isinstance(version, int) or version != 1:
         raise AtomicIndexError("不支持的 commit journal 版本")
     if journal.get("state") not in {
         "prepared",
@@ -259,6 +355,7 @@ def _validate_journal(journal: dict[str, Any], store: object) -> None:
     chunk_ids = journal.get("chunk_ids")
     if (
         not isinstance(chunk_ids, list)
+        or not chunk_ids
         or any(not isinstance(item, str) or not item for item in chunk_ids)
         or len(set(chunk_ids)) != len(chunk_ids)
         or chunk_ids != sorted(chunk_ids)
@@ -266,21 +363,49 @@ def _validate_journal(journal: dict[str, Any], store: object) -> None:
         raise AtomicIndexError("commit journal chunk_ids 无效")
 
     collection = journal.get("collection")
-    if not isinstance(collection, dict):
+    if not isinstance(collection, dict) or set(collection) != {
+        "uri_sha256",
+        "collection_name",
+    }:
+        raise AtomicIndexError("commit journal collection identity 无效")
+    uri_hash = collection.get("uri_sha256")
+    collection_name = collection.get("collection_name")
+    if not _is_sha256(uri_hash) or not isinstance(collection_name, str):
         raise AtomicIndexError("commit journal collection identity 无效")
     expected_uri_hash = hashlib.sha256(
         _normalize_uri(str(getattr(store, "uri", ""))).encode("utf-8")
     ).hexdigest()
     expected_name = str(getattr(store, "collection_name", ""))
     if not secrets.compare_digest(
-        str(collection.get("uri_sha256", "")), expected_uri_hash
-    ) or str(collection.get("collection_name", "")) != expected_name:
+        uri_hash, expected_uri_hash
+    ) or collection_name != expected_name:
         raise AtomicIndexError("commit journal 与当前 collection 不匹配")
 
     if not isinstance(journal.get("snapshot_path"), str) or not journal[
         "snapshot_path"
     ]:
         raise AtomicIndexError("commit journal snapshot_path 无效")
+    if not _is_sha256(journal.get("snapshot_sha256")):
+        raise AtomicIndexError("commit journal snapshot 摘要无效")
+    for field in ("snapshot_size", "snapshot_count"):
+        value = journal.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise AtomicIndexError("commit journal snapshot 元数据无效")
+    vector_dim = journal.get("vector_dim")
+    if isinstance(vector_dim, bool) or not isinstance(vector_dim, int) or vector_dim <= 0:
+        raise AtomicIndexError("commit journal vector_dim 无效")
+    if journal.get("raw_schema") != list(_RAW_SCHEMA):
+        raise AtomicIndexError("commit journal raw schema 无效")
+
+
+def _is_sha256(value: object) -> bool:
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    try:
+        int(value, 16)
+    except ValueError:
+        return False
+    return True
 
 
 def _resolve_snapshot_path(
@@ -295,16 +420,27 @@ def _resolve_snapshot_path(
     return resolved
 
 
-def _read_snapshot(path: Path) -> list[dict[str, Any]]:
+def _read_snapshot(path: Path, journal: dict[str, Any]) -> list[dict[str, Any]]:
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError) as exc:
+        payload = path.read_bytes()
+    except OSError as exc:
         raise AtomicIndexError("rollback snapshot 无法读取") from exc
+    if len(payload) != journal["snapshot_size"] or not secrets.compare_digest(
+        hashlib.sha256(payload).hexdigest(), journal["snapshot_sha256"]
+    ):
+        raise AtomicIndexError("rollback snapshot 完整性校验失败")
+    if payload and not payload.endswith(b"\n"):
+        raise AtomicIndexError("rollback snapshot JSONL 结尾无效")
+    lines = [] if not payload else payload[:-1].split(b"\n")
 
     rows: list[dict[str, Any]] = []
-    for line in lines:
-        if not line.strip():
-            continue
+    for raw_line in lines:
+        if not raw_line.strip():
+            raise AtomicIndexError("rollback snapshot 不允许空行")
+        try:
+            line = raw_line.decode("utf-8")
+        except UnicodeError as exc:
+            raise AtomicIndexError("rollback snapshot 编码无效") from exc
         try:
             value = json.loads(line)
         except json.JSONDecodeError as exc:
@@ -320,9 +456,11 @@ def _validate_snapshot(
 ) -> None:
     chunk_ids = set(journal["chunk_ids"])
     snapshot_ids: list[str] = []
+    if len(rows) != journal["snapshot_count"]:
+        raise AtomicIndexError("rollback snapshot 行数无效")
     for row in rows:
-        if not _RAW_ROW_FIELDS.issubset(row):
-            raise AtomicIndexError("rollback snapshot 原始行字段不完整")
+        if set(row) != _RAW_ROW_FIELDS:
+            raise AtomicIndexError("rollback snapshot 原始行字段集合无效")
         if any(not isinstance(row[field], str) for field in _RAW_ROW_STRING_FIELDS):
             raise AtomicIndexError("rollback snapshot 原始行字符串字段无效")
         chunk_id = row.get("chunk_id")
@@ -332,14 +470,13 @@ def _validate_snapshot(
         if (
             not isinstance(vector, list)
             or not vector
-            or any(
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(value)
-                for value in vector
-            )
+            or any(not _is_finite_number(value) for value in vector)
         ):
             raise AtomicIndexError("rollback snapshot vector 无效")
+        if len(vector) != journal["vector_dim"]:
+            raise AtomicIndexError("rollback snapshot vector 维度无效")
+        if row["text_hash"] != chunk_text_hash(row["text"]):
+            raise AtomicIndexError("rollback snapshot text_hash 无效")
         try:
             metadata = json.loads(row["metadata_json"])
             citations = json.loads(row["citations_json"])
@@ -354,26 +491,50 @@ def _validate_snapshot(
         raise AtomicIndexError("原 collection 不存在时 snapshot 必须为空")
 
 
-def _atomic_write_text(path: Path, payload: str) -> None:
+def _atomic_write_bytes(path: Path, payload: bytes, *, replace: bool = True) -> None:
     _ensure_durable_directory(path.parent)
     temporary = path.parent / f".{path.name}.{secrets.token_hex(8)}.tmp"
     fd: int | None = None
+    temporary_created = False
     try:
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        temporary_created = True
+        with os.fdopen(fd, "wb") as handle:
             fd = None
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        if replace:
+            os.replace(temporary, path)
+            temporary_created = False
+        else:
+            os.link(temporary, path)
+            temporary.unlink()
+            temporary_created = False
         _fsync_directory(path.parent)
     finally:
         if fd is not None:
             os.close(fd)
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+        if temporary_created:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            else:
+                _fsync_directory(path.parent)
+
+
+def _require_empty_journal_dir(path: Path) -> None:
+    if not path.exists():
+        return
+    if not path.is_dir():
+        raise AtomicIndexError("回滚目录必须是空目录")
+    try:
+        has_entries = next(path.iterdir(), None) is not None
+    except OSError as exc:
+        raise AtomicIndexError("回滚目录无法安全检查") from exc
+    if has_entries:
+        raise AtomicIndexError("回滚目录必须是空目录")
 
 
 def _ensure_durable_directory(path: Path) -> None:
@@ -390,14 +551,6 @@ def _ensure_durable_directory(path: Path) -> None:
     for directory in reversed(missing):
         _fsync_directory(directory)
         _fsync_directory(directory.parent)
-
-
-def _remove_durable(path: Path) -> None:
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        return
-    _fsync_directory(path.parent)
 
 
 def _fsync_directory(path: Path) -> None:

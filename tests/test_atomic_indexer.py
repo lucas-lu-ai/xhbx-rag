@@ -16,7 +16,24 @@ from xhbx_rag.atomic_indexer import (
     AtomicIndexer,
     RollbackPendingError,
 )
+from xhbx_rag.chunk_io import chunk_text_hash
 from xhbx_rag.index_lock import _normalize_uri, collection_write_lock
+
+
+RAW_SCHEMA = sorted(
+    {
+        "chunk_id",
+        "vector",
+        "text",
+        "text_hash",
+        "case_name",
+        "chunk_type",
+        "stage",
+        "scenario",
+        "metadata_json",
+        "citations_json",
+    }
+)
 
 
 class FakeTransactionalStore:
@@ -46,6 +63,11 @@ class FakeTransactionalStore:
         self.collection_checks = 0
         self.ensure_calls: list[int] = []
         self.drop_calls = 0
+        self.fetch_calls = 0
+        self.next_flush_error: BaseException | None = None
+        self.wrong_ids_on_next_verify = False
+        self.corrupt_fetch_field: str | None = None
+        self.on_fetch: Any = None
 
     def collection_exists(self) -> bool:
         self.collection_checks += 1
@@ -66,13 +88,28 @@ class FakeTransactionalStore:
     def fetch_raw_rows_by_ids(
         self, chunk_ids: list[str]
     ) -> dict[str, dict[str, Any]]:
+        self.fetch_calls += 1
+        if self.on_fetch is not None:
+            callback = self.on_fetch
+            self.on_fetch = None
+            callback()
         if not self.exists:
             return {}
-        return {
+        rows = {
             chunk_id: copy.deepcopy(self.rows[chunk_id])
             for chunk_id in chunk_ids
             if chunk_id in self.rows
         }
+        if self.wrong_ids_on_next_verify and self.upsert_calls == 1:
+            self.wrong_ids_on_next_verify = False
+            return {
+                f"wrong-{index}": copy.deepcopy(row)
+                for index, row in enumerate(rows.values())
+            }
+        if self.corrupt_fetch_field is not None and self.upsert_calls > 0:
+            for row in rows.values():
+                row.pop(self.corrupt_fetch_field, None)
+        return rows
 
     def delete_by_ids(self, chunk_ids: list[str]) -> None:
         self.delete_calls.append(list(chunk_ids))
@@ -90,6 +127,10 @@ class FakeTransactionalStore:
 
     def flush(self) -> None:
         self.flush_calls += 1
+        if self.next_flush_error is not None:
+            error = self.next_flush_error
+            self.next_flush_error = None
+            raise error
         if self.fail_next_flush:
             self.fail_next_flush = False
             raise RuntimeError("flush failed")
@@ -100,7 +141,7 @@ class FakeEmbedding:
         self,
         vectors: list[list[float]],
         *,
-        error: Exception | None = None,
+        error: BaseException | None = None,
         called: threading.Event | None = None,
     ) -> None:
         self.vectors = vectors
@@ -137,7 +178,7 @@ def raw_row(chunk_id: str, text: str, vector: list[float]) -> dict[str, Any]:
         "chunk_id": chunk_id,
         "vector": list(vector),
         "text": text,
-        "text_hash": f"hash-{chunk_id}-{text}",
+        "text_hash": chunk_text_hash(text),
         "case_name": "旧案例",
         "chunk_type": "script",
         "stage": "成交",
@@ -161,6 +202,27 @@ def read_journal(journal_dir: Path) -> dict[str, Any]:
     return json.loads((journal_dir / "journal.json").read_text(encoding="utf-8"))
 
 
+def journal_with_checksum(data: dict[str, Any]) -> dict[str, Any]:
+    core = {key: value for key, value in data.items() if key != "journal_sha256"}
+    payload = json.dumps(
+        core, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return {**core, "journal_sha256": hashlib.sha256(payload).hexdigest()}
+
+
+def write_journal_data(path: Path, data: dict[str, Any]) -> None:
+    path.write_text(
+        json.dumps(
+            journal_with_checksum(data),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def write_prepared_journal(
     journal_dir: Path,
     *,
@@ -170,32 +232,36 @@ def write_prepared_journal(
     collection_existed: bool,
     state: str = "prepared",
     snapshot_path: Path | None = None,
+    vector_dim: int = 2,
 ) -> Path:
     journal_dir.mkdir(parents=True)
     snapshot = snapshot_path or journal_dir / "snapshot.jsonl"
-    snapshot.write_text(
-        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in old_rows),
-        encoding="utf-8",
-    )
+    snapshot_payload = "".join(
+        json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
+        for row in old_rows
+    ).encode("utf-8")
+    snapshot.write_bytes(snapshot_payload)
     journal_path = journal_dir / "journal.json"
-    journal_path.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "collection": {
-                    "uri_sha256": hashlib.sha256(
-                        _normalize_uri(store.uri).encode("utf-8")
-                    ).hexdigest(),
-                    "collection_name": store.collection_name,
-                },
-                "collection_existed": collection_existed,
-                "chunk_ids": sorted(chunk_ids),
-                "snapshot_path": str(snapshot),
-                "state": state,
+    write_journal_data(
+        journal_path,
+        {
+            "version": 1,
+            "collection": {
+                "uri_sha256": hashlib.sha256(
+                    _normalize_uri(store.uri).encode("utf-8")
+                ).hexdigest(),
+                "collection_name": store.collection_name,
             },
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
+            "collection_existed": collection_existed,
+            "chunk_ids": sorted(chunk_ids),
+            "snapshot_path": str(snapshot),
+            "snapshot_sha256": hashlib.sha256(snapshot_payload).hexdigest(),
+            "snapshot_size": len(snapshot_payload),
+            "snapshot_count": len(old_rows),
+            "vector_dim": vector_dim,
+            "raw_schema": RAW_SCHEMA,
+            "state": state,
+        },
     )
     return journal_path
 
@@ -214,9 +280,12 @@ def test_commit_failure_deletes_new_rows_and_restores_old_rows(tmp_path: Path) -
         [chunk("same", "新文本"), chunk("new", "新增文本")],
     )
 
-    with pytest.raises(Exception, match="flush failed"):
+    with pytest.raises(AtomicIndexError) as caught:
         indexer.commit(chunks, journal_dir=tmp_path / "rollback")
 
+    assert str(caught.value) == "知识库写入失败，已完成回滚"
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert "flush failed" not in str(caught.value)
     assert store.rows["same"] == raw_row("same", "旧文本", [0.1, 0.2])
     assert "new" not in store.rows
     assert read_journal(tmp_path / "rollback")["state"] == "rolled_back"
@@ -258,6 +327,12 @@ def test_commit_success_persists_minimal_durable_journal_and_notifies_states(
     assert journal["chunk_ids"] == ["a", "z"]
     assert journal["snapshot_path"] == "snapshot.jsonl"
     assert journal["state"] == "committed"
+    assert journal["snapshot_count"] == 0
+    assert journal["snapshot_size"] == 0
+    assert journal["snapshot_sha256"] == hashlib.sha256(b"").hexdigest()
+    assert journal["vector_dim"] == 2
+    assert journal["raw_schema"] == RAW_SCHEMA
+    assert journal == journal_with_checksum(journal)
     encoded = json.dumps(journal, ensure_ascii=False)
     assert "secret" not in encoded
     assert "do-not-persist" not in encoded
@@ -268,6 +343,136 @@ def test_commit_success_persists_minimal_durable_journal_and_notifies_states(
     assert stat.S_IMODE((journal_dir / "journal.json").stat().st_mode) == 0o600
     assert stat.S_IMODE((journal_dir / "snapshot.jsonl").stat().st_mode) == 0o600
     assert not list(journal_dir.glob("*.tmp"))
+
+
+def test_commit_rejects_existing_recovery_material_without_overwriting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = FakeTransactionalStore(existing={})
+    journal_dir = tmp_path / "rollback"
+    journal_path = write_prepared_journal(
+        journal_dir,
+        store=store,
+        chunk_ids=["old"],
+        old_rows=[],
+        collection_existed=True,
+    )
+    snapshot_path = journal_dir / "snapshot.jsonl"
+    original_pair = (journal_path.read_bytes(), snapshot_path.read_bytes())
+
+    def unexpected_replace(_source: object, _target: object) -> None:
+        raise AssertionError("已有恢复材料时不得尝试 replace")
+
+    monkeypatch.setattr("os.replace", unexpected_replace)
+
+    with pytest.raises(AtomicIndexError, match="回滚目录"):
+        AtomicIndexer(
+            embedding_client=FakeEmbedding([[0.1, 0.2]]), store=store
+        ).commit(
+            write_chunks(tmp_path / "chunks.jsonl", [chunk("new", "新增")]),
+            journal_dir=journal_dir,
+        )
+
+    assert (journal_path.read_bytes(), snapshot_path.read_bytes()) == original_pair
+    assert store.upsert_calls == 0
+    assert store.delete_calls == []
+    assert store.drop_calls == 0
+
+
+def test_commit_rechecks_empty_directory_immediately_before_snapshot(
+    tmp_path: Path,
+) -> None:
+    store = FakeTransactionalStore(existing={})
+    journal_dir = tmp_path / "rollback"
+
+    def create_conflicting_material() -> None:
+        journal_dir.mkdir(parents=True, exist_ok=True)
+        (journal_dir / "conflict").write_text("do not overwrite", encoding="utf-8")
+
+    store.on_fetch = create_conflicting_material
+
+    with pytest.raises(AtomicIndexError, match="提交准备"):
+        AtomicIndexer(
+            embedding_client=FakeEmbedding([[0.1, 0.2]]), store=store
+        ).commit(
+            write_chunks(tmp_path / "chunks.jsonl", [chunk("new", "新增")]),
+            journal_dir=journal_dir,
+        )
+
+    assert (journal_dir / "conflict").read_text(encoding="utf-8") == "do not overwrite"
+    assert not (journal_dir / "snapshot.jsonl").exists()
+    assert not (journal_dir / "journal.json").exists()
+    assert store.upsert_calls == 0
+
+
+def test_commit_never_overwrites_snapshot_created_after_final_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = FakeTransactionalStore(existing={})
+    journal_dir = tmp_path / "rollback"
+    snapshot_path = journal_dir / "snapshot.jsonl"
+    foreign_snapshot = b"foreign recovery evidence\n"
+    original_link = os.link
+    injected = False
+
+    def race_snapshot_publish(source: object, target: object) -> None:
+        nonlocal injected
+        target_path = Path(target)
+        if not injected and target_path.name == "snapshot.jsonl":
+            injected = True
+            target_path.write_bytes(foreign_snapshot)
+        original_link(source, target)
+
+    monkeypatch.setattr("os.link", race_snapshot_publish)
+
+    with pytest.raises(AtomicIndexError, match="提交准备"):
+        AtomicIndexer(
+            embedding_client=FakeEmbedding([[0.1, 0.2]]), store=store
+        ).commit(
+            write_chunks(tmp_path / "chunks.jsonl", [chunk("new", "新增")]),
+            journal_dir=journal_dir,
+        )
+
+    assert snapshot_path.read_bytes() == foreign_snapshot
+    assert not (journal_dir / "journal.json").exists()
+    assert store.upsert_calls == 0
+
+
+def test_second_file_publish_failure_never_deletes_foreign_pair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = FakeTransactionalStore(existing={})
+    journal_dir = tmp_path / "rollback"
+    snapshot_path = journal_dir / "snapshot.jsonl"
+    journal_path = journal_dir / "journal.json"
+    foreign_snapshot = b"foreign snapshot\n"
+    foreign_journal = b'{"foreign":true}\n'
+    original_link = os.link
+    injected = False
+
+    def race_journal_publish(source: object, target: object) -> None:
+        nonlocal injected
+        target_path = Path(target)
+        if not injected and target_path.name == "journal.json":
+            injected = True
+            snapshot_path.unlink()
+            snapshot_path.write_bytes(foreign_snapshot)
+            journal_path.write_bytes(foreign_journal)
+        original_link(source, target)
+
+    monkeypatch.setattr("os.link", race_journal_publish)
+
+    with pytest.raises(AtomicIndexError, match="提交准备"):
+        AtomicIndexer(
+            embedding_client=FakeEmbedding([[0.1, 0.2]]), store=store
+        ).commit(
+            write_chunks(tmp_path / "chunks.jsonl", [chunk("new", "新增")]),
+            journal_dir=journal_dir,
+        )
+
+    assert snapshot_path.read_bytes() == foreign_snapshot
+    assert journal_path.read_bytes() == foreign_journal
+    assert store.upsert_calls == 0
 
 
 def test_creating_journal_directory_fsyncs_its_parent(
@@ -304,12 +509,15 @@ def test_embedding_failure_happens_before_any_store_access(tmp_path: Path) -> No
         store=store,
     )
 
-    with pytest.raises(RuntimeError, match="embedding failed"):
+    with pytest.raises(AtomicIndexError) as caught:
         indexer.commit(
             write_chunks(tmp_path / "chunks.jsonl", [chunk("one", "文本")]),
             journal_dir=tmp_path / "rollback",
         )
 
+    assert str(caught.value) == "向量生成失败"
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert "embedding failed" not in str(caught.value)
     assert store.collection_checks == 0
     assert store.upsert_calls == 0
     assert not (tmp_path / "rollback").exists()
@@ -376,12 +584,74 @@ def test_invalid_embeddings_do_not_prepare_or_write(
     assert store.upsert_calls == 0
 
 
+@pytest.mark.parametrize(
+    "vector",
+    [
+        [True, 0.2],
+        ["0.1", 0.2],
+        [float("nan"), 0.2],
+        [float("inf"), 0.2],
+        [float("-inf"), 0.2],
+        [10**10000, 0.2],
+    ],
+)
+def test_invalid_embedding_elements_are_rejected_before_store_access(
+    tmp_path: Path, vector: list[Any]
+) -> None:
+    store = FakeTransactionalStore(existing={})
+
+    with pytest.raises(AtomicIndexError, match="数值"):
+        AtomicIndexer(embedding_client=FakeEmbedding([vector]), store=store).commit(
+            write_chunks(tmp_path / "chunks.jsonl", [chunk("one", "文本")]),
+            journal_dir=tmp_path / "rollback",
+        )
+
+    assert store.collection_checks == 0
+    assert store.upsert_calls == 0
+    assert not (tmp_path / "rollback").exists()
+
+
+def test_empty_chunks_are_rejected_without_embedding_or_store_access(
+    tmp_path: Path,
+) -> None:
+    store = FakeTransactionalStore(existing={})
+    embedding = FakeEmbedding([])
+
+    with pytest.raises(AtomicIndexError, match="不能为空"):
+        AtomicIndexer(embedding_client=embedding, store=store).commit(
+            write_chunks(tmp_path / "chunks.jsonl", []),
+            journal_dir=tmp_path / "rollback",
+        )
+
+    assert embedding.calls == []
+    assert store.collection_checks == 0
+
+
+def test_duplicate_chunk_ids_are_rejected_before_embedding_and_store_access(
+    tmp_path: Path,
+) -> None:
+    store = FakeTransactionalStore(existing={})
+    embedding = FakeEmbedding([[0.1, 0.2], [0.3, 0.4]])
+
+    with pytest.raises(AtomicIndexError, match="重复"):
+        AtomicIndexer(embedding_client=embedding, store=store).commit(
+            write_chunks(
+                tmp_path / "chunks.jsonl",
+                [chunk("same", "文本一"), chunk("same", "文本二")],
+            ),
+            journal_dir=tmp_path / "rollback",
+        )
+
+    assert embedding.calls == []
+    assert store.collection_checks == 0
+
+
 def test_failure_after_creating_new_collection_drops_it(tmp_path: Path) -> None:
     store = FakeTransactionalStore(
         existing={}, collection_existed=False, fail_after_upsert=True
     )
 
-    with pytest.raises(RuntimeError, match="flush failed"):
+    with pytest.raises(AtomicIndexError) as caught:
         AtomicIndexer(
             embedding_client=FakeEmbedding([[0.1, 0.2]]), store=store
         ).commit(
@@ -389,6 +659,7 @@ def test_failure_after_creating_new_collection_drops_it(tmp_path: Path) -> None:
             journal_dir=tmp_path / "rollback",
         )
 
+    assert str(caught.value) == "知识库写入失败，已完成回滚"
     assert store.exists is False
     assert store.rows == {}
     assert store.drop_calls == 1
@@ -413,15 +684,112 @@ def test_write_verification_failure_is_compensated(tmp_path: Path) -> None:
     assert read_journal(tmp_path / "rollback")["state"] == "rolled_back"
 
 
-def test_journal_write_failure_never_upserts_and_removes_snapshot(
-    tmp_path: Path,
+def test_write_verification_rejects_same_count_with_wrong_ids(tmp_path: Path) -> None:
+    store = FakeTransactionalStore(existing={})
+    store.wrong_ids_on_next_verify = True
+
+    with pytest.raises(AtomicIndexError):
+        AtomicIndexer(
+            embedding_client=FakeEmbedding([[0.1, 0.2], [0.3, 0.4]]), store=store
+        ).commit(
+            write_chunks(
+                tmp_path / "chunks.jsonl",
+                [chunk("one", "文本一"), chunk("two", "文本二")],
+            ),
+            journal_dir=tmp_path / "rollback",
+        )
+
+    assert store.rows == {}
+    assert read_journal(tmp_path / "rollback")["state"] == "rolled_back"
+
+
+@pytest.mark.parametrize("crash", [KeyboardInterrupt(), SystemExit(2)])
+def test_base_exception_leaves_prepared_for_crash_recovery(
+    tmp_path: Path, crash: BaseException
+) -> None:
+    store = FakeTransactionalStore(existing={})
+    store.next_flush_error = crash
+    journal_dir = tmp_path / "rollback"
+    indexer = AtomicIndexer(
+        embedding_client=FakeEmbedding([[0.1, 0.2]]), store=store
+    )
+
+    with pytest.raises(type(crash)):
+        indexer.commit(
+            write_chunks(tmp_path / "chunks.jsonl", [chunk("new", "新增")]),
+            journal_dir=journal_dir,
+        )
+
+    assert "new" in store.rows
+    assert store.delete_calls == []
+    assert read_journal(journal_dir)["state"] == "prepared"
+
+    indexer.recover(journal_dir / "journal.json")
+    assert store.rows == {}
+    assert read_journal(journal_dir)["state"] == "rolled_back"
+
+
+def test_committed_journal_write_failure_is_compensated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = FakeTransactionalStore(existing={})
+    original_replace = os.replace
+    failed = False
+
+    def fail_committed_replace(source: object, target: object) -> None:
+        nonlocal failed
+        source_path = Path(source)
+        target_path = Path(target)
+        if (
+            not failed
+            and target_path.name == "journal.json"
+            and json.loads(source_path.read_text(encoding="utf-8"))["state"]
+            == "committed"
+        ):
+            failed = True
+            raise OSError("commit journal failed at /private/secret")
+        original_replace(source, target)
+
+    monkeypatch.setattr("os.replace", fail_committed_replace)
+
+    with pytest.raises(AtomicIndexError):
+        AtomicIndexer(
+            embedding_client=FakeEmbedding([[0.1, 0.2]]), store=store
+        ).commit(
+            write_chunks(tmp_path / "chunks.jsonl", [chunk("new", "新增")]),
+            journal_dir=tmp_path / "rollback",
+        )
+
+    assert store.rows == {}
+    assert read_journal(tmp_path / "rollback")["state"] == "rolled_back"
+
+
+def test_journal_publish_failure_never_upserts_or_overwrites_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = FakeTransactionalStore(existing={})
     journal_dir = tmp_path / "rollback"
     journal_dir.mkdir()
-    (journal_dir / "journal.json").mkdir()
+    original_link = os.link
+    original_fsync = os.fsync
+    directory_fsync_temp_states: list[bool] = []
 
-    with pytest.raises(OSError):
+    def fail_journal_publish(source: object, target: object) -> None:
+        if Path(target).name == "journal.json":
+            raise OSError("journal publish failed at /private/secret")
+        original_link(source, target)
+
+    def record_directory_fsync(fd: int) -> None:
+        metadata = os.fstat(fd)
+        directory = journal_dir.stat()
+        if (metadata.st_dev, metadata.st_ino) == (directory.st_dev, directory.st_ino):
+            directory_fsync_temp_states.append(bool(list(journal_dir.glob(".*.tmp"))))
+        original_fsync(fd)
+
+    monkeypatch.setattr("os.link", fail_journal_publish)
+    monkeypatch.setattr("os.fsync", record_directory_fsync)
+
+    with pytest.raises(AtomicIndexError) as caught:
         AtomicIndexer(
             embedding_client=FakeEmbedding([[0.1, 0.2]]), store=store
         ).commit(
@@ -429,8 +797,13 @@ def test_journal_write_failure_never_upserts_and_removes_snapshot(
             journal_dir=journal_dir,
         )
 
+    assert str(caught.value) == "知识库提交准备失败"
+    assert isinstance(caught.value.__cause__, OSError)
+    assert "/private" not in str(caught.value)
     assert store.upsert_calls == 0
-    assert not (journal_dir / "snapshot.jsonl").exists()
+    assert (journal_dir / "snapshot.jsonl").is_file()
+    assert not (journal_dir / "journal.json").exists()
+    assert directory_fsync_temp_states[-1] is False
 
 
 def test_journal_directory_fsync_failure_preserves_possible_recovery_pair(
@@ -461,7 +834,7 @@ def test_journal_directory_fsync_failure_preserves_possible_recovery_pair(
 
     monkeypatch.setattr("os.fsync", fail_after_journal_replace)
 
-    with pytest.raises(OSError, match="directory fsync failed"):
+    with pytest.raises(AtomicIndexError) as caught:
         AtomicIndexer(
             embedding_client=FakeEmbedding([[0.9, 0.8]]), store=store
         ).commit(
@@ -469,6 +842,8 @@ def test_journal_directory_fsync_failure_preserves_possible_recovery_pair(
             journal_dir=journal_dir,
         )
 
+    assert str(caught.value) == "知识库提交准备失败"
+    assert isinstance(caught.value.__cause__, OSError)
     assert store.upsert_calls == 0
     assert journal_path.is_file()
     assert (journal_dir / "snapshot.jsonl").is_file()
@@ -482,7 +857,7 @@ def test_prepared_callback_failure_is_compensated(tmp_path: Path) -> None:
         if state == "prepared":
             raise RuntimeError("state store failed")
 
-    with pytest.raises(RuntimeError, match="state store failed"):
+    with pytest.raises(AtomicIndexError) as caught:
         AtomicIndexer(
             embedding_client=FakeEmbedding([[0.1, 0.2]]), store=store
         ).commit(
@@ -491,6 +866,8 @@ def test_prepared_callback_failure_is_compensated(tmp_path: Path) -> None:
             on_state=on_state,
         )
 
+    assert str(caught.value) == "知识库写入失败，已完成回滚"
+    assert isinstance(caught.value.__cause__, RuntimeError)
     assert store.rows == {}
     assert read_journal(tmp_path / "rollback")["state"] == "rolled_back"
 
@@ -503,7 +880,7 @@ def test_prepared_callback_failure_cannot_block_physical_compensation(
     def unavailable_state_store(_state: str, _journal_path: Path) -> None:
         raise RuntimeError("state store unavailable")
 
-    with pytest.raises(RuntimeError, match="state store unavailable"):
+    with pytest.raises(AtomicIndexError) as caught:
         AtomicIndexer(
             embedding_client=FakeEmbedding([[0.1, 0.2]]), store=store
         ).commit(
@@ -512,6 +889,7 @@ def test_prepared_callback_failure_cannot_block_physical_compensation(
             on_state=unavailable_state_store,
         )
 
+    assert str(caught.value) == "知识库写入失败，已完成回滚"
     assert store.rows == {}
     assert read_journal(tmp_path / "rollback")["state"] == "rolled_back"
 
@@ -533,6 +911,8 @@ def test_commit_raises_pending_when_physical_rollback_fails(tmp_path: Path) -> N
     assert caught.value.journal_path == journal_dir / "journal.json"
     assert "new" in store.rows
     assert read_journal(journal_dir)["state"] == "rolling_back"
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert str(caught.value.__cause__) == "delete failed"
 
 
 def test_committed_callback_failure_does_not_roll_back(tmp_path: Path) -> None:
@@ -542,7 +922,7 @@ def test_committed_callback_failure_does_not_roll_back(tmp_path: Path) -> None:
         if state == "committed":
             raise RuntimeError("sqlite state failed")
 
-    with pytest.raises(RuntimeError, match="sqlite state failed"):
+    with pytest.raises(AtomicIndexError) as caught:
         AtomicIndexer(
             embedding_client=FakeEmbedding([[0.1, 0.2]]), store=store
         ).commit(
@@ -551,6 +931,8 @@ def test_committed_callback_failure_does_not_roll_back(tmp_path: Path) -> None:
             on_state=on_state,
         )
 
+    assert str(caught.value) == "知识库已提交，但状态同步失败"
+    assert isinstance(caught.value.__cause__, RuntimeError)
     assert "new" in store.rows
     assert store.delete_calls == []
     assert read_journal(tmp_path / "rollback")["state"] == "committed"
@@ -576,6 +958,281 @@ def test_recover_prepared_journal_rolls_back(tmp_path: Path) -> None:
     assert store.rows["same"] == raw_row("same", "旧文本", [0.1, 0.2])
     assert "new" not in store.rows
     assert read_journal(journal.parent)["state"] == "rolled_back"
+
+
+@pytest.mark.parametrize("separator", ["\u2028", "\u2029"])
+def test_recover_preserves_unicode_line_separator_inside_snapshot_text(
+    tmp_path: Path, separator: str
+) -> None:
+    old = raw_row("same", f"旧{separator}文本", [0.1, 0.2])
+    current = raw_row("same", "新文本", [0.9, 0.8])
+    store = FakeTransactionalStore(existing={"same": current})
+    journal = write_prepared_journal(
+        tmp_path / "rollback",
+        store=store,
+        chunk_ids=["same"],
+        old_rows=[old],
+        collection_existed=True,
+    )
+
+    AtomicIndexer(embedding_client=FakeEmbedding([]), store=store).recover(journal)
+
+    assert store.rows == {"same": old}
+    assert read_journal(journal.parent)["state"] == "rolled_back"
+
+
+@pytest.mark.parametrize("identity_change", ["uri", "collection_name"])
+def test_recover_rejects_collection_identity_mismatch_without_store_writes(
+    tmp_path: Path, identity_change: str
+) -> None:
+    store = FakeTransactionalStore(existing={})
+    journal = write_prepared_journal(
+        tmp_path / "rollback",
+        store=store,
+        chunk_ids=["new"],
+        old_rows=[],
+        collection_existed=True,
+    )
+    if identity_change == "uri":
+        store.uri = "memory://different-store"
+    else:
+        store.collection_name = "other_chunks"
+
+    with pytest.raises(AtomicIndexError, match="collection"):
+        AtomicIndexer(embedding_client=FakeEmbedding([]), store=store).recover(journal)
+
+    assert store.upsert_calls == 0
+    assert store.delete_calls == []
+    assert store.drop_calls == 0
+    assert store.flush_calls == 0
+
+
+def test_recover_rolled_back_performs_no_store_operation(tmp_path: Path) -> None:
+    store = FakeTransactionalStore(existing={})
+    journal = write_prepared_journal(
+        tmp_path / "rollback",
+        store=store,
+        chunk_ids=["new"],
+        old_rows=[],
+        collection_existed=True,
+        state="rolled_back",
+    )
+
+    AtomicIndexer(embedding_client=FakeEmbedding([]), store=store).recover(journal)
+
+    assert store.collection_checks == 0
+    assert store.fetch_calls == 0
+    assert store.upsert_calls == 0
+    assert store.delete_calls == []
+    assert store.drop_calls == 0
+    assert store.flush_calls == 0
+
+
+def test_recover_rejects_journal_self_checksum_mismatch_before_store_write(
+    tmp_path: Path,
+) -> None:
+    old = raw_row("same", "旧文本", [0.1, 0.2])
+    current = raw_row("same", "新文本", [0.9, 0.8])
+    store = FakeTransactionalStore(existing={"same": current})
+    journal_path = write_prepared_journal(
+        tmp_path / "rollback",
+        store=store,
+        chunk_ids=["same"],
+        old_rows=[old],
+        collection_existed=True,
+    )
+    journal = read_journal(journal_path.parent)
+    journal["collection_existed"] = False
+    journal_path.write_text(json.dumps(journal, ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(AtomicIndexError, match="journal 自校验"):
+        AtomicIndexer(embedding_client=FakeEmbedding([]), store=store).recover(
+            journal_path
+        )
+
+    assert store.rows == {"same": current}
+    assert store.delete_calls == []
+    assert store.upsert_calls == 0
+    assert store.drop_calls == 0
+
+
+def test_recover_rejects_snapshot_digest_mismatch_before_store_write(
+    tmp_path: Path,
+) -> None:
+    old = raw_row("same", "旧文本", [0.1, 0.2])
+    current = raw_row("same", "新文本", [0.9, 0.8])
+    store = FakeTransactionalStore(existing={"same": current})
+    journal_path = write_prepared_journal(
+        tmp_path / "rollback",
+        store=store,
+        chunk_ids=["same"],
+        old_rows=[old],
+        collection_existed=True,
+    )
+    with (journal_path.parent / "snapshot.jsonl").open("ab") as handle:
+        handle.write(b"\n")
+
+    with pytest.raises(AtomicIndexError, match="snapshot 完整性"):
+        AtomicIndexer(embedding_client=FakeEmbedding([]), store=store).recover(
+            journal_path
+        )
+
+    assert store.rows == {"same": current}
+    assert store.delete_calls == []
+    assert store.upsert_calls == 0
+
+
+@pytest.mark.parametrize(
+    "chunk_ids",
+    [[], ["two", "one"], ["one", "one"], ["one", 2]],
+)
+def test_recover_rejects_invalid_journal_ids_before_store_write(
+    tmp_path: Path, chunk_ids: list[Any]
+) -> None:
+    store = FakeTransactionalStore(existing={})
+    journal_path = write_prepared_journal(
+        tmp_path / "rollback",
+        store=store,
+        chunk_ids=["one"],
+        old_rows=[],
+        collection_existed=True,
+    )
+    journal = read_journal(journal_path.parent)
+    journal["chunk_ids"] = chunk_ids
+    write_journal_data(journal_path, journal)
+
+    with pytest.raises(AtomicIndexError, match="chunk_ids"):
+        AtomicIndexer(embedding_client=FakeEmbedding([]), store=store).recover(
+            journal_path
+        )
+
+    assert store.delete_calls == []
+    assert store.upsert_calls == 0
+    assert store.drop_calls == 0
+
+
+def test_recover_rejects_boolean_journal_version_before_store_write(
+    tmp_path: Path,
+) -> None:
+    store = FakeTransactionalStore(existing={})
+    journal_path = write_prepared_journal(
+        tmp_path / "rollback",
+        store=store,
+        chunk_ids=["one"],
+        old_rows=[],
+        collection_existed=True,
+    )
+    journal = read_journal(journal_path.parent)
+    journal["version"] = True
+    write_journal_data(journal_path, journal)
+
+    with pytest.raises(AtomicIndexError, match="版本"):
+        AtomicIndexer(embedding_client=FakeEmbedding([]), store=store).recover(
+            journal_path
+        )
+
+    assert store.delete_calls == []
+    assert store.upsert_calls == 0
+    assert store.drop_calls == 0
+
+
+def test_recover_rejects_snapshot_count_mismatch_before_store_write(
+    tmp_path: Path,
+) -> None:
+    current = raw_row("same", "新文本", [0.9, 0.8])
+    store = FakeTransactionalStore(existing={"same": current})
+    journal_path = write_prepared_journal(
+        tmp_path / "rollback",
+        store=store,
+        chunk_ids=["same"],
+        old_rows=[raw_row("same", "旧文本", [0.1, 0.2])],
+        collection_existed=True,
+    )
+    journal = read_journal(journal_path.parent)
+    journal["snapshot_count"] = 2
+    write_journal_data(journal_path, journal)
+
+    with pytest.raises(AtomicIndexError, match="行数"):
+        AtomicIndexer(embedding_client=FakeEmbedding([]), store=store).recover(
+            journal_path
+        )
+
+    assert store.rows == {"same": current}
+    assert store.delete_calls == []
+    assert store.upsert_calls == 0
+
+
+def test_recover_rejects_blank_snapshot_line_before_store_write(
+    tmp_path: Path,
+) -> None:
+    current = raw_row("same", "新文本", [0.9, 0.8])
+    store = FakeTransactionalStore(existing={"same": current})
+    journal_path = write_prepared_journal(
+        tmp_path / "rollback",
+        store=store,
+        chunk_ids=["same"],
+        old_rows=[raw_row("same", "旧文本", [0.1, 0.2])],
+        collection_existed=True,
+    )
+    snapshot_path = journal_path.parent / "snapshot.jsonl"
+    payload = snapshot_path.read_bytes() + b"\n"
+    snapshot_path.write_bytes(payload)
+    journal = read_journal(journal_path.parent)
+    journal["snapshot_sha256"] = hashlib.sha256(payload).hexdigest()
+    journal["snapshot_size"] = len(payload)
+    write_journal_data(journal_path, journal)
+
+    with pytest.raises(AtomicIndexError, match="空行"):
+        AtomicIndexer(embedding_client=FakeEmbedding([]), store=store).recover(
+            journal_path
+        )
+
+    assert store.rows == {"same": current}
+    assert store.delete_calls == []
+    assert store.upsert_calls == 0
+
+
+@pytest.mark.parametrize("corruption", ["vector_dim", "extra_field", "text_hash"])
+def test_recover_rejects_semantically_invalid_snapshot_before_store_write(
+    tmp_path: Path, corruption: str
+) -> None:
+    old = raw_row("same", "旧文本", [0.1, 0.2])
+    current = raw_row("same", "新文本", [0.9, 0.8])
+    store = FakeTransactionalStore(existing={"same": current})
+    journal_path = write_prepared_journal(
+        tmp_path / "rollback",
+        store=store,
+        chunk_ids=["same"],
+        old_rows=[old],
+        collection_existed=True,
+    )
+    damaged = copy.deepcopy(old)
+    if corruption == "vector_dim":
+        damaged["vector"] = [0.1, 0.2, 0.3]
+    elif corruption == "extra_field":
+        damaged["unexpected"] = "not in Milvus schema"
+    else:
+        damaged["text_hash"] = "0" * 64
+    snapshot_payload = (
+        json.dumps(damaged, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    (journal_path.parent / "snapshot.jsonl").write_bytes(snapshot_payload)
+    journal = read_journal(journal_path.parent)
+    journal.update(
+        snapshot_sha256=hashlib.sha256(snapshot_payload).hexdigest(),
+        snapshot_size=len(snapshot_payload),
+        snapshot_count=1,
+    )
+    write_journal_data(journal_path, journal)
+
+    with pytest.raises(AtomicIndexError, match="snapshot"):
+        AtomicIndexer(embedding_client=FakeEmbedding([]), store=store).recover(
+            journal_path
+        )
+
+    assert store.rows == {"same": current}
+    assert store.delete_calls == []
+    assert store.upsert_calls == 0
 
 
 def test_recover_rolling_back_is_idempotent(tmp_path: Path) -> None:
@@ -651,7 +1308,7 @@ def test_recover_rejects_incomplete_snapshot_before_destructive_delete(
         collection_existed=True,
     )
 
-    with pytest.raises(AtomicIndexError, match="字段不完整"):
+    with pytest.raises(AtomicIndexError, match="字段集合"):
         AtomicIndexer(embedding_client=FakeEmbedding([]), store=store).recover(journal)
 
     assert store.rows == {"same": current}
@@ -679,6 +1336,29 @@ def test_recover_can_resume_after_rollback_failure(tmp_path: Path) -> None:
 
     assert store.rows == {}
     assert read_journal(journal.parent)["state"] == "rolled_back"
+
+
+def test_rollback_flushes_and_corrupt_restoration_remains_pending(
+    tmp_path: Path,
+) -> None:
+    old = raw_row("same", "旧文本", [0.1, 0.2])
+    current = raw_row("same", "新文本", [0.9, 0.8])
+    store = FakeTransactionalStore(existing={"same": current})
+    store.corrupt_fetch_field = "text_hash"
+    journal = write_prepared_journal(
+        tmp_path / "rollback",
+        store=store,
+        chunk_ids=["same"],
+        old_rows=[old],
+        collection_existed=True,
+    )
+
+    with pytest.raises(RollbackPendingError):
+        AtomicIndexer(embedding_client=FakeEmbedding([]), store=store).recover(journal)
+
+    assert store.flush_calls == 1
+    assert store.delete_calls == [["same"]]
+    assert read_journal(journal.parent)["state"] == "rolling_back"
 
 
 def test_recover_drops_collection_that_did_not_exist_before(tmp_path: Path) -> None:
