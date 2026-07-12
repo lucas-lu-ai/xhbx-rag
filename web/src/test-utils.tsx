@@ -5,7 +5,10 @@ import type {
   BatchRunDetail,
   BatchRunProgress,
   BatchRunQuestionDetail,
-  BatchRunSummary
+  BatchRunSummary,
+  IngestionJobDetail,
+  IngestionJobProgress,
+  IngestionJobSummary
 } from "./types";
 
 export const statusPayload = {
@@ -367,4 +370,289 @@ export function batchRunProgressOf(detail: BatchRunDetail): BatchRunProgress {
       updated_at: question.updated_at
     }))
   };
+}
+
+export function ingestionSummary(
+  overrides: Partial<IngestionJobSummary> = {}
+): IngestionJobSummary {
+  return {
+    job_id: "job-1",
+    source_name: "优秀案例.zip",
+    source_kind: "zip",
+    target: "case",
+    status: "succeeded",
+    current_stage: "completed",
+    attempt_count: 1,
+    item_total: 3,
+    item_done: 3,
+    document_total: 6,
+    chunk_total: 24,
+    ignored_total: 1,
+    warning_count: 0,
+    error_code: null,
+    error_detail: null,
+    created_at: "2026-07-10T08:00:00+00:00",
+    updated_at: "2026-07-10T08:05:00+00:00",
+    started_at: "2026-07-10T08:01:00+00:00",
+    finished_at: "2026-07-10T08:05:00+00:00",
+    ...overrides
+  };
+}
+
+export function ingestionDetail(
+  overrides: Partial<IngestionJobDetail> = {}
+): IngestionJobDetail {
+  return {
+    ...ingestionSummary(),
+    ignored_entries: ["__MACOSX/._说明.txt"],
+    items: [
+      {
+        item_index: 1,
+        unit_key: "王女士年金险案例",
+        display_name: "王女士年金险案例",
+        relative_paths: ["王女士年金险案例/沟通记录.txt"],
+        document_count: 2,
+        status: "succeeded",
+        current_stage: "completed",
+        chunk_count: 8,
+        warning_count: 0,
+        error_detail: null,
+        updated_at: "2026-07-10T08:05:00+00:00"
+      },
+      {
+        item_index: 2,
+        unit_key: "李先生养老规划",
+        display_name: "李先生养老规划",
+        relative_paths: ["李先生养老规划/需求说明.pdf"],
+        document_count: 2,
+        status: "succeeded",
+        current_stage: "completed",
+        chunk_count: 9,
+        warning_count: 0,
+        error_detail: null,
+        updated_at: "2026-07-10T08:05:00+00:00"
+      },
+      {
+        item_index: 3,
+        unit_key: "赵先生保障方案",
+        display_name: "赵先生保障方案",
+        relative_paths: ["赵先生保障方案/方案.docx"],
+        document_count: 2,
+        status: "succeeded",
+        current_stage: "completed",
+        chunk_count: 7,
+        warning_count: 0,
+        error_detail: null,
+        updated_at: "2026-07-10T08:05:00+00:00"
+      }
+    ],
+    attempt: {
+      attempt_no: 1,
+      status: "succeeded",
+      current_stage: "completed",
+      commit_state: "committed",
+      error_code: null,
+      error_detail: null,
+      started_at: "2026-07-10T08:01:00+00:00",
+      finished_at: "2026-07-10T08:05:00+00:00"
+    },
+    events: [
+      {
+        attempt_no: 1,
+        sequence: 1,
+        event_type: "attempt_started",
+        message: "任务开始处理",
+        payload: { internal_path: "/private/secret", token: "do-not-render" },
+        created_at: "2026-07-10T08:01:00+00:00"
+      }
+    ],
+    ...overrides
+  };
+}
+
+export function ingestionDraftPayload(
+  overrides: Partial<IngestionJobDetail> = {}
+): IngestionJobDetail {
+  const detail = ingestionDetail({
+    status: "draft",
+    current_stage: "uploaded",
+    attempt_count: 0,
+    item_done: 0,
+    chunk_total: 0,
+    started_at: null,
+    finished_at: null,
+    attempt: null,
+    events: [],
+    items: ingestionDetail().items.map((item) => ({
+      ...item,
+      status: "pending",
+      current_stage: "uploaded",
+      chunk_count: 0
+    }))
+  });
+  return { ...detail, ...overrides };
+}
+
+type IngestionApiStubOptions = {
+  draft?: IngestionJobDetail;
+  jobs?: IngestionJobSummary[];
+  detail?: IngestionJobDetail;
+  progress?: IngestionJobProgress;
+  listError?: string;
+};
+
+export function installIngestionApiStub(
+  options: IngestionApiStubOptions = {}
+) {
+  let currentDetail = options.detail ?? options.draft ?? ingestionDraftPayload();
+  let jobs = options.jobs ?? (options.detail ? [summaryOf(currentDetail)] : []);
+
+  const installed = installFetchStub((url, init) => {
+    const method = init?.method ?? "GET";
+    if (url.endsWith("/api/ingestion-jobs") && method === "GET") {
+      if (options.listError) {
+        return jsonResponse({ detail: options.listError }, { status: 503 });
+      }
+      return jsonResponse({ jobs });
+    }
+    if (
+      url.endsWith(`/api/ingestion-jobs/${currentDetail.job_id}/progress`) &&
+      method === "GET"
+    ) {
+      return jsonResponse(options.progress ?? progressOf(currentDetail));
+    }
+    if (
+      url.endsWith(`/api/ingestion-jobs/${currentDetail.job_id}/start`) &&
+      method === "POST"
+    ) {
+      currentDetail = { ...currentDetail, status: "queued" };
+      jobs = upsertIngestionSummary(jobs, summaryOf(currentDetail));
+      return jsonResponse({ ok: true, job_id: currentDetail.job_id, status: "queued" });
+    }
+    if (
+      url.endsWith(`/api/ingestion-jobs/${currentDetail.job_id}/retry`) &&
+      method === "POST"
+    ) {
+      currentDetail = {
+        ...currentDetail,
+        status: "queued",
+        attempt_count: currentDetail.attempt_count + 1,
+        error_code: null,
+        error_detail: null
+      };
+      jobs = upsertIngestionSummary(jobs, summaryOf(currentDetail));
+      return jsonResponse({
+        ok: true,
+        job_id: currentDetail.job_id,
+        status: "queued",
+        attempt_no: currentDetail.attempt_count
+      });
+    }
+    if (
+      url.endsWith(`/api/ingestion-jobs/${currentDetail.job_id}`) &&
+      method === "DELETE"
+    ) {
+      jobs = jobs.filter((job) => job.job_id !== currentDetail.job_id);
+      return jsonResponse({
+        ok: true,
+        job_id: currentDetail.job_id,
+        status: "deleted"
+      });
+    }
+    if (
+      url.endsWith(`/api/ingestion-jobs/${currentDetail.job_id}`) &&
+      method === "GET"
+    ) {
+      return jsonResponse(currentDetail);
+    }
+    return null;
+  });
+
+  class StubXMLHttpRequest extends EventTarget {
+    readonly upload = new EventTarget();
+    status = 0;
+    responseText = "";
+    timeout = 0;
+    private aborted = false;
+    private method = "GET";
+    private url = "";
+
+    open(method: string, url: string) {
+      this.method = method;
+      this.url = url;
+    }
+
+    send(body?: Document | XMLHttpRequestBodyInit | null) {
+      installed.requests.push({ url: this.url, method: this.method, body });
+      queueMicrotask(() => {
+        if (this.aborted) {
+          return;
+        }
+        this.upload.dispatchEvent(
+          new ProgressEvent("progress", {
+            lengthComputable: true,
+            loaded: 1,
+            total: 1
+          })
+        );
+        currentDetail = options.draft ?? ingestionDraftPayload();
+        jobs = upsertIngestionSummary(jobs, summaryOf(currentDetail));
+        this.status = 201;
+        this.responseText = JSON.stringify(currentDetail);
+        this.dispatchEvent(new Event("load"));
+      });
+    }
+
+    abort() {
+      if (this.aborted) {
+        return;
+      }
+      this.aborted = true;
+      this.dispatchEvent(new Event("abort"));
+    }
+  }
+
+  vi.stubGlobal("XMLHttpRequest", StubXMLHttpRequest);
+  return {
+    ...installed,
+    get jobs() {
+      return jobs;
+    }
+  };
+}
+
+function summaryOf(detail: IngestionJobDetail): IngestionJobSummary {
+  const {
+    ignored_entries: _ignoredEntries,
+    items: _items,
+    attempt: _attempt,
+    events: _events,
+    ...summary
+  } = detail;
+  return summary;
+}
+
+function progressOf(detail: IngestionJobDetail): IngestionJobProgress {
+  return {
+    job_id: detail.job_id,
+    status: detail.status,
+    current_stage: detail.current_stage,
+    attempt_no: detail.attempt?.attempt_no ?? null,
+    item_total: detail.item_total,
+    item_done: detail.item_done,
+    document_total: detail.document_total,
+    chunk_total: detail.chunk_total,
+    warning_count: detail.warning_count,
+    active_item_index:
+      detail.items.find((item) => item.status === "running")?.item_index ?? null,
+    message: null,
+    updated_at: detail.updated_at
+  };
+}
+
+function upsertIngestionSummary(
+  jobs: IngestionJobSummary[],
+  summary: IngestionJobSummary
+): IngestionJobSummary[] {
+  return [summary, ...jobs.filter((job) => job.job_id !== summary.job_id)];
 }

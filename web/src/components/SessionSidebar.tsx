@@ -11,6 +11,7 @@ import type {
   ChatSession,
   SessionSelection
 } from "../types";
+import { WorkspaceNav } from "./WorkspaceNav";
 
 type SessionSidebarProps = {
   chatSessions: ChatSession[];
@@ -23,6 +24,7 @@ type SessionSidebarProps = {
   onDeleteBatch: (runId: string) => void;
   onCreateSession: () => void;
   onCreateBatch: () => void;
+  onOpenIngestion: () => void;
 };
 
 export function SessionSidebar({
@@ -35,12 +37,19 @@ export function SessionSidebar({
   onDeleteChat,
   onDeleteBatch,
   onCreateSession,
-  onCreateBatch
+  onCreateBatch,
+  onOpenIngestion
 }: SessionSidebarProps) {
   const entries = mergeSessionEntries(chatSessions, batchRuns);
 
   return (
     <aside className="session-panel" aria-label="会话列表">
+      <WorkspaceNav
+        currentView="chat"
+        onNavigate={(view) => {
+          if (view === "ingestion") onOpenIngestion();
+        }}
+      />
       <header className="session-header">
         <div>
           <p className="eyebrow">会话</p>

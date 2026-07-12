@@ -1,7 +1,17 @@
 import { AlertCircle, ChevronDown, Database, FileText } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { ApiError, deleteBatchRun, getStatus, listBatchRuns } from "./api";
+import {
+  ApiError,
+  deleteBatchRun,
+  deleteIngestionJob,
+  getIngestionJob,
+  getStatus,
+  listBatchRuns,
+  listIngestionJobs,
+  retryIngestionJob,
+  startIngestionJob
+} from "./api";
 import {
   latestSessionSelection,
   mergeSessionEntries,
@@ -24,7 +34,12 @@ import {
   EvidenceDetailContext,
   type EvidenceDetailContextValue
 } from "./components/EvidenceDetailContext";
+import { IngestionCreateView } from "./components/IngestionCreateView";
+import { IngestionDetailPanel } from "./components/IngestionDetailPanel";
+import { IngestionRunView } from "./components/IngestionRunView";
+import { IngestionSidebar } from "./components/IngestionSidebar";
 import { SessionSidebar } from "./components/SessionSidebar";
+import { isIngestionJobActive } from "./ingestion";
 import {
   loadSessionSelection,
   persistSessionSelection
@@ -32,9 +47,18 @@ import {
 import type {
   BatchRunSummary,
   ChatTurn,
+  IngestionJobDetail,
+  IngestionJobProgress,
+  IngestionJobSummary,
   SessionSelection,
   StatusResponse
 } from "./types";
+import {
+  navigateWorkspaceLocation,
+  parseWorkspaceLocation,
+  subscribeWorkspaceLocation,
+  type WorkspaceLocation
+} from "./workspaceLocation";
 
 const DEFAULT_BATCH_POLL_INTERVAL_MS = 2000;
 const DEFAULT_LIST_POLL_INTERVAL_MS = 5000;
@@ -63,12 +87,17 @@ const emptyStatus: StatusResponse = {
 type AppProps = {
   batchPollIntervalMs?: number;
   listPollIntervalMs?: number;
+  ingestionPollIntervalMs?: number;
 };
 
 export function App({
   batchPollIntervalMs = DEFAULT_BATCH_POLL_INTERVAL_MS,
-  listPollIntervalMs = DEFAULT_LIST_POLL_INTERVAL_MS
+  listPollIntervalMs = DEFAULT_LIST_POLL_INTERVAL_MS,
+  ingestionPollIntervalMs = DEFAULT_BATCH_POLL_INTERVAL_MS
 }: AppProps = {}) {
+  const [workspaceLocation, setWorkspaceLocation] = useState<WorkspaceLocation>(
+    () => parseWorkspaceLocation(window.location.search)
+  );
   const [status, setStatus] = useState<StatusResponse>(emptyStatus);
   const [statusError, setStatusError] = useState("");
   const [collectionSelection, setCollectionSelection] = useState<string[] | null>(
@@ -92,6 +121,103 @@ export function App({
   const [detailContainer, setDetailContainer] = useState<HTMLElement | null>(
     null
   );
+  const [ingestionJobs, setIngestionJobs] = useState<IngestionJobSummary[]>([]);
+  const [ingestionJobsLoading, setIngestionJobsLoading] = useState(false);
+  const [ingestionJobsLoaded, setIngestionJobsLoaded] = useState(false);
+  const [ingestionJobsError, setIngestionJobsError] = useState("");
+  const [ingestionDetail, setIngestionDetail] = useState<IngestionJobDetail | null>(null);
+  const [ingestionDetailLoading, setIngestionDetailLoading] = useState(false);
+  const [ingestionDetailError, setIngestionDetailError] = useState("");
+  const [ingestionActionPending, setIngestionActionPending] = useState(false);
+  const [ingestionActionError, setIngestionActionError] = useState("");
+  const ingestionActionPendingRef = useRef(false);
+  const ingestionListRequestRef = useRef(0);
+  const ingestionDetailRequestRef = useRef(0);
+  const appMountedRef = useRef(true);
+
+  useEffect(() => {
+    appMountedRef.current = true;
+    const unsubscribe = subscribeWorkspaceLocation(setWorkspaceLocation);
+    return () => {
+      appMountedRef.current = false;
+      unsubscribe();
+    };
+  }, []);
+
+  const refetchIngestionJobs = useCallback(async () => {
+    const requestId = ++ingestionListRequestRef.current;
+    setIngestionJobsLoading(true);
+    try {
+      const payload = await listIngestionJobs();
+      if (!appMountedRef.current || requestId !== ingestionListRequestRef.current) return;
+      setIngestionJobs(payload.jobs);
+      setIngestionJobsLoaded(true);
+      setIngestionJobsError("");
+    } catch (error) {
+      if (!appMountedRef.current || requestId !== ingestionListRequestRef.current) return;
+      setIngestionJobsError(apiErrorMessage(error, "入库任务列表加载失败，请稍后刷新"));
+    } finally {
+      if (appMountedRef.current && requestId === ingestionListRequestRef.current) {
+        setIngestionJobsLoading(false);
+      }
+    }
+  }, []);
+
+  const selectedIngestionJobId =
+    workspaceLocation.view === "ingestion" ? workspaceLocation.jobId : undefined;
+  const selectedIngestionJobIdRef = useRef(selectedIngestionJobId);
+  selectedIngestionJobIdRef.current = selectedIngestionJobId;
+
+  const refetchIngestionDetail = useCallback(async () => {
+    if (!selectedIngestionJobId) {
+      ingestionDetailRequestRef.current += 1;
+      setIngestionDetail(null);
+      setIngestionDetailLoading(false);
+      setIngestionDetailError("");
+      return;
+    }
+    const requestId = ++ingestionDetailRequestRef.current;
+    setIngestionDetailLoading(true);
+    try {
+      const payload = await getIngestionJob(selectedIngestionJobId);
+      if (!appMountedRef.current || requestId !== ingestionDetailRequestRef.current) return;
+      setIngestionDetail(payload);
+      setIngestionDetailError("");
+    } catch (error) {
+      if (!appMountedRef.current || requestId !== ingestionDetailRequestRef.current) return;
+      setIngestionDetail(null);
+      setIngestionDetailError(apiErrorMessage(error, "入库任务详情加载失败，请重新选择"));
+    } finally {
+      if (appMountedRef.current && requestId === ingestionDetailRequestRef.current) {
+        setIngestionDetailLoading(false);
+      }
+    }
+  }, [selectedIngestionJobId]);
+
+  useEffect(() => {
+    if (workspaceLocation.view === "ingestion") void refetchIngestionJobs();
+  }, [refetchIngestionJobs, workspaceLocation.view]);
+
+  useEffect(() => {
+    void refetchIngestionDetail();
+    setIngestionActionError("");
+  }, [refetchIngestionDetail]);
+
+  const hasActiveIngestionJobs = ingestionJobs.some((job) => isIngestionJobActive(job.status));
+  useEffect(() => {
+    if (workspaceLocation.view !== "ingestion" || !hasActiveIngestionJobs) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const tick = async () => {
+      await refetchIngestionJobs();
+      if (!cancelled) timer = setTimeout(() => void tick(), listPollIntervalMs);
+    };
+    timer = setTimeout(() => void tick(), listPollIntervalMs);
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) clearTimeout(timer);
+    };
+  }, [hasActiveIngestionJobs, listPollIntervalMs, refetchIngestionJobs, workspaceLocation.view]);
 
   const collectionOptions = useMemo(
     () => collectionNamesFromStatus(status),
@@ -378,6 +504,178 @@ export function App({
   const hasEvidenceContext =
     effectiveSelection.kind === "batch" || Boolean(chatLatestResponse);
 
+  function navigateWorkspace(view: WorkspaceLocation["view"]) {
+    navigateWorkspaceLocation(view === "chat" ? { view: "chat" } : { view: "ingestion" });
+  }
+
+  function selectIngestionJob(jobId: string) {
+    navigateWorkspaceLocation({ view: "ingestion", jobId });
+  }
+
+  function handleIngestionCreated(detail: IngestionJobDetail) {
+    setIngestionDetail(detail);
+    setIngestionJobs((current) => upsertIngestionJob(current, detail));
+    setIngestionJobsLoaded(true);
+    setIngestionActionError("");
+    selectIngestionJob(detail.job_id);
+  }
+
+  async function runIngestionAction(
+    action: () => Promise<unknown>,
+    nextStatus: "queued",
+    fallbackError: string
+  ) {
+    if (ingestionActionPendingRef.current || !ingestionDetail) return;
+    const actionJobId = ingestionDetail.job_id;
+    const actionDetail = ingestionDetail;
+    ingestionActionPendingRef.current = true;
+    setIngestionActionPending(true);
+    setIngestionActionError("");
+    try {
+      await action();
+      if (!appMountedRef.current) return;
+      void refetchIngestionJobs();
+      if (selectedIngestionJobIdRef.current !== actionJobId) return;
+      const next = { ...actionDetail, status: nextStatus };
+      setIngestionDetail(next);
+      setIngestionJobs((current) => upsertIngestionJob(current, next));
+    } catch (error) {
+      if (appMountedRef.current) setIngestionActionError(apiErrorMessage(error, fallbackError));
+    } finally {
+      ingestionActionPendingRef.current = false;
+      if (appMountedRef.current) setIngestionActionPending(false);
+    }
+  }
+
+  const handleIngestionProgress = useCallback(
+    (progress: IngestionJobProgress) => {
+      setIngestionDetail((current) =>
+        current?.job_id === progress.job_id
+          ? {
+              ...current,
+              status: progress.status,
+              current_stage: progress.current_stage,
+              item_total: progress.item_total,
+              item_done: progress.item_done,
+              document_total: progress.document_total,
+              chunk_total: progress.chunk_total,
+              warning_count: progress.warning_count,
+              updated_at: progress.updated_at
+            }
+          : current
+      );
+      setIngestionJobs((current) =>
+        current.map((job) =>
+          job.job_id === progress.job_id
+            ? {
+                ...job,
+                status: progress.status,
+                current_stage: progress.current_stage,
+                item_total: progress.item_total,
+                item_done: progress.item_done,
+                document_total: progress.document_total,
+                chunk_total: progress.chunk_total,
+                warning_count: progress.warning_count,
+                updated_at: progress.updated_at
+              }
+            : job
+        )
+      );
+    },
+    []
+  );
+
+  async function handleDeleteIngestion(): Promise<boolean> {
+    if (!ingestionDetail || ingestionActionPendingRef.current) return false;
+    ingestionActionPendingRef.current = true;
+    setIngestionActionPending(true);
+    setIngestionActionError("");
+    try {
+      await deleteIngestionJob(ingestionDetail.job_id);
+      if (!appMountedRef.current) return false;
+      const payload = await listIngestionJobs();
+      if (!appMountedRef.current) return false;
+      setIngestionJobs(payload.jobs);
+      setIngestionJobsLoaded(true);
+      setIngestionDetail(null);
+      const fallback = payload.jobs[0]?.job_id;
+      navigateWorkspaceLocation(
+        fallback ? { view: "ingestion", jobId: fallback } : { view: "ingestion" },
+        { replace: true }
+      );
+      return true;
+    } catch (error) {
+      if (appMountedRef.current) {
+        setIngestionActionError(apiErrorMessage(error, "删除任务失败，请稍后重试"));
+      }
+      return false;
+    } finally {
+      ingestionActionPendingRef.current = false;
+      if (appMountedRef.current) setIngestionActionPending(false);
+    }
+  }
+
+  if (workspaceLocation.view === "ingestion") {
+    return (
+      <div className="app-shell ingestion-shell">
+        <IngestionSidebar
+          jobs={ingestionJobs}
+          selectedJobId={workspaceLocation.jobId}
+          loading={ingestionJobsLoading && !ingestionJobsLoaded}
+          error={ingestionJobsError}
+          onSelect={selectIngestionJob}
+          onCreate={() => navigateWorkspaceLocation({ view: "ingestion" })}
+          onRefresh={() => void refetchIngestionJobs()}
+          onOpenChat={() => navigateWorkspace("chat")}
+        />
+        <main className="qa-panel ingestion-main" aria-label="文档入库工作台">
+          <header className="panel-header">
+            <div><p className="eyebrow">xhbx-rag Web</p><h1>文档入库工作台</h1></div>
+          </header>
+          {workspaceLocation.jobId ? (
+            ingestionDetail ? (
+              <IngestionRunView
+                key={`${ingestionDetail.job_id}:${ingestionDetail.status}`}
+                detail={ingestionDetail}
+                actionPending={ingestionActionPending}
+                actionError={ingestionActionError}
+                pollIntervalMs={ingestionPollIntervalMs}
+                onStart={() =>
+                  void runIngestionAction(
+                    () => startIngestionJob(ingestionDetail.job_id),
+                    "queued",
+                    "启动任务失败，请稍后重试"
+                  )
+                }
+                onRetry={() =>
+                  void runIngestionAction(
+                    () => retryIngestionJob(ingestionDetail.job_id),
+                    "queued",
+                    "重试任务失败，请稍后重试"
+                  )
+                }
+                onDelete={handleDeleteIngestion}
+                onProgress={handleIngestionProgress}
+                onRefresh={() => void refetchIngestionDetail()}
+              />
+            ) : (
+              <div className="ingestion-main-state" role={ingestionDetailError ? "alert" : "status"}>
+                {ingestionDetailError || "正在加载任务详情…"}
+              </div>
+            )
+          ) : (
+            <IngestionCreateView onCreated={handleIngestionCreated} />
+          )}
+        </main>
+        <IngestionDetailPanel
+          detail={ingestionDetail}
+          loading={ingestionDetailLoading}
+          error={ingestionDetailError}
+        />
+      </div>
+    );
+  }
+
   return (
     <EvidenceDetailContext.Provider value={evidenceDetailContext}>
     <div className="app-shell">
@@ -392,6 +690,7 @@ export function App({
         onDeleteBatch={(runId) => void handleDeleteBatchRun(runId)}
         onCreateSession={createSession}
         onCreateBatch={startBatchCreate}
+        onOpenIngestion={() => navigateWorkspace("ingestion")}
       />
 
       <main className="qa-panel" aria-label="RAG 问答">
@@ -559,4 +858,22 @@ function sameStringList(left: string[], right: string[]): boolean {
     left.length === right.length &&
     left.every((value, index) => value === right[index])
   );
+}
+
+function apiErrorMessage(error: unknown, fallback: string): string {
+  return error instanceof ApiError ? error.detail : fallback;
+}
+
+function upsertIngestionJob(
+  jobs: IngestionJobSummary[],
+  detail: IngestionJobDetail
+): IngestionJobSummary[] {
+  const {
+    ignored_entries: _ignoredEntries,
+    items: _items,
+    attempt: _attempt,
+    events: _events,
+    ...summary
+  } = detail;
+  return [summary, ...jobs.filter((job) => job.job_id !== detail.job_id)];
 }
