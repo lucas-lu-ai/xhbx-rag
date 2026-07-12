@@ -497,73 +497,107 @@ type IngestionApiStubOptions = {
   draft?: IngestionJobDetail;
   jobs?: IngestionJobSummary[];
   detail?: IngestionJobDetail;
-  progress?: IngestionJobProgress;
+  details?: Record<string, IngestionJobDetail>;
+  progress?: IngestionJobProgress | Record<string, IngestionJobProgress>;
   listError?: string;
+  deferUpload?: boolean;
+  responses?: {
+    list?: StubResponse[];
+    detail?: Record<string, StubResponse[]>;
+    progress?: Record<string, StubResponse[]>;
+    start?: Record<string, StubResponse[]>;
+    retry?: Record<string, StubResponse[]>;
+    delete?: Record<string, StubResponse[]>;
+  };
 };
+
+type StubResponse = Response | Promise<Response>;
 
 export function installIngestionApiStub(
   options: IngestionApiStubOptions = {}
 ) {
-  let currentDetail = options.detail ?? options.draft ?? ingestionDraftPayload();
-  let jobs = options.jobs ?? (options.detail ? [summaryOf(currentDetail)] : []);
+  const details = new Map<string, IngestionJobDetail>(
+    Object.entries(options.details ?? (options.detail ? { [options.detail.job_id]: options.detail } : {}))
+  );
+  if (options.draft) details.set(options.draft.job_id, options.draft);
+  let jobs = options.jobs ?? (options.detail ? [summaryOf(options.detail)] : []);
+  let completeUpload: (() => void) | undefined;
 
   const installed = installFetchStub((url, init) => {
     const method = init?.method ?? "GET";
     if (url.endsWith("/api/ingestion-jobs") && method === "GET") {
+      const queued = shiftResponse(options.responses?.list);
+      if (queued) return queued;
       if (options.listError) {
         return jsonResponse({ detail: options.listError }, { status: 503 });
       }
       return jsonResponse({ jobs });
     }
-    if (
-      url.endsWith(`/api/ingestion-jobs/${currentDetail.job_id}/progress`) &&
-      method === "GET"
-    ) {
-      return jsonResponse(options.progress ?? progressOf(currentDetail));
+    const match = /\/api\/ingestion-jobs\/([^/?]+)(?:\/(progress|start|retry))?$/.exec(url);
+    if (!match) return null;
+    const jobId = decodeURIComponent(match[1]);
+    const operation = match[2];
+    const currentDetail = details.get(jobId);
+
+    if (operation === "progress" && method === "GET") {
+      const queued = shiftResponse(options.responses?.progress?.[jobId]);
+      if (queued) return queued;
+      if (!currentDetail) return jsonResponse({ detail: "任务不存在" }, { status: 404 });
+      const configured = isProgressMap(options.progress) ? options.progress[jobId] : options.progress;
+      return jsonResponse(configured ?? progressOf(currentDetail));
     }
-    if (
-      url.endsWith(`/api/ingestion-jobs/${currentDetail.job_id}/start`) &&
-      method === "POST"
-    ) {
-      currentDetail = { ...currentDetail, status: "queued" };
-      jobs = upsertIngestionSummary(jobs, summaryOf(currentDetail));
-      return jsonResponse({ ok: true, job_id: currentDetail.job_id, status: "queued" });
+    if (operation === "start" && method === "POST") {
+      const queued = shiftResponse(options.responses?.start?.[jobId]);
+      if (queued) return queued;
+      if (!currentDetail) return jsonResponse({ detail: "任务不存在" }, { status: 404 });
+      if (currentDetail.status !== "draft") {
+        return jsonResponse({ detail: "仅待确认任务可以开始" }, { status: 409 });
+      }
+      const next = { ...currentDetail, status: "queued" as const };
+      details.set(jobId, next);
+      jobs = upsertIngestionSummary(jobs, summaryOf(next));
+      return jsonResponse({ ok: true, job_id: jobId, status: "queued" });
     }
-    if (
-      url.endsWith(`/api/ingestion-jobs/${currentDetail.job_id}/retry`) &&
-      method === "POST"
-    ) {
-      currentDetail = {
+    if (operation === "retry" && method === "POST") {
+      const queued = shiftResponse(options.responses?.retry?.[jobId]);
+      if (queued) return queued;
+      if (!currentDetail) return jsonResponse({ detail: "任务不存在" }, { status: 404 });
+      if (currentDetail.status !== "failed") {
+        return jsonResponse({ detail: "仅失败任务可以重试" }, { status: 409 });
+      }
+      const next = {
         ...currentDetail,
-        status: "queued",
+        status: "queued" as const,
         attempt_count: currentDetail.attempt_count + 1,
         error_code: null,
         error_detail: null
       };
-      jobs = upsertIngestionSummary(jobs, summaryOf(currentDetail));
+      details.set(jobId, next);
+      jobs = upsertIngestionSummary(jobs, summaryOf(next));
       return jsonResponse({
         ok: true,
-        job_id: currentDetail.job_id,
+        job_id: jobId,
         status: "queued",
-        attempt_no: currentDetail.attempt_count
+        attempt_no: next.attempt_count
       });
     }
-    if (
-      url.endsWith(`/api/ingestion-jobs/${currentDetail.job_id}`) &&
-      method === "DELETE"
-    ) {
-      jobs = jobs.filter((job) => job.job_id !== currentDetail.job_id);
-      return jsonResponse({
-        ok: true,
-        job_id: currentDetail.job_id,
-        status: "deleted"
-      });
+    if (!operation && method === "DELETE") {
+      const queued = shiftResponse(options.responses?.delete?.[jobId]);
+      if (queued) return queued;
+      if (!currentDetail) return jsonResponse({ detail: "任务不存在" }, { status: 404 });
+      if (!["draft", "succeeded", "failed", "deleting"].includes(currentDetail.status)) {
+        return jsonResponse({ detail: "当前任务状态不能删除" }, { status: 409 });
+      }
+      details.delete(jobId);
+      jobs = jobs.filter((job) => job.job_id !== jobId);
+      return jsonResponse({ ok: true, job_id: jobId, status: "deleted" });
     }
-    if (
-      url.endsWith(`/api/ingestion-jobs/${currentDetail.job_id}`) &&
-      method === "GET"
-    ) {
-      return jsonResponse(currentDetail);
+    if (!operation && method === "GET") {
+      const queued = shiftResponse(options.responses?.detail?.[jobId]);
+      if (queued) return queued;
+      return currentDetail
+        ? jsonResponse(currentDetail)
+        : jsonResponse({ detail: "任务不存在" }, { status: 404 });
     }
     return null;
   });
@@ -584,7 +618,7 @@ export function installIngestionApiStub(
 
     send(body?: Document | XMLHttpRequestBodyInit | null) {
       installed.requests.push({ url: this.url, method: this.method, body });
-      queueMicrotask(() => {
+      const complete = () => {
         if (this.aborted) {
           return;
         }
@@ -595,12 +629,15 @@ export function installIngestionApiStub(
             total: 1
           })
         );
-        currentDetail = options.draft ?? ingestionDraftPayload();
-        jobs = upsertIngestionSummary(jobs, summaryOf(currentDetail));
+        const uploadedDetail = options.draft ?? ingestionDraftPayload();
+        details.set(uploadedDetail.job_id, uploadedDetail);
+        jobs = upsertIngestionSummary(jobs, summaryOf(uploadedDetail));
         this.status = 201;
-        this.responseText = JSON.stringify(currentDetail);
+        this.responseText = JSON.stringify(uploadedDetail);
         this.dispatchEvent(new Event("load"));
-      });
+      };
+      if (options.deferUpload) completeUpload = complete;
+      else queueMicrotask(complete);
     }
 
     abort() {
@@ -617,8 +654,34 @@ export function installIngestionApiStub(
     ...installed,
     get jobs() {
       return jobs;
+    },
+    setJobs(nextJobs: IngestionJobSummary[]) {
+      jobs = nextJobs;
+    },
+    setDetail(nextDetail: IngestionJobDetail) {
+      details.set(nextDetail.job_id, nextDetail);
+      jobs = upsertIngestionSummary(jobs, summaryOf(nextDetail));
+    },
+    removeDetail(jobId: string) {
+      details.delete(jobId);
+      jobs = jobs.filter((job) => job.job_id !== jobId);
+    },
+    resolveUpload() {
+      const complete = completeUpload;
+      completeUpload = undefined;
+      complete?.();
     }
   };
+}
+
+function shiftResponse(queue: StubResponse[] | undefined): StubResponse | undefined {
+  return queue?.shift();
+}
+
+function isProgressMap(
+  value: IngestionApiStubOptions["progress"]
+): value is Record<string, IngestionJobProgress> {
+  return value !== undefined && !("job_id" in value);
 }
 
 function summaryOf(detail: IngestionJobDetail): IngestionJobSummary {

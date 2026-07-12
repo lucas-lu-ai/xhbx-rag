@@ -2372,7 +2372,8 @@ progress { width: 100%; height: 10px; accent-color: var(--color-accent); }
   padding-top: 16px;
 }
 
-.ingestion-run-actions .secondary-button { width: auto; min-height: 44px; }
+.ingestion-run-actions .secondary-button,
+.ingestion-run-actions .primary-button { width: auto; min-height: 44px; }
 .danger-button { border-color: rgb(180 35 53 / 0.34); color: var(--color-error); }
 .primary-button.danger-button { background: var(--color-error); color: #fff; }
 
@@ -2380,6 +2381,8 @@ progress { width: 100%; height: 10px; accent-color: var(--color-accent); }
 .ingestion-detail-scroll { display: grid; align-content: start; gap: 12px; min-height: 0; overflow-y: auto; padding: 14px; }
 .ingestion-detail-section { display: grid; gap: 12px; }
 .ingestion-detail-section p { color: var(--color-muted); font-size: 13px; line-height: 1.55; }
+.ingestion-detail-error-copy { display: grid; gap: 8px; }
+.ingestion-detail-error-copy .ghost-button { min-height: 44px; }
 .ingestion-detail-list { display: grid; gap: 8px; margin: 0; }
 .ingestion-detail-list div { display: flex; justify-content: space-between; gap: 12px; }
 .ingestion-detail-list dt { color: var(--color-muted); font-size: 12px; }

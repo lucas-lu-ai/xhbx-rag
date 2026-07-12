@@ -97,9 +97,11 @@ export function IngestionCreateView({ onCreated }: IngestionCreateViewProps) {
 
       <label
         className={uploading ? "ingestion-drop-zone uploading" : "ingestion-drop-zone"}
+        aria-disabled={uploading}
         onDragOver={(event) => event.preventDefault()}
         onDrop={(event) => {
           event.preventDefault();
+          if (uploading) return;
           void chooseFile(event.dataTransfer.files[0]);
         }}
       >
@@ -107,6 +109,7 @@ export function IngestionCreateView({ onCreated }: IngestionCreateViewProps) {
           type="file"
           accept={ACCEPT}
           aria-label="上传文档或 ZIP"
+          disabled={uploading}
           onChange={(event) => {
             const file = event.currentTarget.files?.[0];
             event.currentTarget.value = "";

@@ -7,9 +7,10 @@ type IngestionDetailPanelProps = {
   detail: IngestionJobDetail | null;
   loading: boolean;
   error: string;
+  onReload: () => void;
 };
 
-export function IngestionDetailPanel({ detail, loading, error }: IngestionDetailPanelProps) {
+export function IngestionDetailPanel({ detail, loading, error, onReload }: IngestionDetailPanelProps) {
   return (
     <aside className="source-panel ingestion-detail-panel" aria-label="入库任务详情">
       <header className="ingestion-detail-header">
@@ -17,9 +18,15 @@ export function IngestionDetailPanel({ detail, loading, error }: IngestionDetail
       </header>
       <div className="ingestion-detail-scroll">
         {loading && !detail ? <p className="ingestion-detail-empty">正在加载任务详情…</p> : null}
-        {error && (
+        {error && detail && (
           <div className="ingestion-error-box" role="alert">
-            <AlertCircle size={18} aria-hidden="true" /><span>{error}</span>
+            <AlertCircle size={18} aria-hidden="true" />
+            <div className="ingestion-detail-error-copy">
+              <span>{error}</span>
+              <button className="ghost-button" type="button" onClick={onReload}>
+                重新加载任务详情
+              </button>
+            </div>
           </div>
         )}
         {!loading && !detail && !error ? (

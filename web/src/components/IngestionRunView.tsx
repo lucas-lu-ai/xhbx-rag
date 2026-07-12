@@ -150,7 +150,7 @@ export function IngestionRunView({
         </div>
       )}
 
-      {detail.warning_count > 0 && (
+      {detail.status === "succeeded" && detail.warning_count > 0 && (
         <div className="ingestion-warning-box" role="status">
           <AlertCircle size={19} aria-hidden="true" />
           <span>任务包含 {detail.warning_count} 条增值处理警告，核心知识已完成入库。</span>
@@ -273,19 +273,50 @@ function DeleteConfirmation({
   onConfirm: () => Promise<void>;
 }) {
   const cancelRef = useRef<HTMLButtonElement>(null);
+  const confirmRef = useRef<HTMLButtonElement>(null);
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const [fallbackOpen, setFallbackOpen] = useState(
+    () => typeof HTMLDialogElement.prototype.showModal !== "function"
+  );
   useEffect(() => {
-    cancelRef.current?.focus();
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    if (typeof dialog.showModal === "function") {
+      try {
+        if (!dialog.open) dialog.showModal();
+      } catch {
+        setFallbackOpen(true);
+      }
+    } else {
+      setFallbackOpen(true);
+    }
+    queueMicrotask(() => cancelRef.current?.focus());
+    return () => {
+      if (dialog.open && typeof dialog.close === "function") dialog.close();
+    };
   }, []);
 
   return (
     <div className="ingestion-dialog-backdrop">
       <dialog
-        open
+        ref={dialogRef}
+        open={fallbackOpen || undefined}
         className="ingestion-dialog"
         aria-labelledby="delete-ingestion-title"
         aria-modal="true"
         onKeyDown={(event) => {
           if (event.key === "Escape" && !pending) onCancel();
+          if (event.key !== "Tab") return;
+          const first = cancelRef.current;
+          const last = confirmRef.current;
+          if (!first || !last) return;
+          if (event.shiftKey && document.activeElement === first) {
+            event.preventDefault();
+            last.focus();
+          } else if (!event.shiftKey && document.activeElement === last) {
+            event.preventDefault();
+            first.focus();
+          }
         }}
         onCancel={(event) => {
           event.preventDefault();
@@ -298,7 +329,7 @@ function DeleteConfirmation({
           <button ref={cancelRef} className="ghost-button" type="button" disabled={pending} onClick={onCancel}>
             取消
           </button>
-          <button className="primary-button danger-button" type="button" disabled={pending} onClick={() => void onConfirm()}>
+          <button ref={confirmRef} className="primary-button danger-button" type="button" disabled={pending} onClick={() => void onConfirm()}>
             {pending && <LoaderCircle className="spin" size={17} aria-hidden="true" />}
             确认删除
           </button>
