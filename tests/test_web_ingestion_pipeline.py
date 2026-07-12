@@ -1,5 +1,7 @@
 import json
+import logging
 import os
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable
@@ -332,7 +334,7 @@ def test_duplicate_chunk_ids_fail_before_index(tmp_path: Path) -> None:
 
 
 def test_large_raw_citations_pass_when_real_milvus_row_is_compacted(
-    tmp_path: Path,
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     citations = [
         EvidenceRef(
@@ -345,9 +347,16 @@ def test_large_raw_citations_pass_when_real_milvus_row_is_compacted(
     ]
     chunk = course_chunk("large-citations", citations=citations)
     pipeline = pipeline_with_course_report(chunks=[chunk], enrich_failures=[])
+    caplog.set_level(logging.WARNING, logger="xhbx_rag.milvus_store")
 
     prepared = pipeline.prepare(course_job(tmp_path), tmp_path / "attempt")
 
+    clipping_logs = [
+        record
+        for record in caplog.records
+        if "citations 超过 Milvus 字段上限" in record.getMessage()
+    ]
+    assert len(clipping_logs) == 1
     staged = load_chunks_jsonl(prepared.chunks_path)
     assert len(staged[0].citations) == 120
     row = MilvusChunkRecord.from_chunk(staged[0], [0.0]).to_row()
@@ -356,6 +365,26 @@ def test_large_raw_citations_pass_when_real_milvus_row_is_compacted(
     assert stored_citations
     assert all("context" not in citation for citation in stored_citations)
     assert all(len(citation["source_excerpt"]) <= 600 for citation in stored_citations)
+
+
+def test_each_chunk_builds_real_milvus_row_once_per_prepare(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+    original = MilvusChunkRecord.to_row
+
+    def recording_to_row(record: MilvusChunkRecord) -> dict[str, object]:
+        calls.append(record.chunk.chunk_id)
+        return original(record)
+
+    monkeypatch.setattr(MilvusChunkRecord, "to_row", recording_to_row)
+    chunks = [course_chunk("one"), course_chunk("two")]
+    pipeline = pipeline_with_course_report(chunks=chunks, enrich_failures=[])
+
+    prepared = pipeline.prepare(course_job(tmp_path), tmp_path / "attempt")
+
+    assert prepared.chunk_count == 2
+    assert calls == ["one", "two"]
 
 
 def test_two_course_items_run_once_in_item_index_order(tmp_path: Path) -> None:
@@ -518,6 +547,47 @@ def test_case_playbook_path_must_be_confined(tmp_path: Path) -> None:
     assert not (tmp_path / "attempt" / "staging").exists()
 
 
+def test_case_revalidates_output_parent_chain_after_generator(
+    tmp_path: Path,
+) -> None:
+    outside_parent = tmp_path / "outside-generated"
+    outside_parent.mkdir()
+    external_files: list[tuple[Path, str]] = []
+
+    def factory(config: object) -> Callable[..., CaseSalesGenerationResult]:
+        del config
+
+        def generate(**kwargs: object) -> CaseSalesGenerationResult:
+            output_dir = Path(kwargs["output_dir"])  # type: ignore[arg-type]
+            outside_item = outside_parent / output_dir.name
+            outside_insights = _write_case_insights(outside_item, "王女士")
+            original_content = outside_insights.read_text(encoding="utf-8")
+            external_files.append((outside_insights, original_content))
+            generated_parent = output_dir.parent
+            shutil.rmtree(generated_parent)
+            generated_parent.symlink_to(outside_parent, target_is_directory=True)
+            return CaseSalesGenerationResult(
+                case_name="王女士",
+                status="ok",
+                insights_path=output_dir / "case.sales_insights.json",
+            )
+
+        return generate
+
+    pipeline = IngestionPipeline(
+        config_provider=object,
+        case_generation_factory=factory,
+        course_enrichment_factory=lambda config: None,
+    )
+
+    with pytest.raises(IngestionPipelineError, match="案例洞察产物无效"):
+        pipeline.prepare(case_job(tmp_path), tmp_path / "attempt")
+
+    assert external_files
+    assert external_files[0][0].read_text(encoding="utf-8") == external_files[0][1]
+    assert not (tmp_path / "attempt" / "staging").exists()
+
+
 @pytest.mark.parametrize(
     "field", ["chunks", "report", "chunks_symlink", "chunks_non_path"]
 )
@@ -566,6 +636,61 @@ def test_course_output_paths_must_be_confined(
     with pytest.raises(IngestionPipelineError, match="课程解析产物无效"):
         pipeline.prepare(course_job(tmp_path), tmp_path / "attempt")
 
+    assert not (tmp_path / "attempt" / "staging").exists()
+
+
+def test_course_revalidates_output_parent_chain_after_parser(
+    tmp_path: Path,
+) -> None:
+    outside_parent = tmp_path / "outside-parsed"
+    outside_parent.mkdir()
+    external_files: list[tuple[Path, str]] = []
+
+    def course_parser(
+        course_dir: Path,
+        out_dir: Path,
+        enrichment_agent: object = None,
+        trace: object = None,
+        *,
+        fail_fast: bool = False,
+        on_file: Callable[[str, str, int], None] | None = None,
+    ) -> CourseParseReport:
+        del course_dir, enrichment_agent, trace
+        assert fail_fast is True
+        outside_item = outside_parent / out_dir.name
+        output_files = _write_course_outputs(
+            outside_item, [course_chunk("outside-course")]
+        )
+        outside_chunks = Path(output_files["chunks"])
+        external_files.append(
+            (outside_chunks, outside_chunks.read_text(encoding="utf-8"))
+        )
+        parsed_parent = out_dir.parent
+        shutil.rmtree(parsed_parent)
+        parsed_parent.symlink_to(outside_parent, target_is_directory=True)
+        if on_file is not None:
+            on_file("促成课.txt", "parsed", 1)
+        return CourseParseReport(
+            input_dir="course",
+            output_files={
+                "chunks": str(out_dir / "chunks.jsonl"),
+                "report": str(out_dir / "parse_report.json"),
+            },
+            counts={"files_parsed": 1, "files_failed": 0, "chunks": 1},
+        )
+
+    pipeline = IngestionPipeline(
+        config_provider=object,
+        case_generation_factory=lambda config: None,
+        course_enrichment_factory=lambda config: None,
+        course_parser=course_parser,
+    )
+
+    with pytest.raises(IngestionPipelineError, match="课程解析产物无效"):
+        pipeline.prepare(course_job(tmp_path), tmp_path / "attempt")
+
+    assert external_files
+    assert external_files[0][0].read_text(encoding="utf-8") == external_files[0][1]
     assert not (tmp_path / "attempt" / "staging").exists()
 
 

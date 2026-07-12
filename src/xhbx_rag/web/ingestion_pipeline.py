@@ -177,7 +177,7 @@ class IngestionPipeline:
                     all_chunks.extend(chunks)
                     warnings.extend(item_warnings)
 
-            _validate_batch(all_chunks, preflight.target)
+            _validate_prepared_batch(all_chunks)
             try:
                 chunks_path = _publish_staging(staging_dir, all_chunks)
             except Exception as exc:  # noqa: BLE001 - 对外只暴露固定错误
@@ -249,7 +249,7 @@ class IngestionPipeline:
 
         try:
             insights_path = _require_confined_regular_file(
-                result.insights_path, generated_dir
+                result.insights_path, generated_dir, attempt_dir
             )
         except (OSError, ValueError) as exc:
             error = IngestionPipelineError(
@@ -261,7 +261,7 @@ class IngestionPipeline:
         if result.playbook_path is not None:
             try:
                 playbook_path = _require_confined_regular_file(
-                    result.playbook_path, generated_dir
+                    result.playbook_path, generated_dir, attempt_dir
                 )
             except (OSError, ValueError) as exc:
                 error = IngestionPipelineError(
@@ -365,9 +365,9 @@ class IngestionPipeline:
             if not chunks_value or not report_value:
                 raise ValueError("课程解析产物缺失")
             chunks_path = _require_confined_regular_file(
-                chunks_value, parsed_dir
+                chunks_value, parsed_dir, attempt_dir
             )
-            _require_confined_regular_file(report_value, parsed_dir)
+            _require_confined_regular_file(report_value, parsed_dir, attempt_dir)
             chunks = load_chunks_jsonl(chunks_path)
             if not chunks:
                 raise ChunkLoadError("课程未产生 chunk")
@@ -576,21 +576,53 @@ def _prepare_output_dir(path: Path) -> None:
         raise OSError("工作区路径无效")
 
 
-def _require_confined_regular_file(path_value: object, root: Path) -> Path:
+def _require_confined_regular_file(
+    path_value: object,
+    root: Path,
+    trusted_attempt: Path,
+) -> Path:
     try:
         path = Path(os.fspath(path_value))  # type: ignore[arg-type]
     except TypeError as exc:
         raise ValueError("产物路径无效") from exc
-    if root.is_symlink() or not root.is_dir() or path.is_symlink():
+    resolved_root = _revalidate_output_root(root, trusted_attempt)
+    if path.is_symlink():
         raise ValueError("产物路径无效")
     try:
-        resolved_root = root.resolve(strict=True)
         resolved_path = path.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
         raise ValueError("产物路径无效") from exc
     if not resolved_path.is_relative_to(resolved_root) or not resolved_path.is_file():
         raise ValueError("产物路径无效")
     return resolved_path
+
+
+def _revalidate_output_root(root: Path, trusted_attempt: Path) -> Path:
+    try:
+        trusted_lexical = Path(os.path.abspath(trusted_attempt))
+        root_lexical = Path(os.path.abspath(root))
+        relative = root_lexical.relative_to(trusted_lexical)
+        if trusted_lexical.is_symlink():
+            raise ValueError("工作区路径无效")
+        trusted_resolved = trusted_lexical.resolve(strict=True)
+        current = trusted_lexical
+        for part in relative.parts:
+            current /= part
+            if current.is_symlink():
+                raise ValueError("工作区路径无效")
+        resolved_root = root_lexical.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError("工作区路径无效") from exc
+    if not root_lexical.is_dir() or not resolved_root.is_relative_to(
+        trusted_resolved
+    ):
+        raise ValueError("工作区路径无效")
+    return resolved_root
+
+
+def _validate_prepared_batch(chunks: list[RagChunk]) -> None:
+    if not chunks:
+        raise IngestionPipelineError("chunk_failed", "staging chunk 不能为空")
 
 
 def _validate_batch(chunks: list[RagChunk], target: Literal["case", "course"]) -> None:
