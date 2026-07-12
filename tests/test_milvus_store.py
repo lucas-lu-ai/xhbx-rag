@@ -572,19 +572,48 @@ def test_multi_collection_store_merges_filter_options(tmp_path) -> None:
     }
 
 
-def test_store_fetches_raw_rows_with_vectors_and_restores_them(tmp_path) -> None:
+def test_store_deletes_and_restores_complete_raw_rows(tmp_path) -> None:
     store = MilvusLiteStore(db_path=tmp_path / "rag.db", collection_name="chunks")
-    original = MilvusChunkRecord.from_chunk(_chunk("same", "旧文本"), [0.1, 0.2])
-    replacement = MilvusChunkRecord.from_chunk(_chunk("same", "新文本"), [0.9, 0.8])
+    original_chunk = RagChunk(
+        chunk_id="same",
+        chunk_type="script",
+        text="旧文本",
+        metadata={
+            "case_name": "案例A",
+            "stage": "售前",
+            "scenario": "客户抗拒",
+            "strategy_names": ["风险唤醒"],
+        },
+        citations=[EvidenceRef(section_name="第1节", quote="原文")],
+        source_file="demo",
+    )
+    original = MilvusChunkRecord.from_chunk(original_chunk, [0.1, 0.2])
     store.ensure_collection(2)
     store.upsert([original])
 
     snapshot = store.fetch_raw_rows_by_ids(["same"])
-    store.upsert([replacement])
     store.delete_by_ids(["same"])
+    store.flush()
+
+    assert store.fetch_raw_rows_by_ids(["same"]) == {}
+
     store.upsert_raw_rows(list(snapshot.values()))
     store.flush()
 
     restored = store.fetch_raw_rows_by_ids(["same"])["same"]
-    assert restored["text"] == "旧文本"
+    expected = original.to_row()
+    scalar_fields = [
+        "chunk_id",
+        "text",
+        "text_hash",
+        "case_name",
+        "chunk_type",
+        "stage",
+        "scenario",
+        "metadata_json",
+        "citations_json",
+    ]
+    assert {field: restored[field] for field in scalar_fields} == {
+        field: expected[field] for field in scalar_fields
+    }
     assert restored["vector"] == pytest.approx([0.1, 0.2])

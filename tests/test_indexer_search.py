@@ -187,6 +187,59 @@ def test_index_chunks_locks_collection_writes(tmp_path, monkeypatch) -> None:
     assert events == ["lock", "drop", "ensure", "upsert", "unlock"]
 
 
+def test_index_chunks_locks_empty_rebuild_drop(tmp_path, monkeypatch) -> None:
+    chunks_path = tmp_path / "chunks.jsonl"
+    chunks_path.write_text("", encoding="utf-8")
+    events: list[str] = []
+
+    class LockableStore(_FakeStore):
+        uri = "db"
+        collection_name = "chunks"
+
+        def drop_collection(self) -> None:
+            events.append("drop")
+            super().drop_collection()
+
+    @contextmanager
+    def fake_lock(uri: str, collection_name: str):
+        assert (uri, collection_name) == ("db", "chunks")
+        events.append("lock")
+        try:
+            yield
+        finally:
+            events.append("unlock")
+
+    monkeypatch.setattr(indexer, "collection_write_lock", fake_lock)
+    embedding = _FakeEmbedding()
+
+    count = index_chunks(chunks_path, embedding, LockableStore(), mode="rebuild")
+
+    assert count == 0
+    assert embedding.documents == []
+    assert events == ["lock", "drop", "unlock"]
+
+
+def test_index_chunks_store_without_lock_attributes_uses_nullcontext(
+    tmp_path, monkeypatch
+) -> None:
+    chunks_path = tmp_path / "chunks.jsonl"
+    chunks_path.write_text(
+        json.dumps(_chunk("c1", "文本1").model_dump(mode="json"), ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    def unexpected_lock(_uri: str, _collection_name: str):
+        raise AssertionError("fake store 不应获取 collection 文件锁")
+
+    monkeypatch.setattr(indexer, "collection_write_lock", unexpected_lock)
+    store = _FakeStore()
+
+    count = index_chunks(chunks_path, _FakeEmbedding(), store)
+
+    assert count == 1
+    assert store.operations == ["ensure_collection:2", "upsert:1"]
+
+
 def test_index_chunks_emits_trace_events(tmp_path) -> None:
     chunks_path = tmp_path / "chunks.jsonl"
     chunks_path.write_text(
