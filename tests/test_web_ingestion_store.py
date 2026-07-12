@@ -220,7 +220,6 @@ def test_recovery_actions_requeue_and_rollback_correct_jobs(tmp_path: Path) -> N
     running = store.create_draft(preflight=_preflight(), source_path=tmp_path / "r.zip")
     store.start_job(running["job_id"])
     store.claim_job(running["job_id"])
-    store.begin_attempt(running["job_id"], tmp_path / "attempt")
     prepared = store.create_draft(preflight=_preflight(), source_path=tmp_path / "p.zip")
     store.start_job(prepared["job_id"])
     store.claim_job(prepared["job_id"])
@@ -233,6 +232,11 @@ def test_recovery_actions_requeue_and_rollback_correct_jobs(tmp_path: Path) -> N
     assert (queued["job_id"], "enqueue", None) in actions
     assert (running["job_id"], "fail_interrupted", None) in actions
     assert (prepared["job_id"], "rollback", journal_path.resolve()) in actions
+
+    store.fail_job(running["job_id"], code="service_restarted", detail="服务重启导致任务中断")
+    interrupted = store.get_job(running["job_id"])
+    assert interrupted["status"] == "failed"
+    assert interrupted["attempt"]["status"] == "failed"
 
 
 def test_recovery_actions_include_committed_and_deleting_jobs(tmp_path: Path) -> None:
@@ -386,6 +390,29 @@ def test_prepared_commit_requires_a_journal_path(tmp_path: Path) -> None:
     assert store.get_job(job_id)["attempt"]["commit_state"] == "not_started"
 
 
+def test_prepared_journal_path_is_immutable_across_later_commit_updates(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    job_id = _running_job(store, tmp_path)
+    original = (tmp_path / "journal-original.json").resolve()
+    replacement = (tmp_path / "journal-replacement.json").resolve()
+
+    store.mark_commit_state(job_id, "prepared", original)
+    store.mark_commit_state(job_id, "prepared")
+    store.mark_commit_state(job_id, "prepared", original)
+
+    for target_state in ("prepared", "committed"):
+        with pytest.raises(ingestion_store.IngestionStateError):
+            store.mark_commit_state(job_id, target_state, replacement)
+        execution = store.get_job_for_execution(job_id)
+        assert execution["attempt"]["commit_state"] == "prepared"
+        assert execution["attempt"]["journal_path"] == original
+
+    store.mark_commit_state(job_id, "committed")
+    execution = store.get_job_for_execution(job_id)
+    assert execution["attempt"]["commit_state"] == "committed"
+    assert execution["attempt"]["journal_path"] == original
+
+
 @pytest.mark.parametrize(
     "state",
     ["committed", "rolling_back", "rolled_back", "invalid"],
@@ -417,23 +444,33 @@ def test_fail_job_accepts_only_precommit_or_finished_rollback(tmp_path: Path) ->
 def test_persisted_details_and_event_content_are_safely_normalized(tmp_path: Path) -> None:
     store = _store(tmp_path)
     job_id = _running_job(store, tmp_path)
-    secret_value = "sk-live-super-secret-value"
-    posix_path = "/Users/alice/private/customer.txt"
-    windows_path = r"C:\Users\alice\private\customer.txt"
+    secret_values = {
+        "EMBEDDING_API_KEY": "embedding-secret-value",
+        "RERANK_API_KEY": "rerank-secret-value",
+        "OPENAI_API_KEY": "openai-secret-value",
+        "access_token": "access-secret-value",
+        "client_secret": "client-secret-value",
+        "Bearer": "bearer-secret-value",
+    }
+    posix_path = "/Users/alice/private.txt"
+    stack_path = "/opt/xhbx/private/worker.py"
+    windows_path = r"C:\Users\alice\private.txt"
+    secret_text = " ".join(f"{key}={value}" for key, value in secret_values.items())
     unsafe = (
-        f"读取 {posix_path} 和 {windows_path} 失败 "
-        f"token={secret_value} api_key: {secret_value} secret={secret_value} "
+        f"读取{posix_path}失败；读取{windows_path}失败；"
+        f'  File "{stack_path}", line 42；{secret_text}；Bearer bearer-header-value；'
         + "超长错误" * 800
     )
 
     store.mark_stage(job_id, "parsing", unsafe)
     assert store.mark_item_running(job_id, 1, "parsing") is True
     store.fail_item(job_id, 1, unsafe)
-    store.fail_job(job_id, code=f"token={secret_value}", detail=unsafe)
+    store.fail_job(job_id, code=f"OPENAI_API_KEY={secret_values['OPENAI_API_KEY']}", detail=unsafe)
 
     public = store.get_job(job_id)
     serialized = repr(public)
-    for raw_value in (secret_value, posix_path, windows_path):
+    raw_secrets = (*secret_values.values(), "bearer-header-value")
+    for raw_value in (*raw_secrets, posix_path, stack_path, windows_path):
         assert raw_value not in serialized
     assert len(public["error_code"]) <= 2_000
     assert len(public["error_detail"]) <= 2_000
@@ -459,14 +496,21 @@ def test_persisted_details_and_event_content_are_safely_normalized(tmp_path: Pat
             if value is not None
         ]
     persisted = "\n".join(raw_values)
-    for raw_value in (secret_value, posix_path, windows_path):
+    for raw_value in (*raw_secrets, posix_path, stack_path, windows_path):
         assert raw_value not in persisted
 
 
 def test_event_payload_is_recursively_sanitized_and_limited_to_16_kib(tmp_path: Path) -> None:
     store = _store(tmp_path)
     job_id = _running_job(store, tmp_path)
-    secret_value = "nested-super-secret"
+    secret_values = {
+        "EMBEDDING_API_KEY": "nested-embedding-secret",
+        "RERANK_API_KEY": "nested-rerank-secret",
+        "OPENAI_API_KEY": "nested-openai-secret",
+        "access_token": "nested-access-secret",
+        "client_secret": "nested-client-secret",
+        "Bearer": "nested-bearer-secret",
+    }
 
     with store._connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -478,8 +522,11 @@ def test_event_payload_is_recursively_sanitized_and_limited_to_16_kib(tmp_path: 
             message="读取 /var/private/source.txt",
             payload={
                 "nested": {
-                    "api_key": secret_value,
-                    "values": ["token=" + secret_value, r"C:\private\source.txt"],
+                    **secret_values,
+                    "values": [
+                        "OPENAI_API_KEY=" + secret_values["OPENAI_API_KEY"],
+                        r"C:\private\source.txt",
+                    ],
                 }
             },
         )
@@ -495,7 +542,8 @@ def test_event_payload_is_recursively_sanitized_and_limited_to_16_kib(tmp_path: 
     events = store.get_job(job_id)["events"]
     nested = next(event for event in events if event["event_type"] == "nested_payload")
     oversized = next(event for event in events if event["event_type"] == "oversized_payload")
-    assert secret_value not in repr(nested)
+    for secret_value in secret_values.values():
+        assert secret_value not in repr(nested)
     assert "/var/private/source.txt" not in repr(nested)
     assert r"C:\private\source.txt" not in repr(nested)
     assert oversized["payload"] == {"truncated": True}

@@ -19,18 +19,22 @@ _MAX_PERSISTED_TEXT_CHARS = 2_000
 _MAX_EVENT_PAYLOAD_BYTES = 16 * 1_024
 _REDACTED_PATH = "[已隐藏路径]"
 _REDACTED_SECRET = "[已隐藏敏感信息]"
-_SENSITIVE_KEY_RE = re.compile(r"^(?:api[_-]?key|token|secret|password)$", re.IGNORECASE)
+_SENSITIVE_KEY_RE = re.compile(
+    r"^(?:bearer|(?:.*_)?(?:api_key|token|secret|password))$", re.IGNORECASE
+)
 _SENSITIVE_VALUE_RE = re.compile(
-    r"\b(api[_-]?key|token|secret|password)\b\s*[:=]\s*"
-    r"(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)",
+    r"(?<![A-Za-z0-9_])"
+    r"((?:[A-Za-z0-9]+_)*(?:api_key|token|secret|password)|Bearer)\s*[:=]\s*"
+    r"(?:\"[^\"]*\"|'[^']*'|[^\s,;，；。]+)",
     re.IGNORECASE,
 )
-_BEARER_TOKEN_RE = re.compile(r"\bBearer\s+[^\s,;]+", re.IGNORECASE)
+_BEARER_TOKEN_RE = re.compile(r"\bBearer\s+[^\s,;，；。]+", re.IGNORECASE)
 _WINDOWS_ABSOLUTE_PATH_RE = re.compile(
-    r"\b[A-Za-z]:[\\/](?:[^\\/\s]+[\\/])*[^\\/\s,;)\]}]+"
+    r"(?<![A-Za-z0-9_])[A-Za-z]:[\\/]"
+    r"(?:[^\\/\s]+[\\/])*[^\\/\s,;)\]}]+"
 )
 _POSIX_ABSOLUTE_PATH_RE = re.compile(
-    r"(?<![:\w])/(?:[^/\s]+/)*[^/\s,;)\]}]+"
+    r"(?<![:/])/(?!/)(?:[^/\s]+/)*[^/\s,;)\]}]+"
 )
 
 _PUBLIC_JOB_FIELDS = (
@@ -581,6 +585,14 @@ class IngestionStore:
             current_state = row["commit_state"]
             job_status = row["job_status"]
             attempt_status = row["attempt_status"]
+            resolved_journal = str(journal_path.resolve()) if journal_path is not None else None
+            stored_journal = row["journal_path"]
+            if (
+                stored_journal is not None
+                and resolved_journal is not None
+                and resolved_journal != stored_journal
+            ):
+                raise IngestionStateError("journal_path 在 prepared 后不可变")
             coherent_statuses = {
                 "not_started": ("running", "running"),
                 "prepared": ("running", "running"),
@@ -612,7 +624,6 @@ class IngestionStore:
                 raise IngestionStateError("回滚完成要求 rolling_back job/attempt")
             if state == "prepared" and journal_path is None:
                 raise IngestionStateError("prepared 状态必须提供 journal_path")
-            resolved_journal = str(journal_path.resolve()) if journal_path is not None else None
             connection.execute(
                 """
                 UPDATE ingestion_attempts
@@ -740,7 +751,7 @@ class IngestionStore:
             allowed = row is not None and (
                 (
                     row["job_status"] == "running"
-                    and row["attempt_status"] == "running"
+                    and row["attempt_status"] in ("queued", "running")
                     and row["commit_state"] == "not_started"
                 )
                 or (
@@ -750,7 +761,7 @@ class IngestionStore:
                 )
             )
             if not allowed:
-                raise IngestionStateError("失败状态要求提交前失败或已完成回滚")
+                raise IngestionStateError("失败状态要求未提交的 queued/running attempt 或已完成回滚")
             connection.execute(
                 """
                 UPDATE ingestion_jobs
