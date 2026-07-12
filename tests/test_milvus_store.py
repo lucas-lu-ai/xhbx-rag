@@ -239,6 +239,34 @@ def test_milvus_lite_store_drop_collection_removes_existing_collection(tmp_path)
     assert store.client.has_collection(store.collection_name) is False
 
 
+def test_store_flushes_existing_collection() -> None:
+    flush_calls: list[str] = []
+    store = milvus_store.MilvusStore.__new__(milvus_store.MilvusStore)
+    store.collection_name = "chunks"
+    store.client = SimpleNamespace(
+        has_collection=lambda collection_name: collection_name == "chunks",
+        flush=lambda collection_name: flush_calls.append(collection_name),
+    )
+
+    store.flush()
+
+    assert flush_calls == ["chunks"]
+
+
+def test_store_flush_skips_missing_collection() -> None:
+    flush_calls: list[str] = []
+    store = milvus_store.MilvusStore.__new__(milvus_store.MilvusStore)
+    store.collection_name = "missing"
+    store.client = SimpleNamespace(
+        has_collection=lambda _collection_name: False,
+        flush=lambda collection_name: flush_calls.append(collection_name),
+    )
+
+    store.flush()
+
+    assert flush_calls == []
+
+
 def test_milvus_lite_store_keyword_search_ranks_exact_term_matches(tmp_path) -> None:
     store = MilvusLiteStore(
         db_path=tmp_path / "rag.db",
