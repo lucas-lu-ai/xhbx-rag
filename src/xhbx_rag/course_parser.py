@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from .chunk_io import chunk_text_hash
 from .course_chunk_builder import build_course_chunks
@@ -19,6 +20,15 @@ from .sales_generation import _atomic_write_text
 from .source_loader import SUPPORTED_EXTENSIONS, parse_source_file
 
 _ENRICH_SAMPLE_MAX_CHARS = 4000
+
+
+class CourseFileParseError(RuntimeError):
+    """严格课程模式下，单个受支持文件的必需加工失败。"""
+
+    def __init__(self, relative_path: str, detail: str) -> None:
+        super().__init__(f"{relative_path}: {detail}")
+        self.relative_path = relative_path
+        self.detail = detail
 
 
 @dataclass(frozen=True)
@@ -52,9 +62,18 @@ def parse_course_dir(
     out_dir: Path,
     enrichment_agent: CourseEnrichmentAgent | None = None,
     trace: TraceSink | None = None,
+    *,
+    fail_fast: bool = False,
+    on_file: Callable[[str, str, int], None] | None = None,
 ) -> CourseParseReport:
     if not course_dir.is_dir():
         raise NotADirectoryError(f"课程目录不存在或不是目录: {course_dir}")
+
+    chunks_path = out_dir / "chunks.jsonl"
+    report_path = out_dir / "parse_report.json"
+    if fail_fast:
+        chunks_path.unlink(missing_ok=True)
+        report_path.unlink(missing_ok=True)
 
     supported, skipped = _scan_files(course_dir)
     emit_trace(
@@ -91,6 +110,13 @@ def parse_course_dir(
                 "course_parse.file_failed",
                 {"path": relative, "error": repr(exc)},
             )
+            if on_file is not None:
+                on_file(relative, "failed", 0)
+            if fail_fast:
+                raise CourseFileParseError(
+                    relative,
+                    "课程文件解析或切分失败",
+                ) from exc
             continue
         source_hashes.setdefault(source_hash, []).append(relative)
         all_chunks.extend(chunks)
@@ -99,12 +125,12 @@ def parse_course_dir(
             "course_parse.file_parsed",
             {"path": relative, "chunk_count": len(chunks)},
         )
+        if on_file is not None:
+            on_file(relative, "parsed", len(chunks))
 
     duplicates = {key: paths for key, paths in source_hashes.items() if len(paths) > 1}
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    chunks_path = out_dir / "chunks.jsonl"
-    report_path = out_dir / "parse_report.json"
     _atomic_write_text(
         chunks_path,
         "\n".join(chunk.model_dump_json() for chunk in all_chunks),

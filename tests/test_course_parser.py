@@ -1,9 +1,11 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from xhbx_rag.chunk_io import load_chunks_jsonl
 from xhbx_rag.course_enrichment import CourseEnrichment
-from xhbx_rag.course_parser import parse_course_dir
+from xhbx_rag.course_parser import CourseFileParseError, parse_course_dir
 
 
 def _write_pptx(path: Path, slide_texts: list[str]) -> None:
@@ -75,6 +77,56 @@ def test_parse_course_dir_isolates_single_file_failure(tmp_path) -> None:
     assert "坏课件.pptx" in report.failed_files[0]["path"]
     chunks = load_chunks_jsonl(out_dir / "chunks.jsonl")
     assert any("好课件" in chunk.metadata["course_name"] for chunk in chunks)
+
+
+def test_parse_course_dir_fail_fast_raises_on_supported_file_failure(tmp_path) -> None:
+    course_dir = tmp_path / "培训数据"
+    _write_pptx(course_dir / "好课件.pptx", ["销售流程" * 50])
+    (course_dir / "坏课件.pptx").write_bytes(b"broken")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    (out_dir / "chunks.jsonl").write_text("过期产物\n", encoding="utf-8")
+    events: list[tuple[str, str, int]] = []
+
+    with pytest.raises(CourseFileParseError, match="坏课件.pptx"):
+        parse_course_dir(
+            course_dir,
+            out_dir,
+            fail_fast=True,
+            on_file=lambda path, status, count: events.append((path, status, count)),
+        )
+
+    assert events == [("坏课件.pptx", "failed", 0)]
+    assert not (out_dir / "chunks.jsonl").exists()
+
+
+def test_parse_course_dir_default_still_isolates_file_failure(tmp_path) -> None:
+    course_dir = tmp_path / "培训数据"
+    _write_pptx(course_dir / "好课件.pptx", ["销售流程" * 50])
+    (course_dir / "坏课件.pptx").write_bytes(b"broken")
+
+    report = parse_course_dir(course_dir, tmp_path / "out")
+
+    assert report.counts["files_parsed"] == 1
+    assert report.counts["files_failed"] == 1
+
+
+def test_parse_course_dir_fail_fast_keeps_enrichment_failure_as_warning(tmp_path) -> None:
+    course_dir = tmp_path / "培训数据"
+    _write_pptx(course_dir / "促成课.pptx", ["促成动作要点" * 50])
+    events: list[tuple[str, str, int]] = []
+
+    report = parse_course_dir(
+        course_dir,
+        tmp_path / "out",
+        enrichment_agent=_FailingEnrichmentAgent(),
+        fail_fast=True,
+        on_file=lambda path, status, count: events.append((path, status, count)),
+    )
+
+    assert report.enrich_failures and "促成课" in report.enrich_failures[0]
+    assert events and events[0][0:2] == ("促成课.pptx", "parsed")
+    assert events[0][2] > 0
 
 
 def test_parse_course_dir_records_duplicate_text_hash(tmp_path) -> None:
