@@ -15,6 +15,7 @@ from xhbx_rag.atomic_indexer import (
     AtomicIndexResult,
     AtomicJournalIdentity,
     RollbackPendingError,
+    UntrustedJournalError,
 )
 from xhbx_rag.web.ingestion_pipeline import IngestionPipelineError, PreparedIngestion
 from xhbx_rag.web.ingestion_runner import IngestionRunner
@@ -164,7 +165,7 @@ class FakeAtomicIndexer:
     ) -> str:
         del expected_identity
         if self.mode == "corrupt":
-            raise AtomicIndexError("commit journal 自校验失败")
+            raise UntrustedJournalError("commit journal 自校验失败")
         return self.states[journal_path.resolve()]
 
     def recover(
@@ -401,15 +402,15 @@ def test_rollback_pending_without_prepared_callback_is_reconciled_and_preserved(
     assert any((job_dir / "attempts").iterdir())
 
 
-def test_corrupt_journal_stays_rolling_back_and_keeps_all_materials(tmp_path: Path) -> None:
+def test_corrupt_journal_is_quarantined_without_sqlite_reconcile(tmp_path: Path) -> None:
     store, job_id, job_dir = queued_store(tmp_path)
 
     _runner(store, FakePipeline(), FakeAtomicIndexer(mode="corrupt")).execute_job(job_id)
 
     job = store.get_job(job_id)
     assert job is not None
-    assert job["status"] == "rolling_back"
-    assert job["attempt"]["commit_state"] == "rolling_back"
+    assert job["status"] == "running"
+    assert job["attempt"]["commit_state"] == "prepared"
     assert (job_dir / "attempts" / "1" / "rollback" / "journal.json").is_file()
     assert (job_dir / "attempts" / "1" / "staging" / "chunks.jsonl").is_file()
 
@@ -437,11 +438,11 @@ def test_current_rollback_symlink_never_adopts_or_moves_old_committed_material(
 
     job = store.get_job(job_id)
     assert job is not None
-    assert job["status"] == "rolling_back"
-    assert job["attempt"]["commit_state"] == "rolling_back"
+    assert job["status"] == "running"
+    assert job["attempt"]["commit_state"] == "not_started"
     execution = store.get_job_for_execution(job_id)
     assert execution is not None
-    assert execution["attempt"]["journal_path"] == workspace / "rollback/journal.json"
+    assert execution["attempt"]["journal_path"] is None
     assert old_journal.read_text(encoding="utf-8") == "old committed"
     assert old_rollback.is_dir()
     assert (workspace / "staging/current.txt").is_file()
@@ -488,8 +489,8 @@ def test_stored_fake_committed_journal_not_bound_to_current_attempt_is_rejected(
 
     job = store.get_job(job_id)
     assert job is not None
-    assert job["status"] == "rolling_back"
-    assert job["attempt"]["commit_state"] == "rolling_back"
+    assert job["status"] == "running"
+    assert job["attempt"]["commit_state"] == "prepared"
     assert foreign_journal.read_text(encoding="utf-8") == "same collection committed"
     assert (workspace / "staging/current.txt").is_file()
 
@@ -519,8 +520,8 @@ def test_rollback_pending_external_path_is_never_adopted_or_deleted(tmp_path: Pa
 
     job = store.get_job(job_id)
     assert job is not None
-    assert job["status"] == "rolling_back"
-    assert job["attempt"]["commit_state"] == "rolling_back"
+    assert job["status"] == "running"
+    assert job["attempt"]["commit_state"] == "not_started"
     assert foreign_journal.read_text(encoding="utf-8") == "foreign committed"
     assert (job_dir / "attempts" / "1" / "staging/chunks.jsonl").is_file()
 
@@ -561,8 +562,8 @@ def test_old_attempt_committed_journal_cannot_complete_current_retry(tmp_path: P
 
     job = store.get_job(job_id)
     assert job is not None
-    assert job["status"] == "rolling_back"
-    assert job["attempt"]["commit_state"] == "rolling_back"
+    assert job["status"] == "running"
+    assert job["attempt"]["commit_state"] == "prepared"
     assert old_journal.read_text(encoding="utf-8") == "old committed"
     assert (current_workspace / "staging/current.txt").is_file()
 
@@ -670,9 +671,9 @@ def test_execute_recovery_corruption_keeps_workspace_until_stop(tmp_path: Path) 
 
     job = store.get_job(job_id)
     assert job is not None
-    assert sleeps == [2.0]
-    assert job["status"] == "rolling_back"
-    assert job["error_code"] == "rollback_pending"
+    assert sleeps == []
+    assert job["status"] == "running"
+    assert job["attempt"]["commit_state"] == "prepared"
     assert any((job_dir / "attempts").iterdir())
 
 

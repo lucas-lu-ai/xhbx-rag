@@ -64,6 +64,10 @@ class AtomicIndexError(RuntimeError):
     pass
 
 
+class UntrustedJournalError(AtomicIndexError):
+    """journal/owner/snapshot 的确定性验证失败。"""
+
+
 class RollbackPendingError(AtomicIndexError):
     def __init__(self, journal_path: Path, detail: str) -> None:
         super().__init__(detail)
@@ -189,8 +193,11 @@ class AtomicIndexer:
         try:
             with _collection_write_context(self.store):
                 journal = _read_journal(journal_path)
-                _validate_journal(journal, self.store)
-                _validate_expected_identity(journal, expected_identity)
+                try:
+                    _validate_journal(journal, self.store)
+                    _validate_expected_identity(journal, expected_identity)
+                except AtomicIndexError as exc:
+                    raise UntrustedJournalError(str(exc)) from exc
                 state = str(journal["state"])
                 if state == "rolled_back":
                     return
@@ -202,9 +209,14 @@ class AtomicIndexer:
                         raise AtomicIndexError("committed journal 的 ID 集合校验失败")
                     return
 
-                snapshot_path = _resolve_snapshot_path(journal_path, journal)
-                old_rows = _read_snapshot(snapshot_path, journal)
-                _validate_snapshot(old_rows, journal)
+                try:
+                    snapshot_path = _resolve_snapshot_path(journal_path, journal)
+                    old_rows = _read_snapshot(snapshot_path, journal)
+                    _validate_snapshot(old_rows, journal)
+                except AtomicIndexError as exc:
+                    if str(exc) == "rollback snapshot 无法读取":
+                        raise
+                    raise UntrustedJournalError(str(exc)) from exc
                 self._rollback(journal_path, journal, old_rows)
         except AtomicIndexError:
             raise
@@ -222,8 +234,11 @@ class AtomicIndexer:
         try:
             with _collection_write_context(self.store):
                 journal = _read_journal(journal_path)
-                _validate_journal(journal, self.store)
-                _validate_expected_identity(journal, expected_identity)
+                try:
+                    _validate_journal(journal, self.store)
+                    _validate_expected_identity(journal, expected_identity)
+                except AtomicIndexError as exc:
+                    raise UntrustedJournalError(str(exc)) from exc
                 state = str(journal["state"])
                 if state == "committed":
                     chunk_ids = list(journal["chunk_ids"])
@@ -231,9 +246,14 @@ class AtomicIndexer:
                     if actual_ids != set(chunk_ids):
                         raise AtomicIndexError("committed journal 的 ID 集合校验失败")
                 elif state in {"prepared", "rolling_back"}:
-                    snapshot_path = _resolve_snapshot_path(journal_path, journal)
-                    old_rows = _read_snapshot(snapshot_path, journal)
-                    _validate_snapshot(old_rows, journal)
+                    try:
+                        snapshot_path = _resolve_snapshot_path(journal_path, journal)
+                        old_rows = _read_snapshot(snapshot_path, journal)
+                        _validate_snapshot(old_rows, journal)
+                    except AtomicIndexError as exc:
+                        if str(exc) == "rollback snapshot 无法读取":
+                            raise
+                        raise UntrustedJournalError(str(exc)) from exc
                 return cast(
                     Literal["prepared", "committed", "rolling_back", "rolled_back"],
                     state,
@@ -381,11 +401,17 @@ def _journal_with_checksum(journal: dict[str, Any]) -> dict[str, Any]:
 
 def _read_journal(path: Path) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise AtomicIndexError("commit journal 无法读取或格式无效") from exc
+        payload = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise AtomicIndexError("commit journal 无法读取") from exc
+    except UnicodeError as exc:
+        raise UntrustedJournalError("commit journal UTF-8 无效") from exc
+    try:
+        value = json.loads(payload)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise UntrustedJournalError("commit journal 格式无效") from exc
     if not isinstance(value, dict):
-        raise AtomicIndexError("commit journal 必须是 JSON object")
+        raise UntrustedJournalError("commit journal 必须是 JSON object")
     return value
 
 

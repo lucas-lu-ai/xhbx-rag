@@ -16,6 +16,7 @@ from xhbx_rag.atomic_indexer import (
     AtomicIndexResult,
     AtomicJournalIdentity,
     RollbackPendingError,
+    UntrustedJournalError,
 )
 from xhbx_rag.web.ingestion_pipeline import PreparedIngestion
 from xhbx_rag.web.ingestion_store import IngestionStore, RecoveryAction
@@ -205,9 +206,7 @@ class IngestionRunner:
             try:
                 journal = self._journal_for_job(job)
             except _UntrustedRecoveryMaterial:
-                journal = _expected_paths(job).journal
-                self._ensure_rolling_back(job_id, journal)
-                state = None
+                return
             else:
                 if journal is None:
                     return
@@ -221,12 +220,18 @@ class IngestionRunner:
                     state = indexer.inspect_journal_state(
                         journal, expected_identity=identity
                     )
+                except UntrustedJournalError:
+                    return
+                except _UntrustedRecoveryMaterial:
+                    return
                 except Exception:
                     if indexer is not None:
                         try:
                             state = indexer.inspect_journal_state(
                                 journal, expected_identity=identity
                             )
+                        except UntrustedJournalError:
+                            return
                         except Exception:
                             state = None
 
@@ -271,7 +276,6 @@ class IngestionRunner:
                 self.store.fail_job(job_id, code=code, detail=detail)
                 return
             except _UntrustedRecoveryMaterial:
-                self._ensure_rolling_back(job_id, _expected_paths(job).journal)
                 return
             except Exception:
                 if not self._sleep(delay):
@@ -285,9 +289,10 @@ class IngestionRunner:
         for action in actions:
             if action.action == "fail_interrupted":
                 try:
-                    if self._fail_interrupted(action):
+                    disposition = self._fail_interrupted(action)
+                    if disposition == "recovery":
                         discovered_recovery.append(action.job_id)
-                    else:
+                    elif disposition == "done":
                         current = self.store.get_job_for_execution(action.job_id)
                         if current is not None and current["status"] == "running":
                             interrupted_retry.append(action.job_id)
@@ -330,17 +335,14 @@ class IngestionRunner:
             return
         paths = _expected_paths(current)
         if workspace != paths.workspace:
-            self._ensure_rolling_back(job_id, paths.journal)
             return
         if isinstance(exc, RollbackPendingError) and not _lexical_path_equals(
             Path(exc.journal_path), paths.journal
         ):
-            self._ensure_rolling_back(job_id, paths.journal)
             return
         try:
             journal = self._journal_for_job(current)
         except _UntrustedRecoveryMaterial:
-            self._ensure_rolling_back(job_id, paths.journal)
             return
 
         if journal is None:
@@ -357,6 +359,8 @@ class IngestionRunner:
             state = indexer.inspect_journal_state(
                 journal, expected_identity=_identity_for_job(current)
             )
+        except UntrustedJournalError:
+            return
         except Exception:
             self._ensure_rolling_back(job_id, journal)
             return
@@ -520,6 +524,16 @@ class IngestionRunner:
             paths = _expected_paths(checked)
             _validate_attempt_binding(checked, paths, allow_workspace_none=True)
             _validate_directory_chain(paths, include_rollback=True)
+            attempt = checked.get("attempt")
+            if (
+                isinstance(attempt, dict)
+                and attempt.get("workspace_path") is None
+                and attempt.get("commit_state") == "not_started"
+                and attempt.get("status") == "queued"
+                and paths.workspace.is_dir()
+                and any(paths.workspace.iterdir())
+            ):
+                raise _UntrustedRecoveryMaterial("未持久化 workspace 非空")
             clear_attempt_workspaces(paths.job_dir)
         except Exception:
             return False
@@ -619,40 +633,51 @@ class IngestionRunner:
         except Exception:
             return False
 
-    def _fail_interrupted(self, action: RecoveryAction) -> bool:
+    def _fail_interrupted(
+        self, action: RecoveryAction
+    ) -> Literal["done", "recovery", "quarantined"]:
         job = self.store.get_job_for_execution(action.job_id)
         if job is None:
-            return False
+            return "done"
         try:
             journal = self._journal_for_job(job)
         except _UntrustedRecoveryMaterial:
-            self._ensure_rolling_back(action.job_id, _expected_paths(job).journal)
-            return True
+            return "quarantined"
         if journal is not None:
             try:
                 indexer = self.indexer_factory(str(job["target"]))
                 state = indexer.inspect_journal_state(
                     journal, expected_identity=_identity_for_job(job)
                 )
+            except UntrustedJournalError:
+                return "quarantined"
+            except _UntrustedRecoveryMaterial:
+                return "quarantined"
             except Exception:
                 self._ensure_rolling_back(action.job_id, journal)
-                return True
+                return "recovery"
             if state == "committed":
                 self._reconcile_committed(action.job_id, journal)
             elif state == "rolled_back":
                 if not self._reconcile_rolled_back(action.job_id, journal):
-                    return True
+                    return "recovery"
                 current = self.store.get_job_for_execution(action.job_id)
                 if current is None or not self._cleanup_attempts(current):
-                    return False
+                    return "recovery"
                 code, detail = safe_ingestion_error("index_failed")
                 self.store.fail_job(action.job_id, code=code, detail=detail)
-                return False
+                return "done"
             else:
                 self._ensure_rolling_back(action.job_id, journal)
-            return True
+            return "recovery"
         if not self._cleanup_attempts(job):
-            return False
+            current = self.store.get_job_for_execution(action.job_id)
+            if current is not None:
+                try:
+                    self._journal_for_job(current)
+                except _UntrustedRecoveryMaterial:
+                    return "quarantined"
+            return "done"
         attempt = job.get("attempt")
         error_code = (
             "index_failed"
@@ -661,7 +686,7 @@ class IngestionRunner:
         )
         code, detail = safe_ingestion_error(error_code)
         self.store.fail_job(action.job_id, code=code, detail=detail)
-        return False
+        return "done"
 
     def _execute_delete(self, job_id: str) -> None:
         job = self.store.get_job_for_execution(job_id)
