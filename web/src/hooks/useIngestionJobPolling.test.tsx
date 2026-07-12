@@ -125,6 +125,57 @@ test("polling is serial and never overlaps a pending request", async () => {
   expect(fetchProgress).toHaveBeenCalledTimes(2);
 });
 
+test.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY])(
+  "invalid interval %s cannot create an active-job busy loop",
+  async (intervalMs) => {
+    const fetchProgress = vi
+      .fn<(jobId: string) => Promise<IngestionJobProgress>>()
+      .mockResolvedValueOnce(progressPayload({ status: "running" }))
+      .mockResolvedValueOnce(
+        progressPayload({ status: "succeeded", current_stage: "completed" })
+      );
+    renderHook(() =>
+      useIngestionJobPolling("job-1", { intervalMs, fetchProgress })
+    );
+
+    await flushMicrotasks();
+    expect(fetchProgress).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(fetchProgress).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1999);
+    });
+    expect(fetchProgress).toHaveBeenCalledTimes(2);
+  }
+);
+
+test("zero interval cannot create an error retry busy loop", async () => {
+  const fetchProgress = vi
+    .fn<(jobId: string) => Promise<IngestionJobProgress>>()
+    .mockRejectedValueOnce(new Error("临时网络错误"))
+    .mockResolvedValueOnce(
+      progressPayload({ status: "succeeded", current_stage: "completed" })
+    );
+  renderHook(() =>
+    useIngestionJobPolling("job-1", { intervalMs: 0, fetchProgress })
+  );
+
+  await flushMicrotasks();
+  expect(fetchProgress).toHaveBeenCalledTimes(1);
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(1);
+  });
+  expect(fetchProgress).toHaveBeenCalledTimes(1);
+
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(1999);
+  });
+  expect(fetchProgress).toHaveBeenCalledTimes(2);
+});
+
 test("temporary errors remain visible and polling continues", async () => {
   const notFound = new ApiError(404, "入库任务不存在", {
     detail: "入库任务不存在"
@@ -183,6 +234,41 @@ test("job switching ignores stale results from the previous job", async () => {
     await first.promise;
   });
   expect(result.current.progress?.job_id).toBe("job-2");
+});
+
+test("job switching ignores stale rejection from the previous job", async () => {
+  const first = deferred<IngestionJobProgress>();
+  const second = deferred<IngestionJobProgress>();
+  const fetchProgress = vi.fn((jobId: string) =>
+    jobId === "job-1" ? first.promise : second.promise
+  );
+  const { result, rerender } = renderHook(
+    ({ jobId }: { jobId: string | null }) =>
+      useIngestionJobPolling(jobId, { intervalMs: 20, fetchProgress }),
+    { initialProps: { jobId: "job-1" } }
+  );
+  await flushMicrotasks();
+
+  rerender({ jobId: "job-2" });
+  await flushMicrotasks();
+  await act(async () => {
+    second.resolve(
+      progressPayload({
+        job_id: "job-2",
+        status: "succeeded",
+        current_stage: "completed"
+      })
+    );
+    await second.promise;
+  });
+
+  await act(async () => {
+    first.reject(new ApiError(404, "旧任务不存在", { detail: "旧任务不存在" }));
+    await first.promise.catch(() => undefined);
+  });
+
+  expect(result.current.progress?.job_id).toBe("job-2");
+  expect(result.current.error).toBeNull();
 });
 
 test("unmount clears the next poll timer", async () => {

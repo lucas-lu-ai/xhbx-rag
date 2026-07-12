@@ -37,14 +37,30 @@ class FakeEventTarget {
 class FakeXMLHttpRequest extends FakeEventTarget {
   readonly upload = new FakeEventTarget();
   readonly headers = new Map<string, string>();
-  status = 0;
-  responseText = "";
+  private statusValue = 0;
+  private responseTextValue = "";
+  throwOnStatus = false;
+  throwOnResponseText = false;
   timeout = 0;
   method = "";
   url = "";
   async = true;
   body: Document | XMLHttpRequestBodyInit | null = null;
   abortCalls = 0;
+
+  get status(): number {
+    if (this.throwOnStatus) {
+      throw new Error("status getter failed");
+    }
+    return this.statusValue;
+  }
+
+  get responseText(): string {
+    if (this.throwOnResponseText) {
+      throw new Error("responseText getter failed");
+    }
+    return this.responseTextValue;
+  }
 
   open(method: string, url: string | URL, async = true): void {
     this.method = method;
@@ -82,14 +98,14 @@ class FakeXMLHttpRequest extends FakeEventTarget {
   }
 
   resolve(status: number, body: unknown): void {
-    this.status = status;
-    this.responseText = JSON.stringify(body);
+    this.statusValue = status;
+    this.responseTextValue = JSON.stringify(body);
     this.emit("load", new Event("load"));
   }
 
   resolveText(status: number, body: string): void {
-    this.status = status;
-    this.responseText = body;
+    this.statusValue = status;
+    this.responseTextValue = body;
     this.emit("load", new Event("load"));
   }
 
@@ -207,6 +223,57 @@ test.each([
   }
 
   await expect(promise).rejects.toThrow(message);
+  expect(xhr.totalListenerCount()).toBe(0);
+});
+
+test("status zero load is reported as a fixed network error", async () => {
+  const xhr = new FakeXMLHttpRequest();
+  const promise = uploadIngestionJob(new File(["x"], "x.txt"), "case", {
+    xhrFactory: () => xhr
+  });
+
+  xhr.resolve(0, {});
+
+  await expect(promise).rejects.toThrow("上传失败，请检查网络连接");
+  expect(xhr.totalListenerCount()).toBe(0);
+});
+
+test("non-2xx responseText getter failure rejects with fixed status error", async () => {
+  const xhr = new FakeXMLHttpRequest();
+  const promise = uploadIngestionJob(new File(["x"], "x.txt"), "case", {
+    xhrFactory: () => xhr
+  });
+  xhr.throwOnResponseText = true;
+
+  expect(() => xhr.resolve(500, {})).not.toThrow();
+
+  await expect(promise).rejects.toThrow("上传失败 (500)");
+  expect(xhr.totalListenerCount()).toBe(0);
+});
+
+test("2xx responseText getter failure rejects as invalid response", async () => {
+  const xhr = new FakeXMLHttpRequest();
+  const promise = uploadIngestionJob(new File(["x"], "x.txt"), "case", {
+    xhrFactory: () => xhr
+  });
+  xhr.throwOnResponseText = true;
+
+  expect(() => xhr.resolve(201, {})).not.toThrow();
+
+  await expect(promise).rejects.toThrow("上传响应无效");
+  expect(xhr.totalListenerCount()).toBe(0);
+});
+
+test("status getter failure rejects as invalid response", async () => {
+  const xhr = new FakeXMLHttpRequest();
+  const promise = uploadIngestionJob(new File(["x"], "x.txt"), "case", {
+    xhrFactory: () => xhr
+  });
+  xhr.throwOnStatus = true;
+
+  expect(() => xhr.resolve(201, ingestionDraftPayload())).not.toThrow();
+
+  await expect(promise).rejects.toThrow("上传响应无效");
   expect(xhr.totalListenerCount()).toBe(0);
 });
 

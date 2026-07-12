@@ -6,6 +6,8 @@ type NavigateWorkspaceOptions = {
   replace?: boolean;
 };
 
+const WORKSPACE_LOCATION_EVENT = "xhbx-rag:workspace-location-change";
+
 export function parseWorkspaceLocation(search: string): WorkspaceLocation {
   const params = new URLSearchParams(search);
   if (params.get("view") !== "ingestion") {
@@ -40,6 +42,7 @@ export function navigateWorkspaceLocation(
 
   const method = options.replace ? "replaceState" : "pushState";
   window.history[method](null, "", nextUrl);
+  window.dispatchEvent(new Event(WORKSPACE_LOCATION_EVENT));
 }
 
 export function subscribeWorkspaceLocation(
@@ -49,5 +52,9 @@ export function subscribeWorkspaceLocation(
     listener(parseWorkspaceLocation(window.location.search));
   };
   window.addEventListener("popstate", handlePopState);
-  return () => window.removeEventListener("popstate", handlePopState);
+  window.addEventListener(WORKSPACE_LOCATION_EVENT, handlePopState);
+  return () => {
+    window.removeEventListener("popstate", handlePopState);
+    window.removeEventListener(WORKSPACE_LOCATION_EVENT, handlePopState);
+  };
 }

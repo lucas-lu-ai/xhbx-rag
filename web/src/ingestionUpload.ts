@@ -73,13 +73,31 @@ export function uploadIngestionJob(
     }
 
     function handleLoad() {
-      if (xhr.status < 200 || xhr.status >= 300) {
-        fail(httpErrorMessage(xhr.responseText, xhr.status));
+      const status = safeStatus(xhr);
+      if (status === null) {
+        fail(INGESTION_UPLOAD_INVALID_RESPONSE_ERROR);
+        return;
+      }
+      if (status === 0) {
+        fail(INGESTION_UPLOAD_NETWORK_ERROR);
+        return;
+      }
+      const responseText = safeResponseText(xhr);
+      if (status < 200 || status >= 300) {
+        fail(
+          responseText === null
+            ? `上传失败 (${status})`
+            : httpErrorMessage(responseText, status)
+        );
+        return;
+      }
+      if (responseText === null) {
+        fail(INGESTION_UPLOAD_INVALID_RESPONSE_ERROR);
         return;
       }
 
       try {
-        const payload = JSON.parse(xhr.responseText) as unknown;
+        const payload = JSON.parse(responseText) as unknown;
         if (isIngestionJobDetail(payload)) {
           succeed(payload);
         } else {
@@ -148,6 +166,22 @@ function ingestionUploadEndpoint(baseUrl?: string): string {
   const configuredBase =
     baseUrl ?? (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? "";
   return `${configuredBase.replace(/\/$/, "")}/api/ingestion-jobs`;
+}
+
+function safeStatus(request: IngestionUploadRequest): number | null {
+  try {
+    return request.status;
+  } catch {
+    return null;
+  }
+}
+
+function safeResponseText(request: IngestionUploadRequest): string | null {
+  try {
+    return request.responseText;
+  } catch {
+    return null;
+  }
 }
 
 function httpErrorMessage(responseText: string, status: number): string {

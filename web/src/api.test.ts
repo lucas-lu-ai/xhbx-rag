@@ -489,6 +489,7 @@ test("listIngestionJobs gets typed job summaries", async () => {
   const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     expect(input).toBe("/api/ingestion-jobs");
     expect(init?.method).toBe("GET");
+    expect(init?.body).toBeUndefined();
     return jsonResponse({ jobs: [ingestionSummary()] });
   });
 
@@ -501,6 +502,7 @@ test("getIngestionJob encodes the job ID and returns detail", async () => {
   const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     expect(input).toBe("/api/ingestion-jobs/job%2Fwith%20space%3F");
     expect(init?.method).toBe("GET");
+    expect(init?.body).toBeUndefined();
     return jsonResponse(ingestionDraftPayload({ job_id: "job/with space?" }));
   });
 
@@ -513,6 +515,7 @@ test("getIngestionJobProgress gets the lightweight progress response", async () 
   const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     expect(input).toBe("/api/ingestion-jobs/job-1/progress");
     expect(init?.method).toBe("GET");
+    expect(init?.body).toBeUndefined();
     return jsonResponse(progressPayload());
   });
 
@@ -525,6 +528,7 @@ test("startIngestionJob posts to the encoded start endpoint", async () => {
   const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     expect(input).toBe("/api/ingestion-jobs/job%2F1/start");
     expect(init?.method).toBe("POST");
+    expect(init?.body).toBeUndefined();
     return jsonResponse({ ok: true, job_id: "job/1", status: "queued" });
   });
 
@@ -537,6 +541,7 @@ test("retryIngestionJob returns the reserved attempt", async () => {
   const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     expect(input).toBe("/api/ingestion-jobs/job-1/retry");
     expect(init?.method).toBe("POST");
+    expect(init?.body).toBeUndefined();
     return jsonResponse({
       ok: true,
       job_id: "job-1",
@@ -554,6 +559,7 @@ test("deleteIngestionJob issues DELETE and surfaces backend detail", async () =>
   const okFetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     expect(input).toBe("/api/ingestion-jobs/job-1");
     expect(init?.method).toBe("DELETE");
+    expect(init?.body).toBeUndefined();
     return jsonResponse({ ok: true, job_id: "job-1", status: "deleted" });
   });
 

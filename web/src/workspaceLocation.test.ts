@@ -54,6 +54,30 @@ test("history navigation preserves pathname and hash and avoids duplicate pushes
   expect(pushSpy).toHaveBeenCalledTimes(1);
 });
 
+test("push and replace navigation notify subscribers exactly once", () => {
+  const listener = vi.fn();
+  const unsubscribe = subscribeWorkspaceLocation(listener);
+
+  navigateWorkspaceLocation({ view: "ingestion", jobId: "job-1" });
+  expect(listener).toHaveBeenCalledTimes(1);
+  expect(listener).toHaveBeenLastCalledWith({
+    view: "ingestion",
+    jobId: "job-1"
+  });
+
+  listener.mockClear();
+  navigateWorkspaceLocation({ view: "ingestion", jobId: "job-1" });
+  expect(listener).not.toHaveBeenCalled();
+
+  navigateWorkspaceLocation({ view: "ingestion", jobId: "job-2" }, { replace: true });
+  expect(listener).toHaveBeenCalledTimes(1);
+  expect(listener).toHaveBeenLastCalledWith({
+    view: "ingestion",
+    jobId: "job-2"
+  });
+  unsubscribe();
+});
+
 test("popstate subscription exposes the parsed current location and cleans up", () => {
   const listener = vi.fn();
   const unsubscribe = subscribeWorkspaceLocation(listener);
@@ -61,7 +85,7 @@ test("popstate subscription exposes the parsed current location and cleans up", 
 
   window.dispatchEvent(new PopStateEvent("popstate"));
   unsubscribe();
-  window.history.replaceState(null, "", "/");
+  navigateWorkspaceLocation({ view: "chat" });
   window.dispatchEvent(new PopStateEvent("popstate"));
 
   expect(listener).toHaveBeenCalledTimes(1);

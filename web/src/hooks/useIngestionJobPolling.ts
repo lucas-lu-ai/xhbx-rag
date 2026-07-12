@@ -98,8 +98,8 @@ export function useIngestionJobPolling(
 }
 
 function normalizedInterval(value: number | undefined): number {
-  if (value === undefined || !Number.isFinite(value)) {
+  if (value === undefined || !Number.isFinite(value) || value <= 0) {
     return DEFAULT_POLL_INTERVAL_MS;
   }
-  return Math.max(0, value);
+  return value;
 }
