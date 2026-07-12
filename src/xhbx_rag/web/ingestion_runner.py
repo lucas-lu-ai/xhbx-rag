@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import itertools
+import hashlib
 import os
 import queue
+import re
 import stat
 import threading
 from collections.abc import Callable, Mapping
@@ -10,7 +12,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Protocol, cast
 
-from xhbx_rag.atomic_indexer import AtomicIndexResult, RollbackPendingError
+from xhbx_rag.atomic_indexer import (
+    AtomicIndexResult,
+    AtomicJournalIdentity,
+    RollbackPendingError,
+)
 from xhbx_rag.web.ingestion_pipeline import PreparedIngestion
 from xhbx_rag.web.ingestion_store import IngestionStore, RecoveryAction
 from xhbx_rag.web.ingestion_uploads import clear_attempt_workspaces, delete_job_workspace
@@ -33,12 +39,17 @@ class _AtomicIndexer(Protocol):
         chunks_path: Path,
         *,
         journal_dir: Path,
+        identity: AtomicJournalIdentity | None = None,
         on_state: Callable[[str, Path], None] | None = None,
     ) -> AtomicIndexResult: ...
 
-    def recover(self, journal_path: Path) -> None: ...
+    def recover(
+        self, journal_path: Path, *, expected_identity: AtomicJournalIdentity | None = None
+    ) -> None: ...
 
-    def inspect_journal_state(self, journal_path: Path) -> str: ...
+    def inspect_journal_state(
+        self, journal_path: Path, *, expected_identity: AtomicJournalIdentity | None = None
+    ) -> str: ...
 
 
 QueueKind = Literal["job", "recovery", "interrupt", "delete", "stop"]
@@ -156,11 +167,17 @@ class IngestionRunner:
         indexer: _AtomicIndexer | None = None
         try:
             self.store.mark_stage(job_id, "indexing", "")
+            content_sha256 = hashlib.sha256(prepared.chunks_path.read_bytes()).hexdigest()
+            self.store.mark_content_identity(job_id, content_sha256)
+            identity = AtomicJournalIdentity(
+                job_id, int(job["attempt_count"]), content_sha256
+            )
             indexer = self.indexer_factory(str(job["target"]))
             indexer.commit(
                 prepared.chunks_path,
                 journal_dir=workspace / "rollback",
-                on_state=lambda state, path: self.store.mark_commit_state(
+                identity=identity,
+                on_state=lambda state, path: self._on_atomic_state(
                     job_id, state, path
                 ),
             )
@@ -198,13 +215,18 @@ class IngestionRunner:
             indexer: _AtomicIndexer | None = None
             if state is None and _is_trusted_journal(job, journal):
                 try:
+                    identity = _identity_for_job(job)
                     indexer = self.indexer_factory(str(job["target"]))
-                    indexer.recover(journal)
-                    state = indexer.inspect_journal_state(journal)
+                    indexer.recover(journal, expected_identity=identity)
+                    state = indexer.inspect_journal_state(
+                        journal, expected_identity=identity
+                    )
                 except Exception:
                     if indexer is not None:
                         try:
-                            state = indexer.inspect_journal_state(journal)
+                            state = indexer.inspect_journal_state(
+                                journal, expected_identity=identity
+                            )
                         except Exception:
                             state = None
 
@@ -332,7 +354,9 @@ class IngestionRunner:
             self._finish_precommit_failure(job_id, job, exc)
             return
         try:
-            state = indexer.inspect_journal_state(journal)
+            state = indexer.inspect_journal_state(
+                journal, expected_identity=_identity_for_job(current)
+            )
         except Exception:
             self._ensure_rolling_back(job_id, journal)
             return
@@ -388,6 +412,22 @@ class IngestionRunner:
                 self.store.complete_item(job_id, item_index, chunk_count, warning_count)
         elif event == "item_failed":
             self.store.fail_item(job_id, item_index, "")
+
+    def _on_atomic_state(self, job_id: str, state: str, raw_path: Path) -> None:
+        job = self.store.get_job_for_execution(job_id)
+        if job is None:
+            raise _UntrustedRecoveryMaterial("任务不存在")
+        paths = _expected_paths(job)
+        if (
+            not isinstance(raw_path, Path)
+            or not raw_path.is_absolute()
+            or any(part in {".", ".."} for part in raw_path.parts)
+            or str(raw_path) != str(paths.journal)
+        ):
+            raise _UntrustedRecoveryMaterial("Atomic callback journal path 不可信")
+        _validate_attempt_binding(job, paths, allow_workspace_none=False)
+        _validate_recovery_location(paths, paths.rollback_dir)
+        self.store.mark_commit_state(job_id, state, raw_path)
 
     def _finish_precommit_failure(
         self,
@@ -591,7 +631,9 @@ class IngestionRunner:
         if journal is not None:
             try:
                 indexer = self.indexer_factory(str(job["target"]))
-                state = indexer.inspect_journal_state(journal)
+                state = indexer.inspect_journal_state(
+                    journal, expected_identity=_identity_for_job(job)
+                )
             except Exception:
                 self._ensure_rolling_back(action.job_id, journal)
                 return True
@@ -666,13 +708,23 @@ class IngestionRunner:
 
 def _trusted_job_dir(job: Mapping[str, object]) -> Path:
     source_path = job.get("source_path")
+    jobs_root = job.get("jobs_root")
+    job_id = job.get("job_id")
     if (
         not isinstance(source_path, Path)
+        or not isinstance(jobs_root, Path)
+        or not isinstance(job_id, str)
         or not source_path.is_absolute()
         or source_path.parent.name != "source"
     ):
         raise _UntrustedRecoveryMaterial("入库任务工作区无效")
     job_dir = source_path.parent.parent
+    if job_dir.name != job_id or str(job_dir.parent) != str(jobs_root):
+        raise _UntrustedRecoveryMaterial("任务目录未绑定 jobs_root/job_id")
+    if jobs_root.exists() and (
+        jobs_root.is_symlink() or jobs_root.resolve(strict=True) != jobs_root
+    ):
+        raise _UntrustedRecoveryMaterial("jobs_root 不可信")
     if source_path != source_path.resolve(strict=False):
         raise _UntrustedRecoveryMaterial("入库源路径不可信")
     if job_dir.exists() and (
@@ -787,6 +839,22 @@ def _is_trusted_journal(job: Mapping[str, object], journal: Path) -> bool:
         return _journal_path_without_restore(job) == journal
     except _UntrustedRecoveryMaterial:
         return False
+
+
+def _identity_for_job(job: Mapping[str, object]) -> AtomicJournalIdentity:
+    attempt = job.get("attempt")
+    job_id = job.get("job_id")
+    if not isinstance(attempt, dict) or not isinstance(job_id, str):
+        raise _UntrustedRecoveryMaterial("journal owner identity 缺失")
+    digest = attempt.get("content_sha256")
+    attempt_no = attempt.get("attempt_no")
+    if (
+        not isinstance(digest, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        or not _is_positive_int(attempt_no)
+    ):
+        raise _UntrustedRecoveryMaterial("journal owner identity 无效")
+    return AtomicJournalIdentity(job_id, cast(int, attempt_no), digest)
 
 
 def _journal_path_without_restore(job: Mapping[str, object]) -> Path | None:

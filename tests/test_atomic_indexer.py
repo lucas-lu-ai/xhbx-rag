@@ -14,6 +14,7 @@ import pytest
 from xhbx_rag.atomic_indexer import (
     AtomicIndexError,
     AtomicIndexer,
+    AtomicJournalIdentity,
     RollbackPendingError,
 )
 from xhbx_rag.chunk_io import chunk_text_hash
@@ -245,7 +246,12 @@ def write_prepared_journal(
     write_journal_data(
         journal_path,
         {
-            "version": 1,
+            "version": 2,
+            "owner": {
+                "job_id": "standalone",
+                "attempt_no": 1,
+                "chunks_sha256": "0" * 64,
+            },
             "collection": {
                 "uri_sha256": hashlib.sha256(
                     _normalize_uri(store.uri).encode("utf-8")
@@ -1029,6 +1035,29 @@ def test_inspect_journal_state_wraps_store_errors_with_safe_detail(tmp_path: Pat
     assert str(caught.value) == "commit journal 状态检查失败"
     assert "/private/path" not in str(caught.value)
     assert "secret" not in str(caught.value)
+
+
+def test_expected_owner_mismatch_is_rejected_before_any_store_write(tmp_path: Path) -> None:
+    store = FakeTransactionalStore(existing={"new": raw_row("new", "新文本", [0.1, 0.2])})
+    journal = write_prepared_journal(
+        tmp_path / "rollback",
+        store=store,
+        chunk_ids=["new"],
+        old_rows=[],
+        collection_existed=True,
+        state="committed",
+    )
+    wrong = AtomicJournalIdentity("other-job", 9, "f" * 64)
+    indexer = AtomicIndexer(embedding_client=FakeEmbedding([]), store=store)
+
+    with pytest.raises(AtomicIndexError, match="owner identity 不匹配"):
+        indexer.inspect_journal_state(journal, expected_identity=wrong)
+    with pytest.raises(AtomicIndexError, match="owner identity 不匹配"):
+        indexer.recover(journal, expected_identity=wrong)
+
+    assert store.delete_calls == []
+    assert store.upsert_calls == 0
+    assert store.flush_calls == 0
 
 
 @pytest.mark.parametrize("separator", ["\u2028", "\u2029"])

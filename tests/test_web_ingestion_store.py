@@ -341,6 +341,40 @@ def test_store_exposes_a_clear_state_conflict_error() -> None:
     assert issubclass(ingestion_store.IngestionStateError, RuntimeError)
 
 
+@pytest.mark.parametrize("symlink_level", ["jobs_root", "job_dir", "source_file"])
+def test_create_draft_rejects_symlinked_strict_source_layout(
+    tmp_path: Path, symlink_level: str
+) -> None:
+    job_id = "a" * 32
+    jobs_root = tmp_path / "jobs"
+    foreign = tmp_path / "foreign"
+    if symlink_level == "jobs_root":
+        (foreign / job_id / "source").mkdir(parents=True)
+        (foreign / job_id / "source/cases.zip").write_bytes(b"foreign")
+        jobs_root.symlink_to(foreign, target_is_directory=True)
+    else:
+        jobs_root.mkdir()
+        if symlink_level == "job_dir":
+            (foreign / "source").mkdir(parents=True)
+            (foreign / "source/cases.zip").write_bytes(b"foreign")
+            (jobs_root / job_id).symlink_to(foreign, target_is_directory=True)
+        else:
+            source_dir = jobs_root / job_id / "source"
+            source_dir.mkdir(parents=True)
+            target = foreign / "cases.zip"
+            foreign.mkdir()
+            target.write_bytes(b"foreign")
+            (source_dir / "cases.zip").symlink_to(target)
+    store = IngestionStore(tmp_path / "strict.sqlite3", jobs_root=jobs_root)
+    source = jobs_root / job_id / "source/cases.zip"
+
+    with pytest.raises(ValueError, match="符号链接"):
+        store.create_draft(preflight=_preflight(), source_path=source, job_id=job_id)
+
+    assert store.get_job(job_id) is None
+    assert (foreign.rglob("cases.zip").__next__()).read_bytes() == b"foreign"
+
+
 def test_succeed_job_rejects_success_without_committed_attempt(tmp_path: Path) -> None:
     store = _store(tmp_path)
     job_id = _running_job(store, tmp_path)
@@ -351,6 +385,20 @@ def test_succeed_job_rejects_success_without_committed_attempt(tmp_path: Path) -
     job = store.get_job(job_id)
     assert job["status"] == "running"
     assert job["attempt"]["status"] == "running"
+
+
+def test_attempt_content_identity_is_internal_idempotent_and_immutable(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    job_id = _running_job(store, tmp_path)
+    digest = "a" * 64
+
+    store.mark_content_identity(job_id, digest)
+    store.mark_content_identity(job_id, digest)
+    with pytest.raises(ingestion_store.IngestionStateError):
+        store.mark_content_identity(job_id, "b" * 64)
+
+    assert "content_sha256" not in store.get_job(job_id)["attempt"]
+    assert store.get_job_for_execution(job_id)["attempt"]["content_sha256"] == digest
 
 
 def test_succeed_job_rejects_success_while_rolling_back(tmp_path: Path) -> None:

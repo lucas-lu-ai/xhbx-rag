@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ from xhbx_rag.web.source_paths import project_root_from_module
 
 
 _DEFAULT_DB_PATH = Path(".local/web_ingestion/ingestion.sqlite3")
+_DEFAULT_JOBS_PATH = Path(".local/web_ingestion/jobs")
 _MAX_PERSISTED_TEXT_CHARS = 2_000
 _MAX_EVENT_PAYLOAD_BYTES = 16 * 1_024
 _REDACTED_PATH = "[已隐藏路径]"
@@ -150,6 +152,42 @@ def _safe_ingestion_error(code: object) -> tuple[str, str]:
     return normalized_code, _SAFE_INGESTION_ERROR_DETAILS[normalized_code]
 
 
+def _validate_source_layout(jobs_root: Path, job_id: str, source_path: Path) -> Path:
+    raw = Path(source_path)
+    if not raw.is_absolute() or any(part in {".", ".."} for part in raw.parts):
+        raise ValueError("source path 必须是无 dot segment 的绝对路径")
+    expected = jobs_root / job_id / "source" / raw.name
+    if str(raw) != str(expected) or not raw.name or raw.name in {".", ".."}:
+        raise ValueError("source path 不符合 job workspace 布局")
+    chain = (jobs_root, jobs_root / job_id, jobs_root / job_id / "source", raw)
+    for index, component in enumerate(chain):
+        try:
+            metadata = component.lstat()
+        except OSError as exc:
+            raise ValueError("source workspace 不存在") from exc
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValueError("source workspace 不允许符号链接")
+        if index == len(chain) - 1:
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError("source 必须是常规文件")
+        elif not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError("source workspace 组件必须是目录")
+        if not component.resolve(strict=True).is_relative_to(jobs_root):
+            raise ValueError("source workspace 越界")
+    return raw
+
+
+def _absolute_lexical_path(value: Path) -> str:
+    raw = os.fspath(value)
+    if (
+        not Path(raw).is_absolute()
+        or any(segment in {".", ".."} for segment in raw.split(os.sep))
+        or str(Path(raw)) != raw
+    ):
+        raise IngestionStateError("路径必须是无 dot segment 的 absolute lexical path")
+    return raw
+
+
 class IngestionStateError(RuntimeError):
     """入库任务或 attempt 不满足所请求的状态转换。"""
 
@@ -162,10 +200,24 @@ class RecoveryAction:
 
 
 class IngestionStore:
-    def __init__(self, db_path: Path | None = None) -> None:
+    def __init__(
+        self, db_path: Path | None = None, *, jobs_root: Path | None = None
+    ) -> None:
         self.db_path = Path(db_path) if db_path is not None else _DEFAULT_DB_PATH
         if db_path is None:
             self.db_path = project_root_from_module() / self.db_path
+        self.jobs_root = (
+            Path(jobs_root)
+            if jobs_root is not None
+            else (
+                project_root_from_module() / _DEFAULT_JOBS_PATH
+                if db_path is None
+                else self.db_path.parent / "jobs"
+            )
+        )
+        if not self.jobs_root.is_absolute() or ".." in self.jobs_root.parts:
+            raise ValueError("jobs_root 必须是无 dot segment 的绝对路径")
+        self._strict_source_layout = jobs_root is not None or db_path is None
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
@@ -234,6 +286,7 @@ class IngestionStore:
                     ),
                     workspace_path TEXT,
                     journal_path TEXT,
+                    content_sha256 TEXT,
                     error_code TEXT,
                     error_detail TEXT,
                     started_at TEXT,
@@ -255,6 +308,14 @@ class IngestionStore:
                 );
                 """
             )
+            columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(ingestion_attempts)")
+            }
+            if "content_sha256" not in columns:
+                connection.execute(
+                    "ALTER TABLE ingestion_attempts ADD COLUMN content_sha256 TEXT"
+                )
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -270,8 +331,23 @@ class IngestionStore:
         finally:
             connection.close()
 
-    def create_draft(self, *, preflight: PreflightResult, source_path: Path) -> dict[str, Any]:
-        job_id = uuid.uuid4().hex
+    def create_draft(
+        self,
+        *,
+        preflight: PreflightResult,
+        source_path: Path,
+        job_id: str | None = None,
+    ) -> dict[str, Any]:
+        job_id = job_id or uuid.uuid4().hex
+        if not re.fullmatch(r"[0-9a-f]{32}", job_id):
+            raise ValueError("job_id 必须是 UUID hex")
+        if self._strict_source_layout and Path(source_path).name != preflight.source_name:
+            raise ValueError("source filename 与预检不一致")
+        stored_source = (
+            _validate_source_layout(self.jobs_root, job_id, source_path)
+            if self._strict_source_layout
+            else Path(os.path.abspath(os.fspath(source_path)))
+        )
         now = _utc_now()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -289,7 +365,7 @@ class IngestionStore:
                     job_id,
                     preflight.source_name,
                     preflight.source_kind,
-                    str(source_path.resolve()),
+                    str(stored_source),
                     preflight.target,
                     len(preflight.items),
                     preflight.document_total,
@@ -360,6 +436,7 @@ class IngestionStore:
                 return None
             result = self._public_job(row)
             result["source_path"] = Path(row["source_path"])
+            result["jobs_root"] = self.jobs_root
             result["ignored_entries"] = json.loads(row["ignored_entries_json"])
             result["items"] = self._items(connection, job_id)
             result["attempt"] = self._current_attempt(connection, row, internal=True)
@@ -465,7 +542,7 @@ class IngestionStore:
                 SET status = 'running', workspace_path = ?, started_at = ?
                 WHERE job_id = ? AND attempt_no = ? AND status = 'queued'
                 """,
-                (os.path.abspath(os.fspath(workspace_path)), now, job_id, attempt_no),
+                (_absolute_lexical_path(workspace_path), now, job_id, attempt_no),
             )
             if cursor.rowcount != 1:
                 raise RuntimeError("当前 attempt 不在 queued 状态")
@@ -511,6 +588,28 @@ class IngestionStore:
                 message=safe_message,
                 payload={"stage": safe_stage or "unknown"},
             )
+
+    def mark_content_identity(self, job_id: str, content_sha256: str) -> None:
+        if not re.fullmatch(r"[0-9a-f]{64}", content_sha256):
+            raise IngestionStateError("content_sha256 无效")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = self._attempt_state_row(connection, job_id)
+            if row is None or (
+                row["job_status"], row["attempt_status"], row["commit_state"]
+            ) != ("running", "running", "not_started"):
+                raise IngestionStateError("content identity 只允许在提交开始前写入")
+            existing = row["content_sha256"]
+            if existing is not None and existing != content_sha256:
+                raise IngestionStateError("content identity 不可变")
+            if existing is None:
+                connection.execute(
+                    """
+                    UPDATE ingestion_attempts SET content_sha256 = ?
+                    WHERE job_id = ? AND attempt_no = ?
+                    """,
+                    (content_sha256, job_id, row["attempt_count"]),
+                )
 
     def mark_item_running(self, job_id: str, item_index: int, stage: str) -> bool:
         now = _utc_now()
@@ -639,7 +738,7 @@ class IngestionStore:
             job_status = row["job_status"]
             attempt_status = row["attempt_status"]
             resolved_journal = (
-                os.path.abspath(os.fspath(journal_path))
+                _absolute_lexical_path(journal_path)
                 if journal_path is not None
                 else None
             )
@@ -1045,7 +1144,7 @@ class IngestionStore:
             "finished_at",
         ]
         if internal:
-            fields.extend(("workspace_path", "journal_path"))
+            fields.extend(("workspace_path", "journal_path", "content_sha256"))
         result = {field: attempt[field] for field in fields}
         if internal:
             for path_field in ("workspace_path", "journal_path"):
@@ -1072,7 +1171,8 @@ class IngestionStore:
         return connection.execute(
             """
             SELECT j.attempt_count, j.status AS job_status,
-                   a.status AS attempt_status, a.commit_state, a.journal_path
+                   a.status AS attempt_status, a.commit_state, a.journal_path,
+                   a.content_sha256
             FROM ingestion_jobs AS j
             JOIN ingestion_attempts AS a
               ON a.job_id = j.job_id AND a.attempt_no = j.attempt_count

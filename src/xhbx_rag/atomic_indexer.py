@@ -31,6 +31,7 @@ _RAW_ROW_FIELDS = {*_RAW_ROW_STRING_FIELDS, "vector"}
 _RAW_SCHEMA = tuple(sorted(_RAW_ROW_FIELDS))
 _JOURNAL_FIELDS = {
     "version",
+    "owner",
     "collection",
     "collection_existed",
     "chunk_ids",
@@ -50,6 +51,13 @@ _ROLLBACK_PENDING_DETAIL = "知识库回滚尚未完成，请稍后重试"
 class AtomicIndexResult:
     indexed: int
     vector_dim: int
+
+
+@dataclass(frozen=True)
+class AtomicJournalIdentity:
+    job_id: str
+    attempt_no: int
+    chunks_sha256: str
 
 
 class AtomicIndexError(RuntimeError):
@@ -72,9 +80,18 @@ class AtomicIndexer:
         chunks_path: Path,
         *,
         journal_dir: Path,
+        identity: AtomicJournalIdentity | None = None,
         on_state: Callable[[str, Path], None] | None = None,
     ) -> AtomicIndexResult:
         _require_empty_journal_dir(journal_dir)
+        try:
+            chunks_digest = hashlib.sha256(Path(chunks_path).read_bytes()).hexdigest()
+        except OSError as exc:
+            raise AtomicIndexError("待入库 chunk 文件无效") from exc
+        identity = identity or AtomicJournalIdentity("standalone", 1, chunks_digest)
+        _validate_identity(identity)
+        if not secrets.compare_digest(identity.chunks_sha256, chunks_digest):
+            raise AtomicIndexError("待入库 chunk 文件与 owner identity 不匹配")
         try:
             chunks = load_chunks_jsonl(chunks_path)
         except Exception as exc:
@@ -116,6 +133,7 @@ class AtomicIndexer:
                         snapshot_payload=snapshot_payload,
                         snapshot_count=len(old_rows),
                         vector_dim=vector_dim,
+                        identity=identity,
                     )
                     _validate_snapshot(old_rows, journal)
                 except AtomicIndexError:
@@ -164,12 +182,15 @@ class AtomicIndexer:
 
         return AtomicIndexResult(indexed=len(chunks), vector_dim=vector_dim)
 
-    def recover(self, journal_path: Path) -> None:
+    def recover(
+        self, journal_path: Path, *, expected_identity: AtomicJournalIdentity | None = None
+    ) -> None:
         journal_path = Path(journal_path)
         try:
             with _collection_write_context(self.store):
                 journal = _read_journal(journal_path)
                 _validate_journal(journal, self.store)
+                _validate_expected_identity(journal, expected_identity)
                 state = str(journal["state"])
                 if state == "rolled_back":
                     return
@@ -191,7 +212,10 @@ class AtomicIndexer:
             raise AtomicIndexError("知识库恢复失败") from exc
 
     def inspect_journal_state(
-        self, journal_path: Path
+        self,
+        journal_path: Path,
+        *,
+        expected_identity: AtomicJournalIdentity | None = None,
     ) -> Literal["prepared", "committed", "rolling_back", "rolled_back"]:
         """只读校验恢复材料，并返回 durable journal 状态。"""
         journal_path = Path(journal_path)
@@ -199,6 +223,7 @@ class AtomicIndexer:
             with _collection_write_context(self.store):
                 journal = _read_journal(journal_path)
                 _validate_journal(journal, self.store)
+                _validate_expected_identity(journal, expected_identity)
                 state = str(journal["state"])
                 if state == "committed":
                     chunk_ids = list(journal["chunk_ids"])
@@ -285,10 +310,16 @@ def _new_journal(
     snapshot_payload: bytes,
     snapshot_count: int,
     vector_dim: int,
+    identity: AtomicJournalIdentity,
 ) -> dict[str, Any]:
     uri = _normalize_uri(str(getattr(store, "uri", "")))
     return {
-        "version": 1,
+        "version": 2,
+        "owner": {
+            "job_id": identity.job_id,
+            "attempt_no": identity.attempt_no,
+            "chunks_sha256": identity.chunks_sha256,
+        },
         "collection": {
             "uri_sha256": hashlib.sha256(uri.encode("utf-8")).hexdigest(),
             "collection_name": str(getattr(store, "collection_name", "")),
@@ -368,8 +399,20 @@ def _validate_journal(journal: dict[str, Any], store: object) -> None:
     ):
         raise AtomicIndexError("commit journal 自校验失败")
     version = journal.get("version")
-    if isinstance(version, bool) or not isinstance(version, int) or version != 1:
+    if isinstance(version, bool) or not isinstance(version, int) or version != 2:
         raise AtomicIndexError("不支持的 commit journal 版本")
+    owner = journal.get("owner")
+    if not isinstance(owner, dict) or set(owner) != {
+        "job_id",
+        "attempt_no",
+        "chunks_sha256",
+    }:
+        raise AtomicIndexError("commit journal owner identity 无效")
+    _validate_identity(
+        AtomicJournalIdentity(
+            owner.get("job_id"), owner.get("attempt_no"), owner.get("chunks_sha256")
+        )
+    )
     if journal.get("state") not in {
         "prepared",
         "committed",
@@ -434,6 +477,33 @@ def _is_sha256(value: object) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _validate_identity(identity: AtomicJournalIdentity) -> None:
+    if (
+        not isinstance(identity.job_id, str)
+        or not identity.job_id
+        or isinstance(identity.attempt_no, bool)
+        or not isinstance(identity.attempt_no, int)
+        or identity.attempt_no <= 0
+        or not _is_sha256(identity.chunks_sha256)
+    ):
+        raise AtomicIndexError("commit journal owner identity 无效")
+
+
+def _validate_expected_identity(
+    journal: dict[str, Any], expected: AtomicJournalIdentity | None
+) -> None:
+    if expected is None:
+        return
+    _validate_identity(expected)
+    owner = journal["owner"]
+    if owner != {
+        "job_id": expected.job_id,
+        "attempt_no": expected.attempt_no,
+        "chunks_sha256": expected.chunks_sha256,
+    }:
+        raise AtomicIndexError("commit journal owner identity 不匹配")
 
 
 def _resolve_snapshot_path(

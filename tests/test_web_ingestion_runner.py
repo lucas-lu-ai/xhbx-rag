@@ -3,13 +3,19 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Callable
 
 import pytest
 
 import xhbx_rag.web.ingestion_runner as runner_module
-from xhbx_rag.atomic_indexer import AtomicIndexError, AtomicIndexResult, RollbackPendingError
+from xhbx_rag.atomic_indexer import (
+    AtomicIndexError,
+    AtomicIndexResult,
+    AtomicJournalIdentity,
+    RollbackPendingError,
+)
 from xhbx_rag.web.ingestion_pipeline import IngestionPipelineError, PreparedIngestion
 from xhbx_rag.web.ingestion_runner import IngestionRunner
 from xhbx_rag.web.ingestion_store import IngestionStore
@@ -23,8 +29,10 @@ def queued_store(
     name: str = "job",
     item_count: int = 1,
 ) -> tuple[IngestionStore, str, Path]:
-    store = IngestionStore(tmp_path / "ingestion.sqlite3")
-    job_dir = tmp_path / "jobs" / name
+    jobs_root = tmp_path / "jobs"
+    store = IngestionStore(tmp_path / "ingestion.sqlite3", jobs_root=jobs_root)
+    job_id = uuid.uuid4().hex
+    job_dir = jobs_root / job_id
     source = job_dir / "source" / "courses.zip"
     source.parent.mkdir(parents=True, exist_ok=True)
     source.write_bytes(b"source")
@@ -35,6 +43,7 @@ def queued_store(
     job = store.create_draft(
         preflight=PreflightResult("courses.zip", "zip", "course", items),
         source_path=source,
+        job_id=job_id,
     )
     assert store.start_job(job["job_id"]) == "ok"
     return store, job["job_id"], job_dir
@@ -113,9 +122,10 @@ class FakeAtomicIndexer:
         chunks_path: Path,
         *,
         journal_dir: Path,
+        identity: AtomicJournalIdentity | None = None,
         on_state: Callable[[str, Path], None] | None = None,
     ) -> AtomicIndexResult:
-        del chunks_path
+        del chunks_path, identity
         self.commit_calls += 1
         if self.mode == "embedding_failure":
             raise AtomicIndexError("向量生成失败")
@@ -146,12 +156,24 @@ class FakeAtomicIndexer:
             on_state("committed", journal)
         return AtomicIndexResult(indexed=1, vector_dim=2)
 
-    def inspect_journal_state(self, journal_path: Path) -> str:
+    def inspect_journal_state(
+        self,
+        journal_path: Path,
+        *,
+        expected_identity: AtomicJournalIdentity | None = None,
+    ) -> str:
+        del expected_identity
         if self.mode == "corrupt":
             raise AtomicIndexError("commit journal 自校验失败")
         return self.states[journal_path.resolve()]
 
-    def recover(self, journal_path: Path) -> None:
+    def recover(
+        self,
+        journal_path: Path,
+        *,
+        expected_identity: AtomicJournalIdentity | None = None,
+    ) -> None:
+        del expected_identity
         self.recover_calls += 1
         if self.log is not None:
             self.log.append(f"recover:{journal_path.parent.parent.parent.name}")
@@ -196,6 +218,7 @@ def _prepare_recovery(
     journal.write_text("fake", encoding="utf-8")
     (journal.parent / "snapshot.jsonl").write_text("fake", encoding="utf-8")
     indexer.states[journal] = journal_state
+    store.mark_content_identity(job_id, "0" * 64)
     store.mark_commit_state(job_id, "prepared", journal)
     if sqlite_state == "rolling_back":
         store.mark_rolling_back(job_id, code="rollback_pending", detail="raw secret")
@@ -485,9 +508,10 @@ def test_rollback_pending_external_path_is_never_adopted_or_deleted(tmp_path: Pa
             chunks_path: Path,
             *,
             journal_dir: Path,
+            identity: AtomicJournalIdentity | None = None,
             on_state: Callable[[str, Path], None] | None = None,
         ) -> AtomicIndexResult:
-            del chunks_path, journal_dir, on_state
+            del chunks_path, journal_dir, identity, on_state
             self.states[foreign_journal.resolve()] = "committed"
             raise RollbackPendingError(foreign_journal, "raw secret")
 
@@ -701,6 +725,7 @@ def test_restart_discovers_durable_journal_when_sqlite_is_still_not_started(
     (journal.parent / "snapshot.jsonl").write_text("fake", encoding="utf-8")
     indexer = FakeAtomicIndexer()
     indexer.states[journal] = "rolling_back"
+    store.mark_content_identity(job_id, "0" * 64)
     runner = _runner(store, FakePipeline(), indexer)
 
     runner.recover_after_restart()
