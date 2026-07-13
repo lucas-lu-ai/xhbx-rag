@@ -231,7 +231,7 @@ test("只显示模型实际引用的知识并使用连续序号", async () => {
   render(<App />);
 
   const detailPane = screen.getByRole("complementary", {
-    name: "索引和溯源"
+    name: "引用明细"
   });
   expect(
     within(detailPane).getByText("点击一条知识引用查看明细。")
@@ -313,9 +313,11 @@ test("旧聊天回答没有实际引用标记时显示暂无引用", async () =>
   installFetchStub();
   render(<App />);
 
-  expect(await screen.findByText("案例知识库")).toBeInTheDocument();
+  expect(
+    await screen.findByRole("complementary", { name: "引用明细" })
+  ).toBeInTheDocument();
   const detailPane = screen.getByRole("complementary", {
-    name: "索引和溯源"
+    name: "引用明细"
   });
   expect(within(detailPane).getByText("暂无引用。")).toBeInTheDocument();
   expect(
@@ -362,12 +364,14 @@ test.each([0, 1.5, 99])(
     installFetchStub();
     render(<App />);
 
-    expect(await screen.findByText("案例知识库")).toBeInTheDocument();
+    expect(
+      await screen.findByRole("complementary", { name: "引用明细" })
+    ).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: /知识引用/ })
     ).not.toBeInTheDocument();
     const detailPane = screen.getByRole("complementary", {
-      name: "索引和溯源"
+      name: "引用明细"
     });
     expect(within(detailPane).getByText("暂无引用。")).toBeInTheDocument();
     expect(
@@ -432,9 +436,11 @@ test.each([
     installFetchStub();
     render(<App />);
 
-    expect(await screen.findByText("案例知识库")).toBeInTheDocument();
+    expect(
+      await screen.findByRole("complementary", { name: "引用明细" })
+    ).toBeInTheDocument();
     const detailPane = screen.getByRole("complementary", {
-      name: "索引和溯源"
+      name: "引用明细"
     });
     expect(
       within(detailPane).getByText("点击一条知识引用查看明细。")
@@ -461,7 +467,9 @@ test("loads status and submits a question", async () => {
   const { requests } = installFetchStub();
   render(<App />);
 
-  expect(await screen.findByText("案例知识库")).toBeInTheDocument();
+  expect(
+    await screen.findByRole("heading", { name: "引用明细" })
+  ).toBeInTheDocument();
 
   await user.type(screen.getByLabelText("输入问题"), "客户说每年不能超过80万怎么办？");
   await user.click(screen.getByRole("button", { name: "发送" }));
@@ -486,7 +494,7 @@ test("loads status and submits a question", async () => {
   );
 });
 
-test("submits selected collections from the status dropdown", async () => {
+test("hides index controls and lets the backend route collections automatically", async () => {
   const user = userEvent.setup();
   const { requests } = installFetchStub((url) => {
     if (url.endsWith("/api/status")) {
@@ -510,25 +518,33 @@ test("submits selected collections from the status dropdown", async () => {
   });
   render(<App />);
 
-  await user.click(await screen.findByRole("button", { name: "选择 Collection" }));
-  expect(screen.getAllByText("案例知识库").length).toBeGreaterThan(0);
-  expect(screen.getByText("课程知识库")).toBeInTheDocument();
-  await user.click(screen.getByLabelText("案例知识库"));
+  expect(
+    await screen.findByRole("heading", { name: "引用明细" })
+  ).toBeInTheDocument();
+  expect(
+    screen.queryByRole("heading", { name: "索引状态" })
+  ).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole("button", { name: "选择 Collection" })
+  ).not.toBeInTheDocument();
+
+  const detailPane = screen.getByRole("complementary", { name: "引用明细" });
+  expect(
+    within(detailPane).getByRole("heading", { name: "引用明细" })
+  ).toBeInTheDocument();
+
   await user.type(screen.getByLabelText("输入问题"), "促成课程怎么讲？");
   await user.click(screen.getByRole("button", { name: "发送" }));
 
   await waitFor(() => {
-    expect(requests).toContainEqual(
-      expect.objectContaining({
-        url: "/api/answer/stream",
-        body: expect.objectContaining({
-          query: "促成课程怎么讲？",
-          top_n: 20,
-          top_k: 5,
-          collections: ["xhbx_course_chunks"]
-        })
-      })
-    );
+    expect(
+      requests.find((request) => request.url.endsWith("/api/answer/stream"))
+        ?.body
+    ).toEqual({
+      query: "促成课程怎么讲？",
+      top_n: 20,
+      top_k: 5
+    });
   });
 });
 
@@ -687,7 +703,7 @@ test("shows retrieval evidence used by the answer model", async () => {
   ).toBeInTheDocument();
   // 自动选中第一条证据后右侧明细展示完整信息与来源引用。
   const detailPane = screen.getByRole("complementary", {
-    name: "索引和溯源"
+    name: "引用明细"
   });
   expect(
     within(detailPane).getByRole("heading", { name: "引用明细" })

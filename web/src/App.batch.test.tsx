@@ -679,7 +679,7 @@ test("批量行详情自动选中证据并联动右侧明细", async () => {
 
   const qaPanel = screen.getByRole("main", { name: "RAG 问答" });
   const detailPane = screen.getByRole("complementary", {
-    name: "索引和溯源"
+    name: "引用明细"
   });
   const questionButton = await within(qaPanel).findByRole("button", {
     name: /客户说每年不能超过80万怎么办？/
@@ -786,7 +786,7 @@ test("批量行引用反馈按行与原始 evidence 索引隔离", async () => {
 
   const qaPanel = screen.getByRole("main", { name: "RAG 问答" });
   const detailPane = screen.getByRole("complementary", {
-    name: "索引和溯源"
+    name: "引用明细"
   });
   await user.click(
     await within(qaPanel).findByRole("button", {

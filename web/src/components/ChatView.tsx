@@ -32,7 +32,6 @@ type ChatViewProps = {
     updater: (turns: ChatTurn[]) => ChatTurn[],
     title?: string
   ) => void;
-  selectedCollections?: string[];
   topN: number;
   topK: number;
 };
@@ -40,7 +39,6 @@ type ChatViewProps = {
 export function ChatView({
   session,
   onUpdateSession,
-  selectedCollections,
   topN,
   topK
 }: ChatViewProps) {
@@ -84,10 +82,7 @@ export function ChatView({
         {
           query: trimmed,
           top_n: topN,
-          top_k: topK,
-          ...(selectedCollections && selectedCollections.length > 0
-            ? { collections: selectedCollections }
-            : {})
+          top_k: topK
         },
         {
           onEvent: (streamEvent) => {

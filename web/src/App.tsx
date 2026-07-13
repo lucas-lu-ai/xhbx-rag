@@ -1,4 +1,4 @@
-import { AlertCircle, ChevronDown, Database, FileText } from "lucide-react";
+import { AlertCircle, FileText } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
@@ -64,13 +64,6 @@ import {
 const DEFAULT_BATCH_POLL_INTERVAL_MS = 2000;
 const DEFAULT_LIST_POLL_INTERVAL_MS = 5000;
 const BATCH_RUNS_LOAD_ERROR = "批量会话列表加载失败，仅显示聊天会话。";
-const CASE_COLLECTION_LABEL = "案例知识库";
-const COURSE_COLLECTION_LABEL = "课程知识库";
-const COLLECTION_LABELS: Record<string, string> = {
-  xhbx_sales_chunks: CASE_COLLECTION_LABEL,
-  xhbx_course_chunks: COURSE_COLLECTION_LABEL
-};
-
 const emptyStatus: StatusResponse = {
   ok: false,
   data_dir: "data",
@@ -137,10 +130,6 @@ export function App({
   );
   const [status, setStatus] = useState<StatusResponse>(emptyStatus);
   const [statusError, setStatusError] = useState("");
-  const [collectionSelection, setCollectionSelection] = useState<string[] | null>(
-    null
-  );
-  const [collectionMenuOpen, setCollectionMenuOpen] = useState(false);
   const [sessionStore, setSessionStore] = useState(loadChatSessions);
   const [batchRuns, setBatchRuns] = useState<BatchRunSummary[]>([]);
   const [batchRunsLoaded, setBatchRunsLoaded] = useState(false);
@@ -509,39 +498,6 @@ export function App({
     };
   }, [hasActiveIngestionJobs, listPollIntervalMs, refetchIngestionJobs, workspaceLocation.view]);
 
-  const collectionOptions = useMemo(
-    () => collectionNamesFromStatus(status),
-    [status]
-  );
-  const selectedCollectionNames = useMemo(() => {
-    if (collectionOptions.length === 0) {
-      return [];
-    }
-    const baseSelection = collectionSelection ?? collectionOptions;
-    const selected = collectionOptions.filter((name) =>
-      baseSelection.includes(name)
-    );
-    return selected.length > 0 ? selected : collectionOptions;
-  }, [collectionOptions, collectionSelection]);
-  const requestCollections =
-    collectionSelection === null ? undefined : selectedCollectionNames;
-
-  useEffect(() => {
-    setCollectionSelection((current) => {
-      if (current === null) {
-        return null;
-      }
-      const selected = collectionOptions.filter((name) => current.includes(name));
-      if (
-        selected.length === 0 ||
-        selected.length === collectionOptions.length
-      ) {
-        return null;
-      }
-      return sameStringList(selected, current) ? current : selected;
-    });
-  }, [collectionOptions]);
-
   // 选中态归一：批量按原样保留，聊天校验会话存在性后回退。
   const effectiveSelection = useMemo<SessionSelection>(() => {
     if (selection?.kind === "batch") {
@@ -766,25 +722,6 @@ export function App({
         updated_at: new Date().toISOString()
       }))
     );
-  }
-
-  function toggleCollection(collectionName: string) {
-    if (collectionOptions.length <= 1) {
-      return;
-    }
-    setCollectionSelection((current) => {
-      const nextSet = new Set(current ?? collectionOptions);
-      if (nextSet.has(collectionName)) {
-        nextSet.delete(collectionName);
-      } else {
-        nextSet.add(collectionName);
-      }
-      const next = collectionOptions.filter((name) => nextSet.has(name));
-      if (next.length === 0) {
-        return current;
-      }
-      return next.length === collectionOptions.length ? null : next;
-    });
   }
 
   const hasChatCitations = useMemo(() => {
@@ -1185,90 +1122,13 @@ export function App({
             key={activeChatSession.id}
             session={activeChatSession}
             onUpdateSession={updateSessionTurns}
-            selectedCollections={requestCollections}
             topN={status.web_retrieval_top_n}
             topK={status.web_retrieval_top_k}
           />
         )}
       </main>
 
-      <aside className="source-panel" aria-label="索引和溯源">
-        <section className="status-card">
-          <div className="pane-heading">
-            <Database size={20} aria-hidden="true" />
-            <h2>索引状态</h2>
-          </div>
-          <dl>
-            <div>
-              <dt>状态</dt>
-              <dd className={status.ok ? "ok-text" : "error-text"}>
-                {status.ok ? "ready" : "needs config"}
-              </dd>
-            </div>
-            <div>
-              <dt>数据目录</dt>
-              <dd>{status.data_dir}</dd>
-            </div>
-            <div>
-              <dt>Collection</dt>
-              <dd className="collection-cell">
-                {collectionOptions.length > 0 ? (
-                  <div className="collection-select">
-                    <button
-                      aria-expanded={collectionMenuOpen}
-                      aria-label="选择 Collection"
-                      className="collection-select-button"
-                      type="button"
-                      onClick={() => setCollectionMenuOpen((open) => !open)}
-                    >
-                      <span className="collection-primary">
-                        {collectionDisplayName(status, selectedCollectionNames[0])}
-                      </span>
-                      {selectedCollectionNames.length > 1 && (
-                        <span className="collection-count">
-                          +{selectedCollectionNames.length - 1}
-                        </span>
-                      )}
-                      <ChevronDown size={15} aria-hidden="true" />
-                    </button>
-                    {collectionMenuOpen && (
-                      <div
-                        aria-label="可用 Collection"
-                        className="collection-menu"
-                        role="group"
-                      >
-                        {collectionOptions.map((name) => {
-                          const checked = selectedCollectionNames.includes(name);
-                          const label = collectionDisplayName(status, name);
-                          return (
-                            <label className="collection-option" key={name}>
-                              <input
-                                aria-label={label}
-                                type="checkbox"
-                                checked={checked}
-                                disabled={
-                                  checked && selectedCollectionNames.length === 1
-                                }
-                                onChange={() => toggleCollection(name)}
-                              />
-                              <span className="collection-option-text">
-                                <span>{label}</span>
-                                <small>{name}</small>
-                              </span>
-                            </label>
-                          );
-                        })}
-                      </div>
-                    )}
-                  </div>
-                ) : (
-                  "未配置"
-                )}
-              </dd>
-            </div>
-          </dl>
-        </section>
-
+      <aside className="source-panel" aria-label="引用明细">
         <section className="source-detail">
           <div className="pane-heading">
             <FileText size={20} aria-hidden="true" />
@@ -1286,42 +1146,6 @@ export function App({
       </aside>
     </div>
     </EvidenceDetailContext.Provider>
-  );
-}
-
-function collectionNamesFromStatus(status: StatusResponse): string[] {
-  return uniqueNonEmptyStrings([
-    ...(status.milvus_collections ?? []),
-    status.milvus_collection,
-    status.milvus_course_collection ?? ""
-  ]);
-}
-
-function collectionDisplayName(status: StatusResponse, name: string): string {
-  if (name === status.milvus_collection) {
-    return CASE_COLLECTION_LABEL;
-  }
-  if (name === status.milvus_course_collection) {
-    return COURSE_COLLECTION_LABEL;
-  }
-  return COLLECTION_LABELS[name] ?? name;
-}
-
-function uniqueNonEmptyStrings(values: string[]): string[] {
-  const result: string[] = [];
-  for (const value of values) {
-    const normalized = value.trim();
-    if (normalized && !result.includes(normalized)) {
-      result.push(normalized);
-    }
-  }
-  return result;
-}
-
-function sameStringList(left: string[], right: string[]): boolean {
-  return (
-    left.length === right.length &&
-    left.every((value, index) => value === right[index])
   );
 }
 
