@@ -163,14 +163,16 @@ h2 {
 
 .session-header-actions {
   display: flex;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 6px;
+  flex-wrap: nowrap;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
 }
 
 .session-new-button {
-  flex: 0 0 104px;
-  width: 104px;
+  flex: 1 1 0;
+  width: auto;
+  min-width: 0;
   min-height: 44px;
   padding: 8px 10px;
   font-size: 13px;
@@ -1932,15 +1934,9 @@ dd {
   .panel-header-actions,
   .batch-actions,
   .batch-footer,
-  .batch-run-heading,
-  .session-header-actions {
+  .batch-run-heading {
     align-items: stretch;
     flex-direction: column;
-  }
-
-  .session-new-button {
-    flex-basis: auto;
-    width: 100%;
   }
 
   .session-list {
@@ -1980,8 +1976,8 @@ dd {
 
 /* 入库工作台：复用现有玻璃面板与语义色 token。 */
 .workspace-nav {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
+  display: flex;
+  justify-content: center;
   gap: 8px;
   padding: 12px;
   border-bottom: 1px solid var(--color-border);
@@ -1993,6 +1989,7 @@ dd {
   justify-content: center;
   gap: 8px;
   min-width: 0;
+  width: calc((100% - 8px) / 2);
   min-height: 44px;
   border: 1px solid transparent;
   border-radius: 11px;

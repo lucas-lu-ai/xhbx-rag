@@ -99,8 +99,12 @@ test("侧栏新建会话和批量执行按钮使用一致的操作尺寸", async
 
   expect(newSessionButton).toHaveClass("session-new-button");
   expect(createBatchButton).toHaveClass("session-new-button");
-  expect(styleBlock(".session-new-button")).toContain("flex: 0 0 104px;");
-  expect(styleBlock(".session-new-button")).toContain("width: 104px;");
+  expect(screen.queryByText("会话")).not.toBeInTheDocument();
+  expect(screen.queryByText("问答会话")).not.toBeInTheDocument();
+  expect(styleBlock(".session-header-actions")).toContain("flex-wrap: nowrap;");
+  expect(styleBlock(".session-header-actions")).toContain("width: 100%;");
+  expect(styleBlock(".session-new-button")).toContain("flex: 1 1 0;");
+  expect(styleBlock(".session-new-button")).toContain("width: auto;");
   expect(styleBlock(".session-new-button")).toContain("min-height: 44px;");
 });
 

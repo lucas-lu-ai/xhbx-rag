@@ -51,10 +51,6 @@ export function SessionSidebar({
         }}
       />
       <header className="session-header">
-        <div>
-          <p className="eyebrow">会话</p>
-          <h2>问答会话</h2>
-        </div>
         <div className="session-header-actions">
           <button
             className="ghost-button session-new-button"
