@@ -288,12 +288,6 @@ export function failTurn(
   );
 }
 
-export function latestResponseFromTurns(
-  turns: ChatTurn[]
-): AnswerResponse | undefined {
-  return [...turns].reverse().find((turn) => turn.response)?.response;
-}
-
 export function validateLimits(topN: number, topK: number): string {
   if (!Number.isInteger(topN) || topN < 1 || topN > 100) {
     return "召回数量必须在 1 到 100 之间。";
