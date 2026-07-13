@@ -200,7 +200,7 @@ test("titles a new session from the first submitted question and persists it", a
   expect(stored.sessions[0].title).toBe("客户说每年不能超过80万怎么办？");
 });
 
-test("marks answer-cited evidence cards with a badge", async () => {
+test("只显示模型实际引用的知识并使用连续序号", async () => {
   const user = userEvent.setup();
   localStorage.setItem(
     "xhbx-rag.chat-sessions.v1",
@@ -230,15 +230,23 @@ test("marks answer-cited evidence cards with a badge", async () => {
   render(<App />);
 
   await user.click(
-    await screen.findByRole("button", { name: /检索证据/ })
+    await screen.findByRole("button", { name: /知识引用/ })
   );
   const evidenceList = await screen.findByRole("region", {
-    name: "检索证据列表"
+    name: "知识引用列表"
   });
   const rows = within(evidenceList).getAllByRole("button");
-  expect(rows).toHaveLength(2);
-  expect(within(rows[0]).queryByText("答案引用")).not.toBeInTheDocument();
-  expect(within(rows[1]).getByText("答案引用")).toBeInTheDocument();
+  expect(rows).toHaveLength(1);
+  expect(within(rows[0]).getByText("1")).toBeInTheDocument();
+  expect(within(rows[0]).getByText("案例A · 阶段2")).toBeInTheDocument();
+  expect(within(rows[0]).getByText("证据2正文内容。")).toBeInTheDocument();
+  expect(
+    within(evidenceList).queryByText("案例A · 阶段1")
+  ).not.toBeInTheDocument();
+  expect(
+    within(evidenceList).queryByText("证据1正文内容。")
+  ).not.toBeInTheDocument();
+  expect(within(evidenceList).queryByText("答案引用")).not.toBeInTheDocument();
 });
 
 test("loads status and submits a question", async () => {
@@ -458,13 +466,13 @@ test("shows retrieval evidence used by the answer model", async () => {
   await user.type(screen.getByLabelText("输入问题"), "客户说每年不能超过80万怎么办？");
   await user.click(screen.getByRole("button", { name: "发送" }));
 
-  expect(await screen.findByText("检索证据")).toBeInTheDocument();
-  await user.click(screen.getByRole("button", { name: /检索证据/ }));
-  const evidenceList = screen.getByRole("region", { name: "检索证据列表" });
-  // 紧凑行：名称、类型、答案引用徽标与单行预览。
+  expect(await screen.findByText("知识引用")).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: /知识引用/ }));
+  const evidenceList = screen.getByRole("region", { name: "知识引用列表" });
+  // 紧凑行：连续序号、知识名称、类型、重排分与单行预览。
   expect(within(evidenceList).getByText("案例A · 需求分析")).toBeInTheDocument();
   expect(within(evidenceList).getByText("异议处理")).toBeInTheDocument();
-  expect(within(evidenceList).getByText("答案引用")).toBeInTheDocument();
+  expect(within(evidenceList).queryByText("答案引用")).not.toBeInTheDocument();
   expect(
     within(evidenceList).getByText(
       "客户担心预算，可以先承接预算，再对齐保障缺口。"
@@ -475,7 +483,10 @@ test("shows retrieval evidence used by the answer model", async () => {
     name: "索引和溯源"
   });
   expect(
-    within(detailPane).getByText("证据 1 · 异议处理")
+    within(detailPane).getByRole("heading", { name: "引用明细" })
+  ).toBeInTheDocument();
+  expect(
+    within(detailPane).getByText("引用1：案例A · 需求分析")
   ).toBeInTheDocument();
   expect(
     within(detailPane).getByRole("button", { name: "第2节.track-0.txt · L1" })
@@ -489,10 +500,10 @@ test("marks an evidence as useful and saves a usable bad case", async () => {
 
   await user.type(screen.getByLabelText("输入问题"), "客户说每年不能超过80万怎么办？");
   await user.click(screen.getByRole("button", { name: "发送" }));
-  await user.click(await screen.findByLabelText("证据 1 应该用"));
+  await user.click(await screen.findByLabelText("引用1应该用"));
 
   expect(await screen.findByText("已记录可用反馈。")).toBeInTheDocument();
-  expect(screen.getByLabelText("证据 1 应该用")).toBeChecked();
+  expect(screen.getByLabelText("引用1应该用")).toBeChecked();
   expect(requests).toContainEqual(
     expect.objectContaining({
       url: "/api/bad-cases",
@@ -520,7 +531,7 @@ test("marks an evidence as not useful with a reason and saves a bad case", async
 
   await user.type(screen.getByLabelText("输入问题"), "客户说每年不能超过80万怎么办？");
   await user.click(screen.getByRole("button", { name: "发送" }));
-  await user.click(await screen.findByLabelText("证据 1 不该用"));
+  await user.click(await screen.findByLabelText("引用1不该用"));
   await user.type(
     screen.getByLabelText("不可用理由"),
     "该证据与客户问题无关。"
@@ -528,7 +539,7 @@ test("marks an evidence as not useful with a reason and saves a bad case", async
   await user.click(screen.getByRole("button", { name: "保存不可用反馈" }));
 
   expect(await screen.findByText("已记录不可用反馈。")).toBeInTheDocument();
-  expect(screen.getByLabelText("证据 1 不该用")).toBeChecked();
+  expect(screen.getByLabelText("引用1不该用")).toBeChecked();
   expect(requests).toContainEqual(
     expect.objectContaining({
       url: "/api/bad-cases",

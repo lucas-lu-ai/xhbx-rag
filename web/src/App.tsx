@@ -1262,14 +1262,14 @@ export function App({
         <section className="source-detail">
           <div className="pane-heading">
             <FileText size={20} aria-hidden="true" />
-            <h2>证据明细</h2>
+            <h2>引用明细</h2>
           </div>
           <div className="evidence-detail-slot" ref={setDetailContainer} />
           {!selectedEvidenceKey && (
             <p className="empty-source">
               {hasEvidenceContext
-                ? "点击一条检索证据查看明细。"
-                : "暂无证据。"}
+                ? "点击一条知识引用查看明细。"
+                : "暂无引用。"}
             </p>
           )}
         </section>

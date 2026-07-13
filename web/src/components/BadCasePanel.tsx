@@ -178,7 +178,6 @@ export function BadCasePanel({
             evidence={selectedEntry.evidence}
             relatedEvidences={evidences}
             index={selectedEntry.displayIndex}
-            cited
             feedbackJudgement={
               evidenceFeedback[
                 evidenceFeedbackKey(selectedEntry.evidenceIndex)

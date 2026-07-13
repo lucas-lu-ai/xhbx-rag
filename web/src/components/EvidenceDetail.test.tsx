@@ -49,18 +49,34 @@ const evidence: RetrievalEvidence = {
 };
 
 test("明细渲染正文、标签、合规与元信息", () => {
-  render(<EvidenceDetail evidence={evidence} index={0} cited />);
+  render(<EvidenceDetail evidence={evidence} index={0} />);
 
-  expect(screen.getByText("证据 1 · 异议处理")).toBeInTheDocument();
-  expect(screen.getByText("答案引用")).toBeInTheDocument();
+  expect(
+    screen.getByRole("article", { name: "引用1明细" })
+  ).toBeInTheDocument();
+  expect(screen.getByText("引用1：案例A · 需求分析")).toBeInTheDocument();
+  expect(screen.queryByText("证据 1 · 异议处理")).not.toBeInTheDocument();
+  expect(screen.queryByText("答案引用")).not.toBeInTheDocument();
   expect(screen.getByText("重排 0.91")).toBeInTheDocument();
-  expect(screen.getByText("案例A · 需求分析")).toBeInTheDocument();
+  expect(screen.queryByText("案例A · 需求分析")).not.toBeInTheDocument();
+  expect(screen.getByLabelText("引用1命中标签")).toBeInTheDocument();
   expect(
     screen.getByText("客户担心预算，可以先承接预算，再对齐保障缺口。")
   ).toBeInTheDocument();
   expect(screen.getByText("客户画像/高净值客户")).toBeInTheDocument();
   expect(screen.getByText("标签提权 ×1.2")).toBeInTheDocument();
   expect(screen.getByText("合规注意 · 收益承诺风险")).toBeInTheDocument();
+});
+
+test("元信息缺失时使用未命名知识作为标题", () => {
+  render(
+    <EvidenceDetail
+      evidence={{ ...evidence, metadata: undefined }}
+      index={1}
+    />
+  );
+
+  expect(screen.getByText("引用2：未命名知识")).toBeInTheDocument();
 });
 
 test("引用较多时默认只显示前 4 条，可展开与收起", async () => {
@@ -77,7 +93,7 @@ test("引用较多时默认只显示前 4 条，可展开与收起", async () =>
       can_reveal: false
     }))
   };
-  render(<EvidenceDetail evidence={many} index={0} cited={false} />);
+  render(<EvidenceDetail evidence={many} index={0} />);
 
   // 默认只渲染前 4 条引用按钮。
   expect(screen.getByRole("button", { name: /片段0\.txt/ })).toBeInTheDocument();
@@ -96,7 +112,7 @@ test("引用较多时默认只显示前 4 条，可展开与收起", async () =>
 });
 
 test("引用不超过阈值时不显示展开按钮", () => {
-  render(<EvidenceDetail evidence={evidence} index={0} cited={false} />);
+  render(<EvidenceDetail evidence={evidence} index={0} />);
 
   expect(
     screen.queryByRole("button", { name: /展开其余/ })
@@ -105,7 +121,7 @@ test("引用不超过阈值时不显示展开按钮", () => {
 
 test("默认展示第一条来源摘录，点击其它引用切换", async () => {
   const user = userEvent.setup();
-  render(<EvidenceDetail evidence={evidence} index={0} cited={false} />);
+  render(<EvidenceDetail evidence={evidence} index={0} />);
 
   expect(screen.getByText("data/案例A/第2节.track-0.txt")).toBeInTheDocument();
   expect(screen.getByText("客户担心预算的原文")).toBeInTheDocument();
@@ -121,7 +137,7 @@ test("默认展示第一条来源摘录，点击其它引用切换", async () =>
 test("在 Finder 中显示文件调用 reveal 接口", async () => {
   const user = userEvent.setup();
   const { requests } = installFetchStub();
-  render(<EvidenceDetail evidence={evidence} index={0} cited={false} />);
+  render(<EvidenceDetail evidence={evidence} index={0} />);
 
   await user.click(screen.getByRole("button", { name: "在 Finder 中显示文件" }));
 
@@ -139,15 +155,15 @@ test("打标只提供应该用与不该用两个选项", () => {
     <EvidenceDetail
       evidence={evidence}
       index={0}
-      cited={false}
       feedbackJudgement="should_use"
       onToggleFeedback={() => {}}
     />
   );
 
-  expect(screen.getByLabelText("证据 1 应该用")).toBeChecked();
-  expect(screen.getByLabelText("证据 1 不该用")).toBeInTheDocument();
-  expect(screen.queryByLabelText("证据 1 排序太低")).not.toBeInTheDocument();
+  expect(screen.getByLabelText("引用1打标")).toBeInTheDocument();
+  expect(screen.getByLabelText("引用1应该用")).toBeChecked();
+  expect(screen.getByLabelText("引用1不该用")).toBeInTheDocument();
+  expect(screen.queryByLabelText("引用1排序太低")).not.toBeInTheDocument();
 });
 
 test("点击应该用立即选中并落地正向 bad case", async () => {
@@ -155,15 +171,15 @@ test("点击应该用立即选中并落地正向 bad case", async () => {
   const onSubmitUseful = vi.fn().mockResolvedValue(undefined);
   render(<FeedbackHarness onSubmitUseful={onSubmitUseful} />);
 
-  await user.click(screen.getByLabelText("证据 1 应该用"));
+  await user.click(screen.getByLabelText("引用1应该用"));
 
-  expect(screen.getByLabelText("证据 1 应该用")).toBeChecked();
+  expect(screen.getByLabelText("引用1应该用")).toBeChecked();
   expect(onSubmitUseful).toHaveBeenCalledTimes(1);
   expect(await screen.findByText("已记录可用反馈。")).toBeInTheDocument();
-  expect(screen.getByLabelText("证据 1 应该用")).toBeDisabled();
-  expect(screen.getByLabelText("证据 1 不该用")).toBeDisabled();
+  expect(screen.getByLabelText("引用1应该用")).toBeDisabled();
+  expect(screen.getByLabelText("引用1不该用")).toBeDisabled();
 
-  await user.click(screen.getByLabelText("证据 1 不该用"));
+  await user.click(screen.getByLabelText("引用1不该用"));
 
   expect(onSubmitUseful).toHaveBeenCalledTimes(1);
   expect(screen.queryByLabelText("不可用理由")).not.toBeInTheDocument();
@@ -185,7 +201,6 @@ function FeedbackHarness({
     <EvidenceDetail
       evidence={evidence}
       index={0}
-      cited={false}
       feedbackJudgement={judgement}
       onToggleFeedback={(next) =>
         setJudgement((current) => (current === next ? undefined : next))
@@ -205,9 +220,9 @@ test("点击不该用立即选中并展开理由输入，保存后提交理由",
   const onSubmitNotUseful = vi.fn().mockResolvedValue(undefined);
   render(<FeedbackHarness onSubmitNotUseful={onSubmitNotUseful} />);
 
-  await user.click(screen.getByLabelText("证据 1 不该用"));
+  await user.click(screen.getByLabelText("引用1不该用"));
   // 点击后立即呈选中态，不等保存。
-  expect(screen.getByLabelText("证据 1 不该用")).toBeChecked();
+  expect(screen.getByLabelText("引用1不该用")).toBeChecked();
   expect(screen.getByLabelText("不可用理由")).toBeInTheDocument();
   // 理由为空时不能保存。
   expect(
@@ -223,9 +238,9 @@ test("点击不该用立即选中并展开理由输入，保存后提交理由",
   expect(onSubmitNotUseful).toHaveBeenCalledWith("该证据与客户问题无关。");
   expect(await screen.findByText("已记录不可用反馈。")).toBeInTheDocument();
   expect(screen.queryByLabelText("不可用理由")).not.toBeInTheDocument();
-  expect(screen.getByLabelText("证据 1 不该用")).toBeChecked();
-  expect(screen.getByLabelText("证据 1 应该用")).toBeDisabled();
-  expect(screen.getByLabelText("证据 1 不该用")).toBeDisabled();
+  expect(screen.getByLabelText("引用1不该用")).toBeChecked();
+  expect(screen.getByLabelText("引用1应该用")).toBeDisabled();
+  expect(screen.getByLabelText("引用1不该用")).toBeDisabled();
 });
 
 test("反馈保存失败后不锁定选项并允许重试", async () => {
@@ -236,35 +251,35 @@ test("反馈保存失败后不锁定选项并允许重试", async () => {
     .mockResolvedValueOnce(undefined);
   render(<FeedbackHarness onSubmitUseful={onSubmitUseful} />);
 
-  await user.click(screen.getByLabelText("证据 1 应该用"));
+  await user.click(screen.getByLabelText("引用1应该用"));
 
-  expect(screen.getByLabelText("证据 1 应该用")).not.toBeDisabled();
-  expect(screen.getByLabelText("证据 1 不该用")).not.toBeDisabled();
+  expect(screen.getByLabelText("引用1应该用")).not.toBeDisabled();
+  expect(screen.getByLabelText("引用1不该用")).not.toBeDisabled();
 
-  await user.click(screen.getByLabelText("证据 1 应该用"));
-  await user.click(screen.getByLabelText("证据 1 应该用"));
+  await user.click(screen.getByLabelText("引用1应该用"));
+  await user.click(screen.getByLabelText("引用1应该用"));
 
   expect(onSubmitUseful).toHaveBeenCalledTimes(2);
   expect(await screen.findByText("已记录可用反馈。")).toBeInTheDocument();
-  expect(screen.getByLabelText("证据 1 应该用")).toBeDisabled();
-  expect(screen.getByLabelText("证据 1 不该用")).toBeDisabled();
+  expect(screen.getByLabelText("引用1应该用")).toBeDisabled();
+  expect(screen.getByLabelText("引用1不该用")).toBeDisabled();
 });
 
 test("应该用与不该用单选互斥", async () => {
   const user = userEvent.setup();
   render(<FeedbackHarness onSubmitUseful={null} />);
 
-  await user.click(screen.getByLabelText("证据 1 应该用"));
-  expect(screen.getByLabelText("证据 1 应该用")).toBeChecked();
+  await user.click(screen.getByLabelText("引用1应该用"));
+  expect(screen.getByLabelText("引用1应该用")).toBeChecked();
 
-  await user.click(screen.getByLabelText("证据 1 不该用"));
-  expect(screen.getByLabelText("证据 1 不该用")).toBeChecked();
-  expect(screen.getByLabelText("证据 1 应该用")).not.toBeChecked();
+  await user.click(screen.getByLabelText("引用1不该用"));
+  expect(screen.getByLabelText("引用1不该用")).toBeChecked();
+  expect(screen.getByLabelText("引用1应该用")).not.toBeChecked();
 
   // 反向切回应该用，同时收起理由框。
-  await user.click(screen.getByLabelText("证据 1 应该用"));
-  expect(screen.getByLabelText("证据 1 应该用")).toBeChecked();
-  expect(screen.getByLabelText("证据 1 不该用")).not.toBeChecked();
+  await user.click(screen.getByLabelText("引用1应该用"));
+  expect(screen.getByLabelText("引用1应该用")).toBeChecked();
+  expect(screen.getByLabelText("引用1不该用")).not.toBeChecked();
   expect(screen.queryByLabelText("不可用理由")).not.toBeInTheDocument();
 });
 
@@ -278,46 +293,46 @@ test("取消理由输入恢复之前的判定且不提交", async () => {
     />
   );
 
-  await user.click(screen.getByLabelText("证据 1 应该用"));
-  await user.click(screen.getByLabelText("证据 1 不该用"));
+  await user.click(screen.getByLabelText("引用1应该用"));
+  await user.click(screen.getByLabelText("引用1不该用"));
   await user.type(screen.getByLabelText("不可用理由"), "填了一半");
   await user.click(screen.getByRole("button", { name: "取消" }));
 
   expect(screen.queryByLabelText("不可用理由")).not.toBeInTheDocument();
   expect(onSubmitNotUseful).not.toHaveBeenCalled();
   // 恢复打开理由框之前的“应该用”。
-  expect(screen.getByLabelText("证据 1 应该用")).toBeChecked();
-  expect(screen.getByLabelText("证据 1 不该用")).not.toBeChecked();
+  expect(screen.getByLabelText("引用1应该用")).toBeChecked();
+  expect(screen.getByLabelText("引用1不该用")).not.toBeChecked();
 });
 
 test("原本未打标时取消理由输入清空判定", async () => {
   const user = userEvent.setup();
   render(<FeedbackHarness />);
 
-  await user.click(screen.getByLabelText("证据 1 不该用"));
+  await user.click(screen.getByLabelText("引用1不该用"));
   await user.click(screen.getByRole("button", { name: "取消" }));
 
-  expect(screen.getByLabelText("证据 1 不该用")).not.toBeChecked();
-  expect(screen.getByLabelText("证据 1 应该用")).not.toBeChecked();
+  expect(screen.getByLabelText("引用1不该用")).not.toBeChecked();
+  expect(screen.getByLabelText("引用1应该用")).not.toBeChecked();
 });
 
 test("已是不该用时再点取消本地判定并收起理由框", async () => {
   const user = userEvent.setup();
   render(<FeedbackHarness />);
 
-  await user.click(screen.getByLabelText("证据 1 不该用"));
+  await user.click(screen.getByLabelText("引用1不该用"));
   expect(screen.getByLabelText("不可用理由")).toBeInTheDocument();
 
-  await user.click(screen.getByLabelText("证据 1 不该用"));
+  await user.click(screen.getByLabelText("引用1不该用"));
 
-  expect(screen.getByLabelText("证据 1 不该用")).not.toBeChecked();
+  expect(screen.getByLabelText("引用1不该用")).not.toBeChecked();
   expect(screen.queryByLabelText("不可用理由")).not.toBeInTheDocument();
 });
 
 test("没有打标回调时不渲染判定操作", () => {
-  render(<EvidenceDetail evidence={evidence} index={0} cited={false} />);
+  render(<EvidenceDetail evidence={evidence} index={0} />);
 
-  expect(screen.queryByLabelText("证据 1 应该用")).not.toBeInTheDocument();
+  expect(screen.queryByLabelText("引用1应该用")).not.toBeInTheDocument();
 });
 
 test("结构化正文按字段着色区分 AI 归纳与案例原文", () => {
@@ -332,7 +347,7 @@ test("结构化正文按字段着色区分 AI 归纳与案例原文", () => {
       "- 第2节.track-0.txt：客户说每年保费预算不能超过80万"
     ].join("\n")
   };
-  render(<EvidenceDetail evidence={structured} index={0} cited={false} />);
+  render(<EvidenceDetail evidence={structured} index={0} />);
 
   // 图例说明两种来源。
   expect(screen.getByText("AI 归纳")).toBeInTheDocument();
@@ -362,7 +377,7 @@ test("来源原文默认折叠，点击标题展开、再点击折叠", async ()
       "- 第3节.track-0.txt：先看家庭责任额度"
     ].join("\n")
   };
-  render(<EvidenceDetail evidence={structured} index={0} cited={false} />);
+  render(<EvidenceDetail evidence={structured} index={0} />);
 
   const toggle = screen.getByRole("button", { name: /来源原文/ });
   expect(toggle).toHaveAttribute("aria-expanded", "false");
@@ -418,7 +433,7 @@ test("关联话术保持 ID 展示，点击后内联展开完整话术", async (
       ]
     }
   };
-  render(<EvidenceDetail evidence={structured} index={0} cited={false} />);
+  render(<EvidenceDetail evidence={structured} index={0} />);
 
   const scriptButton = screen.getByRole("button", { name: "script_009" });
   expect(scriptButton).toHaveAttribute("aria-expanded", "false");
@@ -445,7 +460,7 @@ test("AI 归纳的 bullet 块默认展开", () => {
     ...evidence,
     text: ["关键动作：", "- 先做保障缺口分析", "- 再谈缴费期"].join("\n")
   };
-  render(<EvidenceDetail evidence={structured} index={0} cited={false} />);
+  render(<EvidenceDetail evidence={structured} index={0} />);
 
   // 生成类要点是核心内容，直接展开、无折叠开关。
   expect(screen.getByText("先做保障缺口分析")).toBeInTheDocument();
@@ -455,7 +470,7 @@ test("AI 归纳的 bullet 块默认展开", () => {
 });
 
 test("非结构化正文回退为纯文本展示", () => {
-  render(<EvidenceDetail evidence={evidence} index={0} cited={false} />);
+  render(<EvidenceDetail evidence={evidence} index={0} />);
 
   expect(
     screen.getByText("客户担心预算，可以先承接预算，再对齐保障缺口。")

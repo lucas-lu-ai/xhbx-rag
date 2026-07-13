@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { App } from "./App";
 import {
   answerPayload,
+  answerPayloadWithEvidences,
   batchRunDetail,
   batchRunProgressOf,
   batchRunQuestionDetail,
@@ -613,7 +614,7 @@ test("批量行反馈只调批量单入口并本地更新 bad_case", async () =>
   ).toBeInTheDocument();
   expect(screen.queryByText("这个回答可用吗？")).not.toBeInTheDocument();
 
-  await user.click(await screen.findByLabelText("证据 1 不该用"));
+  await user.click(await screen.findByLabelText("引用1不该用"));
   await user.type(
     screen.getByLabelText("不可用理由"),
     "该证据与客户问题无关。"
@@ -650,13 +651,20 @@ test("批量行详情自动选中证据并联动右侧明细", async () => {
     "xhbx-rag.active-session.v1",
     JSON.stringify({ kind: "batch", id: "run-1" })
   );
+  const detail = batchRunDetail({
+    questions: [
+      batchRunQuestionDetail({
+        response: answerPayloadWithEvidences(2, [2])
+      })
+    ]
+  });
   installFetchStub((url, init) => {
     const method = init?.method ?? "GET";
     if (url.endsWith("/api/batch-runs") && method === "GET") {
       return jsonResponse({ runs: [batchRunSummary()] });
     }
     if (url.endsWith("/api/batch-runs/run-1")) {
-      return jsonResponse(batchRunDetail());
+      return jsonResponse(detail);
     }
     return null;
   });
@@ -672,22 +680,36 @@ test("批量行详情自动选中证据并联动右侧明细", async () => {
     await screen.findByText("先承接预算，再讨论缴费期和保障缺口。")
   ).toBeInTheDocument();
 
-  // 进入详情屏自动选中第一条证据，右侧明细展示正文与来源摘录。
+  // 进入详情屏自动选中第一条引用，右侧明细展示正文与来源摘录。
   const detailPane = screen.getByRole("complementary", {
     name: "索引和溯源"
   });
   expect(
-    await within(detailPane).findByText("证据 1 · 异议处理")
+    within(detailPane).getByRole("heading", { name: "引用明细" })
+  ).toBeInTheDocument();
+  expect(
+    await within(detailPane).findByText("引用1：案例A · 阶段2")
   ).toBeInTheDocument();
   expect(
     within(detailPane).getByText("data/案例A/第2节.track-0.txt")
   ).toBeInTheDocument();
 
-  // 展开紧凑证据列表，选中行处于按下状态。
-  await user.click(screen.getByRole("button", { name: /检索证据/ }));
+  // 展开紧凑知识引用列表，只保留实际引用且选中行处于按下状态。
+  await user.click(screen.getByRole("button", { name: /知识引用/ }));
   const evidenceList = await screen.findByRole("region", {
-    name: "检索证据列表"
+    name: "知识引用列表"
   });
   const rows = within(evidenceList).getAllByRole("button");
+  expect(rows).toHaveLength(1);
+  expect(within(rows[0]).getByText("1")).toBeInTheDocument();
+  expect(within(rows[0]).getByText("案例A · 阶段2")).toBeInTheDocument();
+  expect(within(rows[0]).getByText("证据2正文内容。")).toBeInTheDocument();
+  expect(
+    within(evidenceList).queryByText("案例A · 阶段1")
+  ).not.toBeInTheDocument();
+  expect(
+    within(evidenceList).queryByText("证据1正文内容。")
+  ).not.toBeInTheDocument();
+  expect(within(evidenceList).queryByText("答案引用")).not.toBeInTheDocument();
   expect(rows[0]).toHaveAttribute("aria-pressed", "true");
 });

@@ -17,7 +17,6 @@ import {
 import {
   dedupeCitations,
   evidenceComplianceRisks,
-  formatChunkType,
   formatEvidenceMeta,
   formatEvidenceSource,
   formatEvidenceSourceCompact,
@@ -427,7 +426,6 @@ type EvidenceDetailProps = {
   evidence: RetrievalEvidence;
   relatedEvidences?: RetrievalEvidence[];
   index: number;
-  cited: boolean;
   feedbackJudgement?: EvidenceFeedbackJudgement;
   onToggleFeedback?: (judgement: EvidenceFeedbackJudgement) => void;
   // “应该用”提交入口：点击后立即落地一条正向 bad case（无需理由）。
@@ -442,7 +440,6 @@ export function EvidenceDetail({
   evidence,
   relatedEvidences = [],
   index,
-  cited,
   feedbackJudgement,
   onToggleFeedback,
   onSubmitUseful,
@@ -464,6 +461,8 @@ export function EvidenceDetail({
     useState<EvidenceFeedbackJudgement | null>(null);
   const selectedCitation = citations[citationIndex];
   const meta = formatEvidenceMeta(evidence.metadata);
+  const citationNumber = index + 1;
+  const knowledgeName = meta || "未命名知识";
   const score = formatScore(evidence.rerank_score);
   const matchedTags = evidence.matched_tag_paths ?? [];
   const boostLabel = formatTagBoost(evidence.tag_boost_factor);
@@ -562,21 +561,20 @@ export function EvidenceDetail({
   }
 
   return (
-    <article className="evidence-detail" aria-label={`证据 ${index + 1} 明细`}>
+    <article
+      className="evidence-detail"
+      aria-label={`引用${citationNumber}明细`}
+    >
       <div className="evidence-header">
-        <strong>
-          证据 {index + 1} · {formatChunkType(evidence.chunk_type)}
-        </strong>
+        <strong>引用{citationNumber}：{knowledgeName}</strong>
         <span className="evidence-header-side">
-          {cited && <em className="evidence-cited-badge">答案引用</em>}
           {score && <span>重排 {score}</span>}
         </span>
       </div>
-      {meta && <p className="meta-text">{meta}</p>}
       {(matchedTags.length > 0 || complianceRisks.length > 0) && (
         <div
           className="evidence-tag-hits"
-          aria-label={`证据 ${index + 1} 命中标签`}
+          aria-label={`引用${citationNumber}命中标签`}
         >
           {complianceRisks.length > 0 && (
             <span className="evidence-compliance-badge">
@@ -707,12 +705,12 @@ export function EvidenceDetail({
       {onToggleFeedback && (
         <div
           className="evidence-feedback-actions"
-          aria-label={`证据 ${index + 1} 打标`}
+          aria-label={`引用${citationNumber}打标`}
         >
           <label>
             <input
               type="checkbox"
-              aria-label={`证据 ${index + 1} 应该用`}
+              aria-label={`引用${citationNumber}应该用`}
               checked={feedbackJudgement === "should_use"}
               disabled={saving || feedbackSaved}
               onChange={() => void handleUsefulToggle()}
@@ -722,7 +720,7 @@ export function EvidenceDetail({
           <label>
             <input
               type="checkbox"
-              aria-label={`证据 ${index + 1} 不该用`}
+              aria-label={`引用${citationNumber}不该用`}
               checked={feedbackJudgement === "should_not_use"}
               disabled={saving || feedbackSaved}
               onChange={handleNotUsefulToggle}
