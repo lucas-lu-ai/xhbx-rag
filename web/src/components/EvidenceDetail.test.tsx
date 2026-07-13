@@ -182,7 +182,7 @@ const citationBase: Citation = {
   filename: "片段.txt",
   source_type: "txt",
   source_path: "data/片段.txt",
-  display_location: "",
+  display_location: "未提供精确位置",
   display_excerpt: "片段原文",
   can_reveal: false
 };

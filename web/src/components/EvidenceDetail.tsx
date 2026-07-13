@@ -115,9 +115,12 @@ export function EvidenceDetail({
     requestId: number;
   } | null>(null);
   const selectedCitation = citations[citationIndex];
+  const displayLocation = selectedCitation?.display_location.trim();
+  const normalizedDisplayLocation =
+    displayLocation === "未提供精确位置" ? "" : displayLocation;
   const citationLocation = selectedCitation
     ? [
-        selectedCitation.display_location,
+        normalizedDisplayLocation,
         formatLocatorConfidence(selectedCitation.locator_confidence)
       ]
         .filter(Boolean)
