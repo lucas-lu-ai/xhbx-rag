@@ -191,11 +191,22 @@ export type AnswerUsageFeedbackJudgement =
   | "incorrect"
   | "not_applicable";
 
-export type EvidenceFeedbackDecision = {
-  retrieval_judgement: RetrievalFeedbackJudgement;
-  answer_usage_judgement: AnswerUsageFeedbackJudgement;
-  reason?: string;
-};
+export type EvidenceFeedbackDecision =
+  | {
+      retrieval_judgement: "accurate";
+      answer_usage_judgement: "correct";
+      reason?: never;
+    }
+  | {
+      retrieval_judgement: "accurate";
+      answer_usage_judgement: "incorrect";
+      reason: string;
+    }
+  | {
+      retrieval_judgement: "inaccurate";
+      answer_usage_judgement: "not_applicable";
+      reason: string;
+    };
 
 export type EvidenceFeedback = EvidenceFeedbackDecision & {
   chunk_id?: string;

@@ -6,7 +6,7 @@ import {
   LoaderCircle,
   Save
 } from "lucide-react";
-import { Fragment, useEffect, useId, useState } from "react";
+import { Fragment, useEffect, useId, useRef, useState } from "react";
 
 import { revealSource } from "../api";
 import {
@@ -496,10 +496,16 @@ export function EvidenceDetail({
   );
   const [reason, setReason] = useState("");
   const [saving, setSaving] = useState(false);
+  const [feedbackSaved, setFeedbackSaved] = useState(Boolean(feedback));
   const [feedbackMessage, setFeedbackMessage] = useState("");
   const [feedbackError, setFeedbackError] = useState("");
   const retrievalRadioName = useId();
   const answerUsageRadioName = useId();
+  const feedbackEvidenceKey = `${index}:${
+    evidence.chunk_id ?? evidence.text_preview ?? evidence.text ?? ""
+  }`;
+  const feedbackEvidenceKeyRef = useRef(feedbackEvidenceKey);
+  feedbackEvidenceKeyRef.current = feedbackEvidenceKey;
   const selectedCitation = citations[citationIndex];
   const meta = formatEvidenceMeta(evidence.metadata);
   const citationNumber = index + 1;
@@ -517,12 +523,18 @@ export function EvidenceDetail({
         : undefined
     );
     setReason("");
+    setFeedbackSaved(Boolean(feedback));
   }, [
-    evidence.chunk_id,
+    feedbackEvidenceKey,
     feedback?.answer_usage_judgement,
-    feedback?.retrieval_judgement,
-    index
+    feedback?.retrieval_judgement
   ]);
+
+  useEffect(() => {
+    setSaving(false);
+    setFeedbackMessage("");
+    setFeedbackError("");
+  }, [feedbackEvidenceKey]);
 
   function clearFeedbackStatus() {
     setFeedbackMessage("");
@@ -536,21 +548,33 @@ export function EvidenceDetail({
     setReason("");
   }
 
-  async function submitDecision(decision: EvidenceFeedbackDecision) {
+  async function submitDecision(
+    decision: EvidenceFeedbackDecision
+  ): Promise<"saved" | "failed" | "stale"> {
     if (!onSubmitFeedback) {
-      return false;
+      return "failed";
     }
+    const submissionEvidenceKey = feedbackEvidenceKey;
     setSaving(true);
     setFeedbackError("");
     try {
       await onSubmitFeedback(decision);
+      if (feedbackEvidenceKeyRef.current !== submissionEvidenceKey) {
+        return "stale";
+      }
+      setFeedbackSaved(true);
       setFeedbackMessage("已记录引用反馈。");
-      return true;
+      return "saved";
     } catch (error) {
+      if (feedbackEvidenceKeyRef.current !== submissionEvidenceKey) {
+        return "stale";
+      }
       setFeedbackError(error instanceof Error ? error.message : "无法保存反馈。");
-      return false;
+      return "failed";
     } finally {
-      setSaving(false);
+      if (feedbackEvidenceKeyRef.current === submissionEvidenceKey) {
+        setSaving(false);
+      }
     }
   }
 
@@ -561,11 +585,11 @@ export function EvidenceDetail({
     setAnswerUsageJudgement(next);
     setReason("");
     if (next === "correct") {
-      const saved = await submitDecision({
+      const result = await submitDecision({
         retrieval_judgement: "accurate",
         answer_usage_judgement: "correct"
       });
-      if (!saved) {
+      if (result === "failed") {
         setAnswerUsageJudgement(undefined);
       }
     }
@@ -605,13 +629,13 @@ export function EvidenceDetail({
     if (!decision) {
       return;
     }
-    const saved = await submitDecision(decision);
-    if (saved) {
+    const result = await submitDecision(decision);
+    if (result === "saved") {
       setReason("");
     }
   }
 
-  const feedbackLocked = Boolean(feedback) || saving;
+  const feedbackLocked = Boolean(feedback) || saving || feedbackSaved;
   const reasonKind =
     retrievalJudgement === "inaccurate"
       ? "retrieval"
@@ -807,7 +831,7 @@ export function EvidenceDetail({
           )}
         </div>
       )}
-      {onSubmitFeedback && reasonKind && !feedback && (
+      {onSubmitFeedback && reasonKind && !feedback && !feedbackSaved && (
         <div className="evidence-feedback-reason-form">
           <label className="text-field">
             <span>
@@ -818,6 +842,7 @@ export function EvidenceDetail({
             <textarea
               rows={3}
               value={reason}
+              disabled={saving}
               onChange={(event) => {
                 setReason(event.target.value);
                 setFeedbackError("");

@@ -260,6 +260,55 @@ test("参考不正确要求填写原因并提交 trimmed payload", async () => {
   });
 });
 
+test("召回负向成功后未回填 feedback 仍本地锁定且不能再次提交", async () => {
+  const user = userEvent.setup();
+  const onSubmitFeedback = vi.fn().mockResolvedValue(undefined);
+  render(
+    <EvidenceDetail
+      evidence={evidence}
+      index={0}
+      onSubmitFeedback={onSubmitFeedback}
+    />
+  );
+
+  await user.click(screen.getByLabelText("引用1召回不准确"));
+  await user.type(screen.getByLabelText("召回不准确原因"), "证据不相关");
+  await user.click(screen.getByRole("button", { name: "保存反馈" }));
+
+  expect(await screen.findByText("已记录引用反馈。")).toBeInTheDocument();
+  expect(screen.queryByLabelText("召回不准确原因")).not.toBeInTheDocument();
+  for (const radio of screen.getAllByRole("radio")) {
+    expect(radio).toBeDisabled();
+  }
+  await user.click(screen.getByLabelText("引用1召回准确"));
+  expect(onSubmitFeedback).toHaveBeenCalledTimes(1);
+});
+
+test("回答负向成功后未回填 feedback 仍本地锁定且不能再次提交", async () => {
+  const user = userEvent.setup();
+  const onSubmitFeedback = vi.fn().mockResolvedValue(undefined);
+  render(
+    <EvidenceDetail
+      evidence={evidence}
+      index={0}
+      onSubmitFeedback={onSubmitFeedback}
+    />
+  );
+
+  await user.click(screen.getByLabelText("引用1召回准确"));
+  await user.click(screen.getByLabelText("引用1参考不正确"));
+  await user.type(screen.getByLabelText("参考不正确原因"), "回答曲解引用");
+  await user.click(screen.getByRole("button", { name: "保存反馈" }));
+
+  expect(await screen.findByText("已记录引用反馈。")).toBeInTheDocument();
+  expect(screen.queryByLabelText("参考不正确原因")).not.toBeInTheDocument();
+  for (const radio of screen.getAllByRole("radio")) {
+    expect(radio).toBeDisabled();
+  }
+  await user.click(screen.getByLabelText("引用1参考正确"));
+  expect(onSubmitFeedback).toHaveBeenCalledTimes(1);
+});
+
 test("参考正确时立即提交并在保存后锁定所有单选按钮", async () => {
   const user = userEvent.setup();
   const onSubmit = vi.fn().mockResolvedValue(undefined);
@@ -309,6 +358,46 @@ test("参考正确保存中与 feedback 回填后都会锁定所有单选按钮"
   for (const radio of savedRadios) {
     expect(radio).toBeDisabled();
   }
+});
+
+test("负向保存 pending 时锁定原因与全部操作控件并提交 trimmed payload", async () => {
+  const user = userEvent.setup();
+  let resolveSubmit: (() => void) | undefined;
+  const onSubmitFeedback = vi.fn(
+    () =>
+      new Promise<void>((resolve) => {
+        resolveSubmit = resolve;
+      })
+  );
+  render(
+    <EvidenceDetail
+      evidence={evidence}
+      index={0}
+      onSubmitFeedback={onSubmitFeedback}
+    />
+  );
+
+  await user.click(screen.getByLabelText("引用1召回不准确"));
+  await user.type(screen.getByLabelText("召回不准确原因"), "  证据不相关  ");
+  await user.click(screen.getByRole("button", { name: "保存反馈" }));
+
+  expect(onSubmitFeedback).toHaveBeenCalledWith({
+    retrieval_judgement: "inaccurate",
+    answer_usage_judgement: "not_applicable",
+    reason: "证据不相关"
+  });
+  expect(screen.getByLabelText("召回不准确原因")).toBeDisabled();
+  expect(screen.getByRole("button", { name: "保存反馈" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "取消" })).toBeDisabled();
+  for (const radio of screen.getAllByRole("radio")) {
+    expect(radio).toBeDisabled();
+  }
+
+  expect(resolveSubmit).toBeTypeOf("function");
+  await act(async () => {
+    resolveSubmit?.();
+  });
+  expect(screen.getByText("已记录引用反馈。")).toBeInTheDocument();
 });
 
 test("切换召回维度会清空不兼容的回答选择与原因", async () => {
@@ -396,7 +485,7 @@ test("保存失败后修改召回维度会清除错误", async () => {
   expect(screen.getByLabelText("召回不准确原因")).toBeInTheDocument();
 });
 
-test("成功消息尚未由 feedback 锁定时修改召回维度会清除消息", async () => {
+test("正向成功后未回填 feedback 仍本地锁定且不能矛盾提交", async () => {
   const user = userEvent.setup();
   const onSubmitFeedback = vi.fn().mockResolvedValue(undefined);
   render(
@@ -411,10 +500,11 @@ test("成功消息尚未由 feedback 锁定时修改召回维度会清除消息"
   await user.click(screen.getByLabelText("引用1参考正确"));
   expect(await screen.findByText("已记录引用反馈。")).toBeInTheDocument();
 
+  for (const radio of screen.getAllByRole("radio")) {
+    expect(radio).toBeDisabled();
+  }
   await user.click(screen.getByLabelText("引用1召回不准确"));
-
-  expect(screen.queryByText("已记录引用反馈。")).not.toBeInTheDocument();
-  expect(screen.getByLabelText("召回不准确原因")).toBeInTheDocument();
+  expect(onSubmitFeedback).toHaveBeenCalledTimes(1);
 });
 
 test("负向保存失败会保留原因表单并允许重试", async () => {
@@ -497,6 +587,75 @@ test("切换引用后再返回会恢复对应的已保存选择", () => {
   );
   expect(screen.getByLabelText("引用1召回准确")).toBeChecked();
   expect(screen.getByLabelText("引用1参考正确")).toBeChecked();
+});
+
+test("本地成功锁定在复用组件展示不同 evidence 时会重置", async () => {
+  const user = userEvent.setup();
+  const onSubmitFeedback = vi.fn().mockResolvedValue(undefined);
+  const { rerender } = render(
+    <EvidenceDetail
+      evidence={evidence}
+      index={0}
+      onSubmitFeedback={onSubmitFeedback}
+    />
+  );
+
+  await user.click(screen.getByLabelText("引用1召回准确"));
+  await user.click(screen.getByLabelText("引用1参考正确"));
+  expect(await screen.findByText("已记录引用反馈。")).toBeInTheDocument();
+  expect(screen.getByLabelText("引用1召回准确")).toBeDisabled();
+
+  rerender(
+    <EvidenceDetail
+      evidence={{ ...evidence, chunk_id: "c2" }}
+      index={1}
+      onSubmitFeedback={onSubmitFeedback}
+    />
+  );
+
+  expect(screen.getByLabelText("引用2召回准确")).not.toBeChecked();
+  expect(screen.getByLabelText("引用2召回准确")).not.toBeDisabled();
+  expect(screen.queryByText("已记录引用反馈。")).not.toBeInTheDocument();
+});
+
+test("切换 evidence 会解除旧 pending 锁定并忽略旧提交结果", async () => {
+  const user = userEvent.setup();
+  let resolveSubmit: (() => void) | undefined;
+  const onSubmitFeedback = vi.fn(
+    () =>
+      new Promise<void>((resolve) => {
+        resolveSubmit = resolve;
+      })
+  );
+  const { rerender } = render(
+    <EvidenceDetail
+      evidence={evidence}
+      index={0}
+      onSubmitFeedback={onSubmitFeedback}
+    />
+  );
+
+  await user.click(screen.getByLabelText("引用1召回准确"));
+  await user.click(screen.getByLabelText("引用1参考正确"));
+  expect(screen.getByLabelText("引用1召回准确")).toBeDisabled();
+
+  rerender(
+    <EvidenceDetail
+      evidence={{ ...evidence, chunk_id: "c2" }}
+      index={1}
+      onSubmitFeedback={onSubmitFeedback}
+    />
+  );
+
+  expect(screen.getByLabelText("引用2召回准确")).not.toBeChecked();
+  expect(screen.getByLabelText("引用2召回准确")).not.toBeDisabled();
+
+  expect(resolveSubmit).toBeTypeOf("function");
+  await act(async () => {
+    resolveSubmit?.();
+  });
+  expect(screen.queryByText("已记录引用反馈。")).not.toBeInTheDocument();
+  expect(screen.getByLabelText("引用2召回准确")).not.toBeDisabled();
 });
 
 test("没有提交回调时不渲染反馈区", () => {
