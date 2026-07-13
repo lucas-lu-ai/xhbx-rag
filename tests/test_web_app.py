@@ -750,6 +750,83 @@ def test_bad_case_route_rejects_unknown_answer_usage_judgement(monkeypatch) -> N
     "feedback",
     [
         {
+            "retrieval_judgement": [],
+            "answer_usage_judgement": "correct",
+        },
+        {
+            "retrieval_judgement": "accurate",
+            "answer_usage_judgement": {},
+        },
+        {"judgement": []},
+    ],
+)
+def test_bad_case_route_rejects_non_string_evidence_judgements(
+    monkeypatch, feedback: dict
+) -> None:
+    def fail_if_called(payload: dict):
+        raise AssertionError("save_bad_case should not be called")
+
+    monkeypatch.setattr(web_app, "save_bad_case", fail_if_called)
+    client = TestClient(web_app.create_app())
+
+    response = client.post(
+        "/api/bad-cases",
+        json={
+            "query": "保单整理对客户有什么作用？",
+            "answer": "answer",
+            "top_n": 20,
+            "top_k": 5,
+            "issue_types": ["citation_issue"],
+            "evidence_feedback": [{"chunk_id": "case-a-1", **feedback}],
+            "citations": [],
+            "retrieval_evidences": [],
+        },
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "judgement",
+    ["not_allowed", "should_not_use"],
+)
+def test_bad_case_route_rejects_mixed_legacy_and_new_evidence_feedback(
+    monkeypatch, judgement: str
+) -> None:
+    def fail_if_called(payload: dict):
+        raise AssertionError("save_bad_case should not be called")
+
+    monkeypatch.setattr(web_app, "save_bad_case", fail_if_called)
+    client = TestClient(web_app.create_app())
+
+    response = client.post(
+        "/api/bad-cases",
+        json={
+            "query": "保单整理对客户有什么作用？",
+            "answer": "answer",
+            "top_n": 20,
+            "top_k": 5,
+            "issue_types": ["citation_issue"],
+            "evidence_feedback": [
+                {
+                    "chunk_id": "case-a-1",
+                    "judgement": judgement,
+                    "retrieval_judgement": "accurate",
+                    "answer_usage_judgement": "correct",
+                }
+            ],
+            "citations": [],
+            "retrieval_evidences": [],
+        },
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "feedback",
+    [
+        {
             "retrieval_judgement": "unknown",
             "answer_usage_judgement": "correct",
         },

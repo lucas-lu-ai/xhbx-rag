@@ -427,6 +427,38 @@ def test_bad_case_route_rejects_invalid_two_dimensional_feedback(
     assert store.get_question(run_id, 1)["bad_case"] is None
 
 
+@pytest.mark.parametrize(
+    "feedback",
+    [
+        {
+            "retrieval_judgement": [],
+            "answer_usage_judgement": "correct",
+        },
+        {
+            "judgement": "should_use",
+            "retrieval_judgement": "accurate",
+            "answer_usage_judgement": "correct",
+        },
+    ],
+)
+def test_bad_case_route_rejects_unsafe_evidence_feedback_values(
+    tmp_path: Path, feedback: dict
+) -> None:
+    client, store, _ = _make_client(tmp_path)
+    run_id = client.post("/api/batch-runs", json=_create_payload()).json()["run_id"]
+    _fail_first_row(store, run_id)
+
+    response = client.post(
+        f"/api/batch-runs/{run_id}/rows/1/bad-case",
+        json=_bad_case_payload(
+            evidence_feedback=[{"chunk_id": "case-a-1", **feedback}]
+        ),
+    )
+
+    assert response.status_code == 422
+    assert store.get_question(run_id, 1)["bad_case"] is None
+
+
 def test_bad_case_route_rolls_back_cache_when_jsonl_fails(
     tmp_path: Path, monkeypatch
 ) -> None:

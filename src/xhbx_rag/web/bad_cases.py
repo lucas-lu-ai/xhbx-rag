@@ -74,19 +74,33 @@ def validate_evidence_feedback_items(
     values: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     for value in values:
+        has_legacy_judgement = "judgement" in value
+        has_new_judgement = (
+            "retrieval_judgement" in value or "answer_usage_judgement" in value
+        )
+        if has_legacy_judgement and has_new_judgement:
+            raise ValueError("新旧证据反馈字段不能混用")
+
         retrieval_judgement = value.get("retrieval_judgement")
         answer_usage_judgement = value.get("answer_usage_judgement")
-        if (
-            "retrieval_judgement" not in value
-            and "answer_usage_judgement" not in value
-        ):
-            if value.get("judgement") not in EVIDENCE_FEEDBACK_JUDGEMENT_LABELS:
+        if not has_new_judgement:
+            judgement = value.get("judgement")
+            if (
+                not isinstance(judgement, str)
+                or judgement not in EVIDENCE_FEEDBACK_JUDGEMENT_LABELS
+            ):
                 raise ValueError("证据反馈类型不支持")
             continue
 
-        if retrieval_judgement not in RETRIEVAL_JUDGEMENT_LABELS:
+        if (
+            not isinstance(retrieval_judgement, str)
+            or retrieval_judgement not in RETRIEVAL_JUDGEMENT_LABELS
+        ):
             raise ValueError("召回判断不支持")
-        if answer_usage_judgement not in ANSWER_USAGE_JUDGEMENT_LABELS:
+        if (
+            not isinstance(answer_usage_judgement, str)
+            or answer_usage_judgement not in ANSWER_USAGE_JUDGEMENT_LABELS
+        ):
             raise ValueError("回答参考判断不支持")
         if retrieval_judgement == "accurate" and answer_usage_judgement not in {
             "correct",
