@@ -125,6 +125,18 @@ const adjacentCitationResponse: AnswerResponse = {
   retrieval_evidences: unkeyedEvidences
 };
 
+const duplicateChunkEvidences: RetrievalEvidence[] = [
+  { chunk_id: "unreferenced", text: "未引用的第一条证据" },
+  { chunk_id: "duplicate-chunk", text: "同 chunk 的第二条证据" },
+  { chunk_id: "duplicate-chunk", text: "同 chunk 的第三条证据" }
+];
+
+const duplicateChunkResponse: AnswerResponse = {
+  ...adjacentCitationResponse,
+  evidence_count: duplicateChunkEvidences.length,
+  retrieval_evidences: duplicateChunkEvidences
+};
+
 afterEach(() => {
   document
     .querySelectorAll("[data-testid='evidence-portal']")
@@ -153,9 +165,11 @@ function renderPanel(selectedEvidenceKey: string) {
 }
 
 function FeedbackSelectionHarness({
-  portalContainer
+  portalContainer,
+  response: panelResponse = adjacentCitationResponse
 }: {
   portalContainer: HTMLElement;
+  response?: AnswerResponse;
 }) {
   const [selectedEvidenceKey, setSelectedEvidenceKey] = useState<string | null>(
     "turn-1:evidence-2"
@@ -184,7 +198,7 @@ function FeedbackSelectionHarness({
       >
         <BadCasePanel
           turn={turn}
-          response={adjacentCitationResponse}
+          response={panelResponse}
           submit={vi.fn().mockResolvedValue({})}
         />
       </EvidenceDetailContext.Provider>
@@ -230,6 +244,35 @@ test("反馈 toggle 按原始 evidence 索引隔离相邻引用状态", () => {
   expect(
     screen.getByTestId("mock-feedback-judgement")
   ).toBeEmptyDOMElement();
+  fireEvent.click(
+    screen.getByRole("button", { name: "切换应该用状态" })
+  );
+  expect(screen.getByTestId("mock-feedback-judgement")).toHaveTextContent(
+    "should_use"
+  );
+
+  fireEvent.click(screen.getByRole("button", { name: "查看原始第 2 条" }));
+  expect(
+    screen.getByTestId("mock-feedback-judgement")
+  ).toBeEmptyDOMElement();
+
+  fireEvent.click(screen.getByRole("button", { name: "查看原始第 3 条" }));
+  expect(screen.getByTestId("mock-feedback-judgement")).toHaveTextContent(
+    "should_use"
+  );
+});
+
+test("重复 chunk_id 的引用反馈仍按原始 evidence 索引隔离", () => {
+  const portalContainer = document.createElement("div");
+  portalContainer.dataset.testid = "evidence-portal";
+  document.body.appendChild(portalContainer);
+  render(
+    <FeedbackSelectionHarness
+      portalContainer={portalContainer}
+      response={duplicateChunkResponse}
+    />
+  );
+
   fireEvent.click(
     screen.getByRole("button", { name: "切换应该用状态" })
   );

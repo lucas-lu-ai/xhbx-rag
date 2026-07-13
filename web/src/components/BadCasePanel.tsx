@@ -61,7 +61,7 @@ export function BadCasePanel({
     evidence: RetrievalEvidence,
     judgement: EvidenceFeedbackJudgement
   ) {
-    const key = evidenceFeedbackKey(index, evidence);
+    const key = evidenceFeedbackKey(index);
     setEvidenceFeedback((items) => {
       if (items[key]?.judgement === judgement) {
         const { [key]: _removed, ...rest } = items;
@@ -114,7 +114,7 @@ export function BadCasePanel({
     onSavedBadCase?.(payload);
     setEvidenceFeedback((items) => ({
       ...items,
-      [evidenceFeedbackKey(index, evidence)]: entry
+      [evidenceFeedbackKey(index)]: entry
     }));
   }
 
@@ -155,7 +155,7 @@ export function BadCasePanel({
     onSavedBadCase?.(payload);
     setEvidenceFeedback((items) => ({
       ...items,
-      [evidenceFeedbackKey(index, evidence)]: entry
+      [evidenceFeedbackKey(index)]: entry
     }));
   }
 
@@ -181,10 +181,7 @@ export function BadCasePanel({
             cited
             feedbackJudgement={
               evidenceFeedback[
-                evidenceFeedbackKey(
-                  selectedEntry.evidenceIndex,
-                  selectedEntry.evidence
-                )
+                evidenceFeedbackKey(selectedEntry.evidenceIndex)
               ]?.judgement
             }
             onToggleFeedback={(judgement) =>
@@ -214,8 +211,8 @@ export function BadCasePanel({
   );
 }
 
-function evidenceFeedbackKey(index: number, evidence: RetrievalEvidence): string {
-  return evidence.chunk_id || `evidence-${index}`;
+function evidenceFeedbackKey(index: number): string {
+  return `evidence-index:${index}`;
 }
 
 function evidenceFeedbackLabel(
