@@ -188,9 +188,9 @@ def test_query_understanding_falls_back_to_all_when_case_semantics_miss_case_tar
 
 @pytest.mark.parametrize(
     "intent",
-    ["journey_search", "strategy_search", "script_search", "objection_handling"],
+    ["journey_search", "objection_handling"],
 )
-def test_query_understanding_uses_case_intent_as_routing_guard_when_chunk_types_empty(
+def test_query_understanding_uses_case_only_intent_as_routing_guard_when_chunk_types_empty(
     intent: str,
 ) -> None:
     result = QueryUnderstanding.model_validate(
@@ -204,6 +204,32 @@ def test_query_understanding_uses_case_intent_as_routing_guard_when_chunk_types_
     )
 
     assert result.collection_targets == ["case", "course"]
+
+
+@pytest.mark.parametrize(
+    ("intent", "chunk_types"),
+    [
+        ("script_search", ["training_course"]),
+        ("script_search", []),
+        ("strategy_search", ["training_course"]),
+        ("strategy_search", []),
+    ],
+)
+def test_query_understanding_preserves_course_target_for_ambiguous_intent(
+    intent: str,
+    chunk_types: list[str],
+) -> None:
+    result = QueryUnderstanding.model_validate(
+        {
+            "intent": intent,
+            "rewritten_query": "查询制式话术或标准流程",
+            "needs_retrieval": True,
+            "collection_targets": ["course"],
+            "filters": {"chunk_types": chunk_types},
+        }
+    )
+
+    assert result.collection_targets == ["course"]
 
 
 def test_query_understanding_falls_back_to_all_when_course_semantics_miss_course_target() -> None:
@@ -317,6 +343,8 @@ def test_query_understanding_prompt_explains_collection_routing() -> None:
     assert "course 仅包含 training_course" in _SYSTEM_PROMPT
     assert '同时需要案例和课程时选择 ["case", "course"]' in _SYSTEM_PROMPT
     assert "collection_targets 必须与 intent 和 filters.chunk_types 一致" in _SYSTEM_PROMPT
+    assert "script_search 和 strategy_search 本身不足以决定 collection_targets" in _SYSTEM_PROMPT
+    assert "制式话术、标准流程可属于 course" in _SYSTEM_PROMPT
     assert '无法确定时选择 ["case", "course"]' in _SYSTEM_PROMPT
 
 

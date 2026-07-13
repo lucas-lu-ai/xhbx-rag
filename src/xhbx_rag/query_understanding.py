@@ -23,9 +23,7 @@ _CASE_CHUNK_TYPES = frozenset(
     {"customer_journey", "strategy", "script", "objection_handling"}
 )
 _COURSE_CHUNK_TYPES = frozenset({"training_course"})
-_CASE_INTENTS = frozenset(
-    {"journey_search", "strategy_search", "script_search", "objection_handling"}
-)
+_CASE_ONLY_INTENTS = frozenset({"journey_search", "objection_handling"})
 _ALLOWED_CHUNK_TYPES = {
     *_CASE_CHUNK_TYPES,
     *_COURSE_CHUNK_TYPES,
@@ -114,7 +112,7 @@ class QueryUnderstanding(BaseModel):
             return self
 
         chunk_types = set(self.filters.chunk_types)
-        needs_case = self.intent in _CASE_INTENTS or bool(
+        needs_case = self.intent in _CASE_ONLY_INTENTS or bool(
             chunk_types.intersection(_CASE_CHUNK_TYPES)
         )
         needs_course = bool(chunk_types.intersection(_COURSE_CHUNK_TYPES))
@@ -214,6 +212,8 @@ _SYSTEM_PROMPT = """你是销售洞察 RAG 的查询理解节点。
 4. 通用解释、作用、价值、原因类问题使用 general_sales_qa，chunk_types 通常留空，除非用户明确限定只查某类知识。
 5. 知识库同时包含绩优案例经验与制式培训课程两类：问"怎么讲这门课/课程内容/标准流程/制式话术/培训教材"倾向 chunk_types=["training_course"]；问"某位绩优如何做成/实战经验"倾向案例四类；不确定时 chunk_types 留空同时检索两类。
 6. collection_targets 必须与 intent 和 filters.chunk_types 一致；混合类型选择两者，不确定时也选择两者。
+7. script_search 和 strategy_search 本身不足以决定 collection_targets；制式话术、标准流程可属于 course。
+8. 结合用户问题、filters.chunk_types 和 collection_targets 判断目标库，确保目标与 chunk_types 一致。
 """
 
 
