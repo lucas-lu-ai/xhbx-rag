@@ -6,6 +6,7 @@ import pytest
 
 import xhbx_rag.web.services as services
 from xhbx_rag.config import ConfigError
+from xhbx_rag.query_understanding import CollectionTarget, QueryUnderstanding
 
 
 SAFE_CONFIG_ERROR = "配置解析失败，请检查 .env 中的数值配置。"
@@ -46,14 +47,40 @@ class _FakeHttpComponent:
         self.http_client = _FakeCloseable(f"{name}.http_client", calls)
 
 
+class _FakeQueryComponent(_FakeHttpComponent):
+    def __init__(
+        self,
+        name: str,
+        calls: list[str],
+        understanding: QueryUnderstanding | None = None,
+    ) -> None:
+        super().__init__(name, calls)
+        self.understanding = understanding or _query_understanding()
+
+    def understand(self, query: str) -> QueryUnderstanding:
+        return self.understanding
+
+
 class _FakeStoreComponent:
     def __init__(self, name: str, calls: list[str]) -> None:
         self.client = _FakeCloseable(f"{name}.client", calls)
 
 
-def _install_rag_stubs(monkeypatch, citations=None):
+def _query_understanding(
+    collection_targets: list[CollectionTarget] | None = None,
+) -> QueryUnderstanding:
+    return QueryUnderstanding(
+        intent="general_sales_qa",
+        rewritten_query="客户预算上限80万时如何回应",
+        needs_retrieval=True,
+        collection_targets=collection_targets or ["case", "course"],
+    )
+
+
+def _install_rag_stubs(monkeypatch, citations=None, collection_targets=None):
     constructor_calls = {}
     answer_calls = {}
+    understanding = _query_understanding(collection_targets)
 
     def component_factory(name: str, value: str):
         def factory(**kwargs):
@@ -63,18 +90,27 @@ def _install_rag_stubs(monkeypatch, citations=None):
         return factory
 
     monkeypatch.setattr(services.RetrievalConfig, "from_env", _fake_config)
-    monkeypatch.setattr(
-        services,
-        "QueryUnderstandingAgent",
-        component_factory("query_agent", "query-agent"),
-    )
+    class FakeQueryAgent:
+        def understand(self, query: str) -> QueryUnderstanding:
+            constructor_calls.setdefault("understand_queries", []).append(query)
+            return understanding
+
+    def query_agent_factory(**kwargs):
+        constructor_calls["query_agent"] = kwargs
+        agent = FakeQueryAgent()
+        constructor_calls["query_agent_instance"] = agent
+        constructor_calls["understanding"] = understanding
+        return agent
+
+    monkeypatch.setattr(services, "QueryUnderstandingAgent", query_agent_factory)
     monkeypatch.setattr(
         services,
         "EmbeddingClient",
         component_factory("embedding_client", "embedding"),
     )
-    def store_factory(config):
+    def store_factory(config, collection_names=None):
         constructor_calls["store"] = config
+        constructor_calls["store_collections"] = collection_names
         return "store"
 
     monkeypatch.setattr(services, "create_retrieval_store", store_factory)
@@ -114,11 +150,14 @@ def _install_closeable_rag_stubs(monkeypatch, error=None) -> list[str]:
 
         return factory
 
-    def store_factory(config):
+    def query_agent_factory(**kwargs):
+        return _FakeQueryComponent("query_agent", close_calls)
+
+    def store_factory(config, collection_names=None):
         return _FakeStoreComponent("store", close_calls)
 
     monkeypatch.setattr(services.RetrievalConfig, "from_env", _fake_config)
-    monkeypatch.setattr(services, "QueryUnderstandingAgent", http_factory("query_agent"))
+    monkeypatch.setattr(services, "QueryUnderstandingAgent", query_agent_factory)
     monkeypatch.setattr(services, "EmbeddingClient", http_factory("embedding_client"))
     monkeypatch.setattr(services, "create_retrieval_store", store_factory)
     monkeypatch.setattr(services, "RerankClient", http_factory("reranker"))
@@ -398,7 +437,9 @@ def test_answer_question_uses_existing_rag_components(
         "on_thinking_delta": None,
     }
     assert calls["query"] == "客户说每年不能超过80万怎么办？"
-    assert calls["query_agent"] == "query-agent"
+    assert calls["query_agent"] is constructors["query_agent_instance"]
+    assert calls["understanding"] is constructors["understanding"]
+    assert constructors["understand_queries"] == ["客户说每年不能超过80万怎么办？"]
     assert calls["embedding_client"] == "embedding"
     assert calls["store"] == "store"
     assert calls["reranker"] == "reranker"
@@ -420,9 +461,17 @@ def test_answer_question_returns_retrieval_evidences_from_answer_context(
     source.write_text("客户担心预算，可以先承接预算，再对齐保障缺口。", encoding="utf-8")
 
     monkeypatch.setattr(services.RetrievalConfig, "from_env", _fake_config)
-    monkeypatch.setattr(services, "QueryUnderstandingAgent", lambda **kwargs: "query")
+    monkeypatch.setattr(
+        services,
+        "QueryUnderstandingAgent",
+        lambda **kwargs: _FakeQueryComponent("query_agent", []),
+    )
     monkeypatch.setattr(services, "EmbeddingClient", lambda **kwargs: "embedding")
-    monkeypatch.setattr(services, "create_retrieval_store", lambda config: "store")
+    monkeypatch.setattr(
+        services,
+        "create_retrieval_store",
+        lambda config, collection_names=None: "store",
+    )
     monkeypatch.setattr(services, "RerankClient", lambda **kwargs: "reranker")
 
     class FakeAnswerAgent:
@@ -732,47 +781,49 @@ def test_answer_question_strips_query_before_rag_call(monkeypatch) -> None:
     assert calls["query"] == "q"
 
 
-def test_answer_question_passes_selected_collections_to_retrieval_store(
+@pytest.mark.parametrize(
+    ("targets", "expected_collections"),
+    [
+        (["case"], ["xhbx_sales_chunks"]),
+        (["course"], ["xhbx_course_chunks"]),
+        (["case", "course"], ["xhbx_sales_chunks", "xhbx_course_chunks"]),
+    ],
+)
+def test_answer_question_routes_model_targets_and_reuses_understanding(
+    monkeypatch,
+    targets: list[CollectionTarget],
+    expected_collections: list[str],
+) -> None:
+    constructors, answer_calls = _install_rag_stubs(
+        monkeypatch,
+        collection_targets=targets,
+    )
+
+    services.answer_question(query="q", top_n=20, top_k=5)
+
+    assert constructors["store_collections"] == expected_collections
+    assert constructors["understand_queries"] == ["q"]
+    assert answer_calls["understanding"] is constructors["understanding"]
+
+
+def test_answer_question_explicit_collections_override_model_targets(
     monkeypatch,
 ) -> None:
-    constructor_calls = {}
-    answer_calls = {}
-
-    monkeypatch.setattr(services.RetrievalConfig, "from_env", _fake_config)
-    monkeypatch.setattr(services, "QueryUnderstandingAgent", lambda **kwargs: "query")
-    monkeypatch.setattr(services, "EmbeddingClient", lambda **kwargs: "embedding")
-    monkeypatch.setattr(services, "RerankClient", lambda **kwargs: "reranker")
-    monkeypatch.setattr(services, "AnswerAgent", lambda **kwargs: "answer-agent")
-
-    def store_factory(config, collection_names=None):
-        constructor_calls["store_collections"] = collection_names
-        return "store"
-
-    monkeypatch.setattr(services, "create_retrieval_store", store_factory)
-
-    def fake_answer_query(**kwargs):
-        answer_calls.update(kwargs)
-        return {
-            "original_query": kwargs["query"],
-            "rewritten_query": "q",
-            "intent": "general_sales_qa",
-            "filters": {},
-            "answer": "answer",
-            "citations": [],
-            "evidence_count": 0,
-        }
-
-    monkeypatch.setattr(services, "answer_query", fake_answer_query)
+    constructors, answer_calls = _install_rag_stubs(
+        monkeypatch,
+        collection_targets=["course"],
+    )
 
     services.answer_question(
         query="q",
         top_n=20,
         top_k=5,
-        collections=["xhbx_course_chunks"],
+        collections=["custom_chunks"],
     )
 
-    assert constructor_calls["store_collections"] == ["xhbx_course_chunks"]
-    assert answer_calls["store"] == "store"
+    assert constructors["store_collections"] == ["custom_chunks"]
+    assert constructors["understand_queries"] == ["q"]
+    assert answer_calls["understanding"] is constructors["understanding"]
 
 
 def test_answer_question_preserves_config_error(monkeypatch) -> None:
@@ -908,7 +959,7 @@ def test_answer_question_sanitizes_local_index_open_failure(monkeypatch) -> None
     monkeypatch.setattr(
         services,
         "QueryUnderstandingAgent",
-        lambda **kwargs: _FakeHttpComponent("query_agent", []),
+        lambda **kwargs: _FakeQueryComponent("query_agent", []),
     )
     monkeypatch.setattr(
         services,
@@ -916,7 +967,7 @@ def test_answer_question_sanitizes_local_index_open_failure(monkeypatch) -> None
         lambda **kwargs: _FakeHttpComponent("embedding_client", []),
     )
 
-    def fail_store(config):
+    def fail_store(config, collection_names=None):
         raise RuntimeError(
             "Open local milvus failed for "
             "/Users/milan/xhbx-rag/.local/milvus/xhbx_rag.db secret-token"

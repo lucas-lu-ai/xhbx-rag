@@ -48,40 +48,49 @@ def search_evidence(
     top_n: int,
     top_k: int,
     trace: TraceSink | None = None,
+    understanding: QueryUnderstanding | None = None,
 ) -> dict:
     emit_trace(
         trace,
         "search.query_received",
         {"query": query, "top_n": top_n, "top_k": top_k},
     )
-    understanding = query_agent.understand(query)
-    filters_payload = understanding.filters.model_dump(mode="json")
+    resolved_understanding = (
+        understanding if understanding is not None else query_agent.understand(query)
+    )
+    filters_payload = resolved_understanding.filters.model_dump(mode="json")
     emit_trace(
         trace,
         "search.query_understood",
         {
-            "intent": understanding.intent,
-            "rewritten_query": understanding.rewritten_query,
-            "needs_retrieval": understanding.needs_retrieval,
+            "intent": resolved_understanding.intent,
+            "rewritten_query": resolved_understanding.rewritten_query,
+            "needs_retrieval": resolved_understanding.needs_retrieval,
             "filters": filters_payload,
         },
     )
-    if not understanding.needs_retrieval or understanding.intent == "out_of_scope":
+    if (
+        not resolved_understanding.needs_retrieval
+        or resolved_understanding.intent == "out_of_scope"
+    ):
         emit_trace(
             trace,
             "search.skipped",
-            {"reason": "query 不属于可检索范围", "intent": understanding.intent},
+            {
+                "reason": "query 不属于可检索范围",
+                "intent": resolved_understanding.intent,
+            },
         )
         return {
             "original_query": query,
-            "rewritten_query": understanding.rewritten_query,
-            "intent": understanding.intent,
+            "rewritten_query": resolved_understanding.rewritten_query,
+            "intent": resolved_understanding.intent,
             "filters": filters_payload,
             "results": [],
             "reason": "query 不属于可检索范围",
         }
 
-    rewritten_query = understanding.rewritten_query.strip()
+    rewritten_query = resolved_understanding.rewritten_query.strip()
     if not rewritten_query:
         raise ValueError("rewritten_query 不能为空")
 
@@ -95,7 +104,7 @@ def search_evidence(
             "vector_head": vector[:5],
         },
     )
-    filter_dict = _search_filters(understanding)
+    filter_dict = _search_filters(resolved_understanding)
     vector_hits = store.search(vector=vector, top_k=top_n, filters=filter_dict)
     emit_trace(
         trace,
@@ -182,7 +191,7 @@ def search_evidence(
     return {
         "original_query": query,
         "rewritten_query": rewritten_query,
-        "intent": understanding.intent,
+        "intent": resolved_understanding.intent,
         "filters": filters_payload,
         "results": results,
     }

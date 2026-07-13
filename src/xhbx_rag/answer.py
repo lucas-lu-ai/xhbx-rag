@@ -23,6 +23,7 @@ from .http_retry import (
     sleep_before_retry,
 )
 from .observability import TraceSink, emit_trace
+from .query_understanding import QueryUnderstanding
 from .search import search_evidence
 
 
@@ -478,6 +479,7 @@ def answer_query(
     top_n: int,
     top_k: int,
     trace: TraceSink | None = None,
+    understanding: QueryUnderstanding | None = None,
 ) -> dict[str, Any]:
     search_result = search_evidence(
         query=query,
@@ -488,6 +490,7 @@ def answer_query(
         top_n=top_n,
         top_k=top_k,
         trace=trace,
+        understanding=understanding,
     )
     return answer_from_search_result(
         search_result,

@@ -22,7 +22,10 @@ from xhbx_rag.observability import (
     close_trace,
     create_studio_trace_sink,
 )
-from xhbx_rag.query_understanding import QueryUnderstandingAgent
+from xhbx_rag.query_understanding import (
+    CollectionTarget,
+    QueryUnderstandingAgent,
+)
 from xhbx_rag.rerank import RerankClient
 from xhbx_rag.resource_utils import close_resources, is_local_index_open_failure
 
@@ -132,6 +135,22 @@ def batch_concurrency(config: RetrievalConfig) -> int:
     return max(SERIAL_BATCH_CONCURRENCY, min(MAX_BATCH_CONCURRENCY, parsed))
 
 
+def _collection_names_for_targets(
+    config: RetrievalConfig,
+    targets: Sequence[CollectionTarget],
+) -> list[str]:
+    collection_by_target = {
+        "case": config.milvus_collection,
+        "course": config.milvus_course_collection,
+    }
+    selected: list[str] = []
+    for target in targets:
+        collection_name = collection_by_target.get(target)
+        if collection_name and collection_name not in selected:
+            selected.append(collection_name)
+    return selected or configured_collection_names(config)
+
+
 # 兼容旧名，避免存量调用点/测试破坏。
 _batch_concurrency = batch_concurrency
 
@@ -202,17 +221,25 @@ def _answer_question_with_config(
             model=config.model_name,
         )
         resources.append(query_agent)
+        understanding = query_agent.understand(query)
         embedding_client = EmbeddingClient(
             base_url=config.embedding_base_url,
             api_key=config.embedding_api_key,
             model=config.embedding_model_name,
         )
         resources.append(embedding_client)
+        selected_names = (
+            list(collections)
+            if collections
+            else _collection_names_for_targets(
+                config,
+                understanding.collection_targets,
+            )
+        )
         try:
-            store = (
-                create_retrieval_store(config, collection_names=collections)
-                if collections
-                else create_retrieval_store(config)
+            store = create_retrieval_store(
+                config,
+                collection_names=selected_names,
             )
         except Exception as exc:
             if config.milvus_mode == "lite" and _is_local_index_open_failure(exc):
@@ -243,6 +270,7 @@ def _answer_question_with_config(
             top_n=top_n,
             top_k=top_k,
             trace=trace,
+            understanding=understanding,
         )
     finally:
         _close_resources(resources)

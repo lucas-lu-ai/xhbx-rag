@@ -287,6 +287,34 @@ def test_search_evidence_embeds_rewritten_query_not_raw_query() -> None:
     assert result["results"][0]["rerank_score"] == 0.99
 
 
+def test_search_evidence_reuses_precomputed_understanding() -> None:
+    class _UnexpectedQueryAgent:
+        def understand(self, query: str) -> QueryUnderstanding:
+            raise AssertionError("提供预计算理解结果后不应再次调用 query agent")
+
+    understanding = QueryUnderstanding(
+        intent="script_search",
+        rewritten_query="预计算后的客户开场检索词",
+        needs_retrieval=True,
+        filters=QueryFilters(),
+    )
+    embedding = _FakeEmbedding()
+
+    result = search_evidence(
+        query="原始问题",
+        query_agent=_UnexpectedQueryAgent(),
+        embedding_client=embedding,
+        store=_FakeStore(),
+        reranker=_EmptyReranker(),
+        top_n=20,
+        top_k=5,
+        understanding=understanding,
+    )
+
+    assert embedding.queries == ["预计算后的客户开场检索词"]
+    assert result["rewritten_query"] == "预计算后的客户开场检索词"
+
+
 def test_search_evidence_ignores_chunk_type_filters_for_general_sales_qa() -> None:
     class _GeneralQaAgent:
         def understand(self, query: str) -> QueryUnderstanding:
