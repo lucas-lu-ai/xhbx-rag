@@ -327,6 +327,57 @@ def test_compact_kb_search_results_use_empty_source_fields_for_missing_citation(
     ]
 
 
+def test_compact_kb_search_results_use_empty_content_when_text_is_missing():
+    server = create_mcp_server(
+        searcher=FakeSearcher(result={"results": [{"citations": []}]})
+    )
+
+    payload = _call_tool(
+        server,
+        "kb_search_knowledge",
+        {"query": "客户经营", "kbId": 1, "includeDetails": False},
+    )
+
+    assert payload["data"] == [
+        {"content": "", "source_path": "", "filename": ""}
+    ]
+
+
+@pytest.mark.parametrize(
+    ("citation", "expected_source_path", "expected_filename"),
+    [
+        ({"filename": "a.txt"}, "", "a.txt"),
+        ({"source_path": "案例A/a.txt"}, "案例A/a.txt", ""),
+        ({"source_path": None, "filename": "a.txt"}, "", "a.txt"),
+        ({"source_path": "案例A/a.txt", "filename": None}, "案例A/a.txt", ""),
+    ],
+)
+def test_compact_kb_search_results_use_empty_source_field_when_first_citation_field_is_missing_or_none(
+    citation,
+    expected_source_path,
+    expected_filename,
+):
+    server = create_mcp_server(
+        searcher=FakeSearcher(
+            result={"results": [{"text": "正文", "citations": [citation]}]}
+        )
+    )
+
+    payload = _call_tool(
+        server,
+        "kb_search_knowledge",
+        {"query": "客户经营", "kbId": 1, "includeDetails": False},
+    )
+
+    assert payload["data"] == [
+        {
+            "content": "正文",
+            "source_path": expected_source_path,
+            "filename": expected_filename,
+        }
+    ]
+
+
 def test_kb_search_knowledge_maps_course_kb_to_training_course_filter():
     searcher = FakeSearcher()
     server = create_mcp_server(searcher=searcher)
