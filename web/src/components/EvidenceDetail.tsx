@@ -291,7 +291,7 @@ export function EvidenceDetail({
             const confidence = formatLocatorConfidence(
               citation.locator_confidence
             );
-            // 按钮用紧凑来源（去掉课程章节长路径），完整位置留在下方“位置”块。
+            // 按钮用紧凑来源（去掉课程章节长路径），完整位置留在下方“位置与定位”块。
             const label = [
               formatEvidenceSourceCompact(citation),
               confidence === "精确定位" ? "" : confidence

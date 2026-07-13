@@ -5,6 +5,7 @@ import { useState } from "react";
 import { EvidenceDetail } from "./EvidenceDetail";
 import { runRegisteredCleanups } from "../test-utils";
 import type {
+  Citation,
   EvidenceFeedback,
   EvidenceFeedbackDecision,
   RetrievalEvidence
@@ -140,7 +141,22 @@ test("来源详情合并显示位置与定位且不再提供 Finder 按钮", () 
   ).not.toBeInTheDocument();
 });
 
-test.each([
+const citationBase: Citation = {
+  filename: "片段.txt",
+  source_type: "txt",
+  source_path: "data/片段.txt",
+  display_location: "",
+  display_excerpt: "片段原文",
+  can_reveal: false
+};
+
+const citationLocationCases: Array<{
+  name: string;
+  citation: Partial<
+    Pick<Citation, "display_location" | "locator_confidence">
+  >;
+  expected: string;
+}> = [
   {
     name: "仅有位置",
     citation: { display_location: "L12" },
@@ -156,28 +172,25 @@ test.each([
     citation: {},
     expected: "未提供"
   }
-])("来源详情$name时显示$expected", ({ citation, expected }) => {
-  render(
-    <EvidenceDetail
-      evidence={{
-        ...evidence,
-        citations: [
-          {
-            filename: "片段.txt",
-            source_type: "txt",
-            source_path: "data/片段.txt",
-            display_excerpt: "片段原文",
-            ...citation
-          }
-        ]
-      }}
-      index={0}
-    />
-  );
+];
 
-  expect(screen.getByText("位置与定位")).toBeInTheDocument();
-  expect(screen.getByText(expected)).toBeInTheDocument();
-});
+test.each(citationLocationCases)(
+  "来源详情$name时显示$expected",
+  ({ citation, expected }) => {
+    render(
+      <EvidenceDetail
+        evidence={{
+          ...evidence,
+          citations: [{ ...citationBase, ...citation }]
+        }}
+        index={0}
+      />
+    );
+
+    expect(screen.getByText("位置与定位")).toBeInTheDocument();
+    expect(screen.getByText(expected)).toBeInTheDocument();
+  }
+);
 
 function FeedbackHarness({
   onSubmit = vi.fn().mockResolvedValue(undefined),
