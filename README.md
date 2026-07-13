@@ -471,6 +471,18 @@ WEB_BATCH_CONCURRENCY=3
 
 `WEB_BATCH_CONCURRENCY` 控制 Web 批量问答同时执行的问题数（1-10，默认 3），仅在 `MILVUS_MODE=docker` 时生效；Milvus Lite 是单进程本地文件，lite 模式下批量执行强制串行。
 
+Web 问答检索数量：
+
+```env
+WEB_RETRIEVAL_TOP_N=20
+WEB_RETRIEVAL_TOP_K=5
+```
+
+- `WEB_RETRIEVAL_TOP_N`：Web 单次问答与批量执行的召回数量，默认 `20`，范围 `1–100`。
+- `WEB_RETRIEVAL_TOP_K`：Web 单次问答与批量执行的引用数量，默认 `5`，范围 `1–20`，且不得大于 `WEB_RETRIEVAL_TOP_N`。
+
+这两个值由后端读取并统一下发，知识问答页面不再提供手工输入控件；CLI、MCP 和 A2A 的显式检索参数不受影响。
+
 `MILVUS_MODE` 默认为 `lite`，继续使用 `MILVUS_LITE_PATH` 指向的 Milvus Lite 本地文件。
 
 如需连接本机 Docker Milvus：
