@@ -16,8 +16,7 @@ import {
   failTurn,
   makeStreamingTurn,
   makeTurnId,
-  sessionTitleForQuestion,
-  validateLimits
+  sessionTitleForQuestion
 } from "../chatSessions";
 import type { AnswerResponse, ChatSession, ChatTurn } from "../types";
 import { BadCasePanel } from "./BadCasePanel";
@@ -25,9 +24,6 @@ import { firstEvidenceKey, useEvidenceDetail } from "./EvidenceDetailContext";
 import { MarkdownMessage } from "./MarkdownMessage";
 import { ProcessTimeline } from "./ProcessTimeline";
 import { ThinkingProcess } from "./ThinkingProcess";
-
-const DEFAULT_TOP_N = 20;
-const DEFAULT_TOP_K = 5;
 
 type ChatViewProps = {
   session: ChatSession;
@@ -37,17 +33,19 @@ type ChatViewProps = {
     title?: string
   ) => void;
   selectedCollections?: string[];
+  topN: number;
+  topK: number;
 };
 
 export function ChatView({
   session,
   onUpdateSession,
-  selectedCollections
+  selectedCollections,
+  topN,
+  topK
 }: ChatViewProps) {
   const { onSelectEvidence } = useEvidenceDetail();
   const [query, setQuery] = useState("");
-  const [topN, setTopN] = useState(DEFAULT_TOP_N);
-  const [topK, setTopK] = useState(DEFAULT_TOP_K);
   const [formError, setFormError] = useState("");
   const turns = session.turns;
   // 流式状态从会话 turns 派生，切走再切回同一会话时仍能保持发送/清空守卫。
@@ -68,12 +66,6 @@ export function ChatView({
       setFormError("请输入问题后再发送。");
       return;
     }
-    const limitError = validateLimits(topN, topK);
-    if (limitError) {
-      setFormError(limitError);
-      return;
-    }
-
     if (streaming) {
       return;
     }
@@ -259,34 +251,6 @@ export function ChatView({
           placeholder="客户说每年不能超过80万怎么办？"
         />
         <div className="form-actions">
-          <label className="number-field">
-            <span>召回</span>
-            <input
-              aria-label="召回数量"
-              min={1}
-              max={100}
-              type="number"
-              value={topN}
-              onChange={(event) => {
-                setTopN(Number(event.target.value));
-                setFormError("");
-              }}
-            />
-          </label>
-          <label className="number-field">
-            <span>引用</span>
-            <input
-              aria-label="引用数量"
-              min={1}
-              max={20}
-              type="number"
-              value={topK}
-              onChange={(event) => {
-                setTopK(Number(event.target.value));
-                setFormError("");
-              }}
-            />
-          </label>
           <button className="primary-button" type="submit" disabled={streaming}>
             {streaming ? (
               <LoaderCircle className="spin" size={18} aria-hidden="true" />

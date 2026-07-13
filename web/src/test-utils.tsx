@@ -21,6 +21,8 @@ export const statusPayload = {
   milvus_course_collection: "xhbx_course_chunks",
   milvus_collections: ["xhbx_sales_chunks", "xhbx_course_chunks"],
   batch_concurrency: 1,
+  web_retrieval_top_n: 20,
+  web_retrieval_top_k: 5,
   config: { API_KEY: true },
   errors: []
 };

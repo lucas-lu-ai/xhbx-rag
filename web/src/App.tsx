@@ -80,6 +80,8 @@ const emptyStatus: StatusResponse = {
   milvus_course_collection: "",
   milvus_collections: [],
   batch_concurrency: 1,
+  web_retrieval_top_n: 20,
+  web_retrieval_top_k: 5,
   config: {},
   errors: []
 };
@@ -1170,6 +1172,8 @@ export function App({
             session={activeChatSession}
             onUpdateSession={updateSessionTurns}
             selectedCollections={requestCollections}
+            topN={status.web_retrieval_top_n}
+            topK={status.web_retrieval_top_k}
           />
         )}
       </main>

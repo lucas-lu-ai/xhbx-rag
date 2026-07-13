@@ -11,7 +11,8 @@ import {
   jsonResponse,
   installStorageStub,
   runRegisteredCleanups,
-  sseResponse
+  sseResponse,
+  statusPayload
 } from "./test-utils";
 
 beforeEach(() => {
@@ -23,8 +24,18 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-test("uses default retrieval and citation limits", async () => {
-  installFetchStub();
+test("hides retrieval limit controls and uses status configuration", async () => {
+  const user = userEvent.setup();
+  const { requests } = installFetchStub((url) => {
+    if (url.endsWith("/api/status")) {
+      return jsonResponse({
+        ...statusPayload,
+        web_retrieval_top_n: 30,
+        web_retrieval_top_k: 8
+      });
+    }
+    return null;
+  });
 
   render(<App />);
 
@@ -33,8 +44,17 @@ test("uses default retrieval and citation limits", async () => {
     within(qaPanel).queryByText("销售知识库问答")
   ).not.toBeInTheDocument();
   expect(within(qaPanel).queryByText("xhbx-rag Web")).not.toBeInTheDocument();
-  expect(await screen.findByLabelText("召回数量")).toHaveValue(20);
-  expect(screen.getByLabelText("引用数量")).toHaveValue(5);
+  expect(screen.queryByLabelText("召回数量")).not.toBeInTheDocument();
+  expect(screen.queryByLabelText("引用数量")).not.toBeInTheDocument();
+
+  await user.type(screen.getByLabelText("输入问题"), "客户预算有限怎么办？");
+  await user.click(screen.getByRole("button", { name: "发送" }));
+
+  await waitFor(() => {
+    expect(
+      requests.find((request) => request.url.endsWith("/api/answer/stream"))?.body
+    ).toMatchObject({ top_n: 30, top_k: 8 });
+  });
 });
 
 test("restores persisted sessions after reload", async () => {
@@ -265,6 +285,8 @@ test("submits selected collections from the status dropdown", async () => {
         milvus_course_collection: "xhbx_course_chunks",
         milvus_collections: ["xhbx_sales_chunks", "xhbx_course_chunks"],
         batch_concurrency: 1,
+        web_retrieval_top_n: 20,
+        web_retrieval_top_k: 5,
         config: { API_KEY: true },
         errors: []
       });
@@ -538,22 +560,6 @@ test("does not submit an empty question", async () => {
   await user.click(screen.getByRole("button", { name: "发送" }));
 
   expect(screen.getByText("请输入问题后再发送。")).toBeInTheDocument();
-  expect(
-    requests.filter((request) => request.url.endsWith("/api/answer/stream"))
-  ).toHaveLength(0);
-});
-
-test("validates citation count before submit", async () => {
-  const user = userEvent.setup();
-  const { requests } = installFetchStub();
-  render(<App />);
-
-  await user.clear(screen.getByLabelText("召回数量"));
-  await user.type(screen.getByLabelText("召回数量"), "1");
-  await user.type(screen.getByLabelText("输入问题"), "客户说每年不能超过80万怎么办？");
-  await user.click(screen.getByRole("button", { name: "发送" }));
-
-  expect(screen.getByText("引用数量不能大于召回数量。")).toBeInTheDocument();
   expect(
     requests.filter((request) => request.url.endsWith("/api/answer/stream"))
   ).toHaveLength(0);

@@ -10,6 +10,8 @@ export type StatusResponse = {
   milvus_course_collection?: string;
   milvus_collections?: string[];
   batch_concurrency: number;
+  web_retrieval_top_n: number;
+  web_retrieval_top_k: number;
   config: ConfigStatus;
   errors: string[];
 };
