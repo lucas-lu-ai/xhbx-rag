@@ -110,7 +110,7 @@ class QueryUnderstanding(BaseModel):
 
     @model_validator(mode="after")
     def _reconcile_collection_targets(self) -> "QueryUnderstanding":
-        if not self.needs_retrieval:
+        if not self.needs_retrieval or self.intent == "out_of_scope":
             return self
 
         chunk_types = set(self.filters.chunk_types)

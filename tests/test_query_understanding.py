@@ -296,6 +296,20 @@ def test_query_understanding_does_not_reconcile_targets_when_retrieval_not_neede
     assert result.collection_targets == ["course"]
 
 
+def test_query_understanding_does_not_reconcile_out_of_scope_targets() -> None:
+    result = QueryUnderstanding.model_validate(
+        {
+            "intent": "out_of_scope",
+            "rewritten_query": "查询非保险销售知识",
+            "needs_retrieval": True,
+            "collection_targets": ["course"],
+            "filters": {"chunk_types": ["script"]},
+        }
+    )
+
+    assert result.collection_targets == ["course"]
+
+
 def test_query_understanding_prompt_explains_collection_routing() -> None:
     from xhbx_rag.query_understanding import _SYSTEM_PROMPT
 
