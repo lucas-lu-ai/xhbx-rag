@@ -504,8 +504,12 @@ export function EvidenceDetail({
   const feedbackEvidenceKey = `${index}:${
     evidence.chunk_id ?? evidence.text_preview ?? evidence.text ?? ""
   }`;
-  const feedbackEvidenceKeyRef = useRef(feedbackEvidenceKey);
-  feedbackEvidenceKeyRef.current = feedbackEvidenceKey;
+  const feedbackGenerationRef = useRef(0);
+  const feedbackRequestIdRef = useRef(0);
+  const activeFeedbackRequestRef = useRef<{
+    generation: number;
+    requestId: number;
+  } | null>(null);
   const selectedCitation = citations[citationIndex];
   const meta = formatEvidenceMeta(evidence.metadata);
   const citationNumber = index + 1;
@@ -531,6 +535,8 @@ export function EvidenceDetail({
   ]);
 
   useEffect(() => {
+    feedbackGenerationRef.current += 1;
+    activeFeedbackRequestRef.current = null;
     setSaving(false);
     setFeedbackMessage("");
     setFeedbackError("");
@@ -554,25 +560,33 @@ export function EvidenceDetail({
     if (!onSubmitFeedback) {
       return "failed";
     }
-    const submissionEvidenceKey = feedbackEvidenceKey;
+    const generation = feedbackGenerationRef.current;
+    const requestId = feedbackRequestIdRef.current + 1;
+    feedbackRequestIdRef.current = requestId;
+    activeFeedbackRequestRef.current = { generation, requestId };
+    const isCurrentRequest = () =>
+      feedbackGenerationRef.current === generation &&
+      activeFeedbackRequestRef.current?.generation === generation &&
+      activeFeedbackRequestRef.current.requestId === requestId;
     setSaving(true);
     setFeedbackError("");
     try {
       await onSubmitFeedback(decision);
-      if (feedbackEvidenceKeyRef.current !== submissionEvidenceKey) {
+      if (!isCurrentRequest()) {
         return "stale";
       }
       setFeedbackSaved(true);
       setFeedbackMessage("已记录引用反馈。");
       return "saved";
     } catch (error) {
-      if (feedbackEvidenceKeyRef.current !== submissionEvidenceKey) {
+      if (!isCurrentRequest()) {
         return "stale";
       }
       setFeedbackError(error instanceof Error ? error.message : "无法保存反馈。");
       return "failed";
     } finally {
-      if (feedbackEvidenceKeyRef.current === submissionEvidenceKey) {
+      if (isCurrentRequest()) {
+        activeFeedbackRequestRef.current = null;
         setSaving(false);
       }
     }

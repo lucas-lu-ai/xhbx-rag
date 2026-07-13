@@ -658,6 +658,116 @@ test("切换 evidence 会解除旧 pending 锁定并忽略旧提交结果", asyn
   expect(screen.getByLabelText("引用2召回准确")).not.toBeDisabled();
 });
 
+test("A 到 B 再回 A 时旧成功不会结束或锁定新 A 请求", async () => {
+  const user = userEvent.setup();
+  let resolveA1: (() => void) | undefined;
+  let rejectA2: ((error: Error) => void) | undefined;
+  const onSubmitFeedback = vi
+    .fn()
+    .mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveA1 = resolve;
+        })
+    )
+    .mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectA2 = reject;
+        })
+    );
+  const { rerender } = render(
+    <EvidenceDetail
+      evidence={evidence}
+      index={0}
+      onSubmitFeedback={onSubmitFeedback}
+    />
+  );
+
+  await user.click(screen.getByLabelText("引用1召回准确"));
+  await user.click(screen.getByLabelText("引用1参考正确"));
+  rerender(
+    <EvidenceDetail
+      evidence={{ ...evidence, chunk_id: "c2" }}
+      index={1}
+      onSubmitFeedback={onSubmitFeedback}
+    />
+  );
+  rerender(
+    <EvidenceDetail
+      evidence={evidence}
+      index={0}
+      onSubmitFeedback={onSubmitFeedback}
+    />
+  );
+
+  await user.click(screen.getByLabelText("引用1召回准确"));
+  await user.click(screen.getByLabelText("引用1参考正确"));
+  expect(onSubmitFeedback).toHaveBeenCalledTimes(2);
+
+  await act(async () => {
+    resolveA1?.();
+  });
+  expect(screen.queryByText("已记录引用反馈。")).not.toBeInTheDocument();
+  for (const radio of screen.getAllByRole("radio")) {
+    expect(radio).toBeDisabled();
+  }
+
+  await act(async () => {
+    rejectA2?.(new Error("A2 保存失败"));
+  });
+  expect(screen.getByText("A2 保存失败")).toBeInTheDocument();
+  expect(screen.getByLabelText("引用1参考正确")).not.toBeChecked();
+  expect(screen.getByLabelText("引用1参考正确")).not.toBeDisabled();
+});
+
+test("A 到 B 再回 A 时旧失败不会清空新 A 状态或显示旧错误", async () => {
+  const user = userEvent.setup();
+  let rejectA1: ((error: Error) => void) | undefined;
+  const onSubmitFeedback = vi.fn(
+    () =>
+      new Promise<void>((_resolve, reject) => {
+        rejectA1 = reject;
+      })
+  );
+  const { rerender } = render(
+    <EvidenceDetail
+      evidence={evidence}
+      index={0}
+      onSubmitFeedback={onSubmitFeedback}
+    />
+  );
+
+  await user.click(screen.getByLabelText("引用1召回准确"));
+  await user.click(screen.getByLabelText("引用1参考正确"));
+  rerender(
+    <EvidenceDetail
+      evidence={{ ...evidence, chunk_id: "c2" }}
+      index={1}
+      onSubmitFeedback={onSubmitFeedback}
+    />
+  );
+  rerender(
+    <EvidenceDetail
+      evidence={evidence}
+      index={0}
+      onSubmitFeedback={onSubmitFeedback}
+    />
+  );
+
+  await user.click(screen.getByLabelText("引用1召回准确"));
+  await user.click(screen.getByLabelText("引用1参考不正确"));
+  await user.type(screen.getByLabelText("参考不正确原因"), "新 A 原因");
+
+  await act(async () => {
+    rejectA1?.(new Error("旧 A1 保存失败"));
+  });
+  expect(screen.queryByText("旧 A1 保存失败")).not.toBeInTheDocument();
+  expect(screen.getByLabelText("引用1召回准确")).toBeChecked();
+  expect(screen.getByLabelText("引用1参考不正确")).toBeChecked();
+  expect(screen.getByLabelText("参考不正确原因")).toHaveValue("新 A 原因");
+});
+
 test("没有提交回调时不渲染反馈区", () => {
   render(<EvidenceDetail evidence={evidence} index={0} />);
 
