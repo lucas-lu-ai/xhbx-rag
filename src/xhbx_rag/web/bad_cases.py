@@ -73,6 +73,7 @@ def save_bad_case(
 def validate_evidence_feedback_items(
     values: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
+    feedback_mode: str | None = None
     for value in values:
         has_legacy_judgement = "judgement" in value
         has_new_judgement = (
@@ -80,6 +81,12 @@ def validate_evidence_feedback_items(
         )
         if has_legacy_judgement and has_new_judgement:
             raise ValueError("新旧证据反馈字段不能混用")
+
+        item_mode = "new" if has_new_judgement else "legacy"
+        if feedback_mode is None:
+            feedback_mode = item_mode
+        elif item_mode != feedback_mode:
+            raise ValueError("同一组证据反馈不能混用新旧格式")
 
         retrieval_judgement = value.get("retrieval_judgement")
         answer_usage_judgement = value.get("answer_usage_judgement")

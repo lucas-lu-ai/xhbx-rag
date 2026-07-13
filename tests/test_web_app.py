@@ -823,6 +823,39 @@ def test_bad_case_route_rejects_mixed_legacy_and_new_evidence_feedback(
     assert response.status_code == 422
 
 
+def test_bad_case_route_rejects_mixed_feedback_formats_across_items(
+    monkeypatch,
+) -> None:
+    def fail_if_called(payload: dict):
+        raise AssertionError("save_bad_case should not be called")
+
+    monkeypatch.setattr(web_app, "save_bad_case", fail_if_called)
+    client = TestClient(web_app.create_app())
+
+    response = client.post(
+        "/api/bad-cases",
+        json={
+            "query": "保单整理对客户有什么作用？",
+            "answer": "answer",
+            "top_n": 20,
+            "top_k": 5,
+            "issue_types": ["citation_issue"],
+            "evidence_feedback": [
+                {"chunk_id": "case-a-1", "judgement": "should_use"},
+                {
+                    "chunk_id": "case-a-2",
+                    "retrieval_judgement": "accurate",
+                    "answer_usage_judgement": "correct",
+                },
+            ],
+            "citations": [],
+            "retrieval_evidences": [],
+        },
+    )
+
+    assert response.status_code == 422
+
+
 @pytest.mark.parametrize(
     "feedback",
     [

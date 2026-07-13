@@ -459,6 +459,35 @@ def test_bad_case_route_rejects_unsafe_evidence_feedback_values(
     assert store.get_question(run_id, 1)["bad_case"] is None
 
 
+def test_bad_case_route_rejects_mixed_feedback_formats_across_items(
+    tmp_path: Path, monkeypatch
+) -> None:
+    client, store, _ = _make_client(tmp_path)
+    run_id = client.post("/api/batch-runs", json=_create_payload()).json()["run_id"]
+    _fail_first_row(store, run_id)
+
+    def fail_if_called(payload: dict, **kwargs) -> dict:
+        raise AssertionError("save_bad_case 不应被调用")
+
+    monkeypatch.setattr(batch_routes, "save_bad_case", fail_if_called)
+    response = client.post(
+        f"/api/batch-runs/{run_id}/rows/1/bad-case",
+        json=_bad_case_payload(
+            evidence_feedback=[
+                {"chunk_id": "case-a-1", "judgement": "should_use"},
+                {
+                    "chunk_id": "case-a-2",
+                    "retrieval_judgement": "accurate",
+                    "answer_usage_judgement": "correct",
+                },
+            ]
+        ),
+    )
+
+    assert response.status_code == 422
+    assert store.get_question(run_id, 1)["bad_case"] is None
+
+
 def test_bad_case_route_rolls_back_cache_when_jsonl_fails(
     tmp_path: Path, monkeypatch
 ) -> None:
