@@ -257,7 +257,15 @@ test("批量会话轮询进度直到终态并展示行状态", async () => {
   const completedDetail = batchRunDetail({
     status: "completed",
     question_done: 1,
-    questions: [batchRunQuestionDetail({ status: "succeeded" })]
+    questions: [
+      batchRunQuestionDetail({
+        status: "succeeded",
+        response: {
+          ...answerPayload,
+          answer: "先**承接预算**：\n\n- 讨论缴费期\n- 对齐保障缺口"
+        }
+      })
+    ]
   });
   const detailQueue = [pendingDetail, runningDetail, completedDetail];
   const progressQueue: BatchRunProgress[] = [
@@ -296,9 +304,13 @@ test("批量会话轮询进度直到终态并展示行状态", async () => {
       name: /客户说每年不能超过80万怎么办？/
     })
   );
-  expect(
-    await screen.findByText("先承接预算，再讨论缴费期和保障缺口。")
-  ).toBeInTheDocument();
+  expect(await screen.findByText("承接预算")).toHaveProperty(
+    "tagName",
+    "STRONG"
+  );
+  const answerListItem = screen.getByText("讨论缴费期");
+  expect(answerListItem).toHaveProperty("tagName", "LI");
+  expect(answerListItem.parentElement).toHaveProperty("tagName", "UL");
   // “人工答案”既是区块标签又是夹具内容，允许多处命中。
   expect(screen.getAllByText("人工答案").length).toBeGreaterThan(0);
   expect(screen.getByText("返回列表")).toBeInTheDocument();

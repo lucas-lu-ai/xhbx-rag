@@ -40,6 +40,7 @@ import type {
   BatchRunQuestionDetail
 } from "../types";
 import { BadCasePanel } from "./BadCasePanel";
+import { MarkdownMessage } from "./MarkdownMessage";
 import { firstEvidenceKey, useEvidenceDetail } from "./EvidenceDetailContext";
 
 type BatchRunViewProps = {
@@ -313,7 +314,9 @@ export function BatchRunView({
             {openQuestion.error && (
               <p className="form-error">{openQuestion.error}</p>
             )}
-            {openQuestion.response && <p>{openQuestion.response.answer}</p>}
+            {openQuestion.response && (
+              <MarkdownMessage content={openQuestion.response.answer} />
+            )}
             {openQuestion.response?.rewritten_query && (
               <p className="meta-text">
                 改写问题：{openQuestion.response.rewritten_query}
