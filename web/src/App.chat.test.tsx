@@ -376,6 +376,86 @@ test.each([0, 1.5, 99])(
   }
 );
 
+test.each([
+  {
+    latestCase: "没有引用",
+    latestResponse: { ...answerPayload, citations: [] }
+  },
+  {
+    latestCase: "只有不可映射引用",
+    latestResponse: {
+      ...answerPayload,
+      citations: [
+        {
+          ...answerPayload.citations[0],
+          selected: true,
+          evidence_index: 99
+        }
+      ]
+    }
+  }
+])(
+  "多轮聊天最新轮$latestCase时仍提示查看旧轮知识引用",
+  async ({ latestResponse }) => {
+    const user = userEvent.setup();
+    localStorage.setItem(
+      "xhbx-rag.chat-sessions.v1",
+      JSON.stringify({
+        version: 1,
+        active_session_id: "session-1",
+        sessions: [
+          {
+            id: "session-1",
+            title: "多轮回答",
+            created_at: "2026-07-01T08:00:00.000Z",
+            updated_at: "2026-07-01T08:02:00.000Z",
+            turns: [
+              {
+                id: "turn-1",
+                query: "第一轮问题",
+                top_n: 20,
+                top_k: 10,
+                response: answerPayload
+              },
+              {
+                id: "turn-2",
+                query: "第二轮问题",
+                top_n: 20,
+                top_k: 10,
+                response: latestResponse
+              }
+            ]
+          }
+        ]
+      })
+    );
+    installFetchStub();
+    render(<App />);
+
+    expect(await screen.findByText("案例知识库")).toBeInTheDocument();
+    const detailPane = screen.getByRole("complementary", {
+      name: "索引和溯源"
+    });
+    expect(
+      within(detailPane).getByText("点击一条知识引用查看明细。")
+    ).toBeInTheDocument();
+    expect(
+      within(detailPane).queryByText("暂无引用。")
+    ).not.toBeInTheDocument();
+
+    const toggle = screen.getByRole("button", { name: /知识引用/ });
+    await user.click(toggle);
+    const evidenceList = screen.getByRole("region", {
+      name: "知识引用列表"
+    });
+    expect(
+      within(evidenceList).getByRole("button", {
+        name: /案例A · 需求分析/
+      })
+    ).toBeInTheDocument();
+  }
+);
+
 test("loads status and submits a question", async () => {
   const user = userEvent.setup();
   const { requests } = installFetchStub();

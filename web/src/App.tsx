@@ -21,7 +21,6 @@ import {
   createEmptySession,
   deleteSessionFromStore,
   findActiveSession,
-  latestResponseFromTurns,
   loadChatSessions,
   mostRecentlyUpdatedSession,
   persistChatSessions,
@@ -788,19 +787,21 @@ export function App({
     });
   }
 
-  const chatLatestResponse = useMemo(
-    () => latestResponseFromTurns(activeChatSession.turns),
-    [activeChatSession.turns]
-  );
-  const hasChatCitations =
-    effectiveSelection.kind === "chat" &&
-    Boolean(
-      chatLatestResponse &&
-        citedEvidenceEntries(
-          chatLatestResponse.retrieval_evidences ?? [],
-          citedEvidenceIndexes(chatLatestResponse.citations)
-        ).length > 0
-    );
+  const hasChatCitations = useMemo(() => {
+    if (effectiveSelection.kind !== "chat") {
+      return false;
+    }
+    return activeChatSession.turns.some((turn) => {
+      const response = turn.response;
+      return Boolean(
+        response &&
+          citedEvidenceEntries(
+            response.retrieval_evidences ?? [],
+            citedEvidenceIndexes(response.citations)
+          ).length > 0
+      );
+    });
+  }, [activeChatSession.turns, effectiveSelection.kind]);
 
   function navigateWorkspace(view: WorkspaceLocation["view"]) {
     navigateWorkspaceLocation(view === "chat" ? { view: "chat" } : { view: "ingestion" });
