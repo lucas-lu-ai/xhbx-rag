@@ -160,6 +160,13 @@ test("点击应该用立即选中并落地正向 bad case", async () => {
   expect(screen.getByLabelText("证据 1 应该用")).toBeChecked();
   expect(onSubmitUseful).toHaveBeenCalledTimes(1);
   expect(await screen.findByText("已记录可用反馈。")).toBeInTheDocument();
+  expect(screen.getByLabelText("证据 1 应该用")).toBeDisabled();
+  expect(screen.getByLabelText("证据 1 不该用")).toBeDisabled();
+
+  await user.click(screen.getByLabelText("证据 1 不该用"));
+
+  expect(onSubmitUseful).toHaveBeenCalledTimes(1);
+  expect(screen.queryByLabelText("不可用理由")).not.toBeInTheDocument();
 });
 
 // 受控 harness：复刻 BadCasePanel 的 toggle 语义（同判定再点取消、不同判定覆盖），
@@ -168,7 +175,7 @@ function FeedbackHarness({
   onSubmitUseful,
   onSubmitNotUseful
 }: {
-  onSubmitUseful?: () => Promise<void>;
+  onSubmitUseful?: (() => Promise<void>) | null;
   onSubmitNotUseful?: (reason: string) => Promise<void>;
 }) {
   const [judgement, setJudgement] = useState<
@@ -183,7 +190,11 @@ function FeedbackHarness({
       onToggleFeedback={(next) =>
         setJudgement((current) => (current === next ? undefined : next))
       }
-      onSubmitUseful={onSubmitUseful ?? vi.fn().mockResolvedValue(undefined)}
+      onSubmitUseful={
+        onSubmitUseful === null
+          ? undefined
+          : (onSubmitUseful ?? vi.fn().mockResolvedValue(undefined))
+      }
       onSubmitNotUseful={onSubmitNotUseful ?? vi.fn().mockResolvedValue(undefined)}
     />
   );
@@ -213,11 +224,35 @@ test("点击不该用立即选中并展开理由输入，保存后提交理由",
   expect(await screen.findByText("已记录不可用反馈。")).toBeInTheDocument();
   expect(screen.queryByLabelText("不可用理由")).not.toBeInTheDocument();
   expect(screen.getByLabelText("证据 1 不该用")).toBeChecked();
+  expect(screen.getByLabelText("证据 1 应该用")).toBeDisabled();
+  expect(screen.getByLabelText("证据 1 不该用")).toBeDisabled();
+});
+
+test("反馈保存失败后不锁定选项并允许重试", async () => {
+  const user = userEvent.setup();
+  const onSubmitUseful = vi
+    .fn()
+    .mockRejectedValueOnce(new Error("保存失败"))
+    .mockResolvedValueOnce(undefined);
+  render(<FeedbackHarness onSubmitUseful={onSubmitUseful} />);
+
+  await user.click(screen.getByLabelText("证据 1 应该用"));
+
+  expect(screen.getByLabelText("证据 1 应该用")).not.toBeDisabled();
+  expect(screen.getByLabelText("证据 1 不该用")).not.toBeDisabled();
+
+  await user.click(screen.getByLabelText("证据 1 应该用"));
+  await user.click(screen.getByLabelText("证据 1 应该用"));
+
+  expect(onSubmitUseful).toHaveBeenCalledTimes(2);
+  expect(await screen.findByText("已记录可用反馈。")).toBeInTheDocument();
+  expect(screen.getByLabelText("证据 1 应该用")).toBeDisabled();
+  expect(screen.getByLabelText("证据 1 不该用")).toBeDisabled();
 });
 
 test("应该用与不该用单选互斥", async () => {
   const user = userEvent.setup();
-  render(<FeedbackHarness />);
+  render(<FeedbackHarness onSubmitUseful={null} />);
 
   await user.click(screen.getByLabelText("证据 1 应该用"));
   expect(screen.getByLabelText("证据 1 应该用")).toBeChecked();
@@ -236,7 +271,12 @@ test("应该用与不该用单选互斥", async () => {
 test("取消理由输入恢复之前的判定且不提交", async () => {
   const user = userEvent.setup();
   const onSubmitNotUseful = vi.fn();
-  render(<FeedbackHarness onSubmitNotUseful={onSubmitNotUseful} />);
+  render(
+    <FeedbackHarness
+      onSubmitUseful={null}
+      onSubmitNotUseful={onSubmitNotUseful}
+    />
+  );
 
   await user.click(screen.getByLabelText("证据 1 应该用"));
   await user.click(screen.getByLabelText("证据 1 不该用"));

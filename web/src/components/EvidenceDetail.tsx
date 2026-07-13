@@ -456,6 +456,7 @@ export function EvidenceDetail({
   const [reasonOpen, setReasonOpen] = useState(false);
   const [reason, setReason] = useState("");
   const [saving, setSaving] = useState(false);
+  const [feedbackSaved, setFeedbackSaved] = useState(false);
   const [feedbackMessage, setFeedbackMessage] = useState("");
   const [feedbackError, setFeedbackError] = useState("");
   // 打开理由框前的判定，取消时恢复（应该用/不该用是单选互斥）。
@@ -489,6 +490,7 @@ export function EvidenceDetail({
     setSaving(true);
     try {
       await onSubmitUseful();
+      setFeedbackSaved(true);
       setFeedbackMessage("已记录可用反馈。");
     } catch (error) {
       setFeedbackError(error instanceof Error ? error.message : "无法保存反馈。");
@@ -534,6 +536,7 @@ export function EvidenceDetail({
     setFeedbackError("");
     try {
       await onSubmitNotUseful(trimmed);
+      setFeedbackSaved(true);
       setReasonOpen(false);
       setReason("");
       setFeedbackMessage("已记录不可用反馈。");
@@ -711,7 +714,7 @@ export function EvidenceDetail({
               type="checkbox"
               aria-label={`证据 ${index + 1} 应该用`}
               checked={feedbackJudgement === "should_use"}
-              disabled={saving}
+              disabled={saving || feedbackSaved}
               onChange={() => void handleUsefulToggle()}
             />
             <span>应该用</span>
@@ -721,7 +724,7 @@ export function EvidenceDetail({
               type="checkbox"
               aria-label={`证据 ${index + 1} 不该用`}
               checked={feedbackJudgement === "should_not_use"}
-              disabled={saving}
+              disabled={saving || feedbackSaved}
               onChange={handleNotUsefulToggle}
             />
             <span>不该用</span>
