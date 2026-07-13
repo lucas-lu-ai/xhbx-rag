@@ -2,18 +2,18 @@
 
 ## 目标
 
-为新版 `kb_search_knowledge` 增加按请求切换返回结构的能力。默认保持现有完整结构，避免破坏已有调用方；调用方明确关闭详情后，每条检索结果只返回正文和第一条引用来源。
+为新版 `kb_search_knowledge` 增加按请求切换返回结构的能力。默认返回正文和第一条引用来源；调用方明确开启详情后返回现有完整结构。
 
 ## 接口设计
 
 `kb_search_knowledge` 新增布尔参数：
 
 ```python
-includeDetails: bool = True
+includeDetails: bool = False
 ```
 
+- `includeDetails=false`：默认值；沿用外层 `McpResponse`，但 `data` 中每条结果只包含 `content`、`source_path`、`filename`。
 - `includeDetails=true`：沿用当前完整的 `McpResponse` 和 `data` 条目结构。
-- `includeDetails=false`：仍沿用外层 `McpResponse`，但 `data` 中每条结果只包含 `content`、`source_path`、`filename`。
 - 旧版 `search_knowledge` 不变。
 
 精简模式的成功响应示例：
@@ -50,10 +50,9 @@ includeDetails: bool = True
 
 在 MCP 服务测试中覆盖：
 
-1. 不传 `includeDetails` 时仍返回原完整结构。
-2. 显式传 `includeDetails=true` 时返回原完整结构。
-3. 传 `includeDetails=false` 时仅返回三个指定字段。
+1. 不传 `includeDetails` 时仅返回三个指定字段。
+2. 显式传 `includeDetails=false` 时仅返回三个指定字段。
+3. 显式传 `includeDetails=true` 时返回原完整结构。
 4. 多条 citation 时只使用第一条。
 5. 无 citation 或 citation 字段缺失时返回空字符串。
-6. 工具输入 schema 暴露 `includeDetails`，默认值为 `true`。
-
+6. 工具输入 schema 暴露 `includeDetails`，默认值为 `false`。
