@@ -20,13 +20,11 @@ import { EvidenceDetailContext } from "./EvidenceDetailContext";
 vi.mock("./EvidenceDetail", () => ({
   EvidenceDetail: ({
     evidence,
-    relatedEvidences,
     index,
     feedback,
     onSubmitFeedback
   }: {
     evidence: RetrievalEvidence;
-    relatedEvidences: RetrievalEvidence[];
     index: number;
     feedback?: EvidenceFeedback;
     onSubmitFeedback: (decision: EvidenceFeedbackDecision) => Promise<void>;
@@ -35,7 +33,6 @@ vi.mock("./EvidenceDetail", () => ({
       data-testid="mock-evidence-detail"
       data-index={index}
       data-chunk-id={evidence.chunk_id}
-      data-related-count={relatedEvidences.length}
     >
       <span data-testid="mock-feedback">
         {feedback ? JSON.stringify(feedback) : ""}
@@ -247,7 +244,6 @@ test("准确且参考正确映射为 usable，并保留完整证据", async () =
   expect(portalContainer).toContainElement(detail);
   expect(detail).toHaveAttribute("data-index", "1");
   expect(detail).toHaveAttribute("data-chunk-id", "chunk-3");
-  expect(detail).toHaveAttribute("data-related-count", "3");
 
   fireEvent.click(
     screen.getByRole("button", { name: "提交准确且参考正确" })

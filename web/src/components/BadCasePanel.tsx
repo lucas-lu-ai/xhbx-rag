@@ -154,7 +154,6 @@ export function BadCasePanel({
           <EvidenceDetail
             key={selectedEvidenceKey}
             evidence={selectedEntry.evidence}
-            relatedEvidences={evidences}
             index={selectedEntry.displayIndex}
             feedback={
               evidenceFeedback[
