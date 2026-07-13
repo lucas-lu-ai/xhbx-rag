@@ -176,6 +176,7 @@ def test_kb_search_knowledge_exposes_documented_parameters():
     assert properties["retrievalMode"]["default"] == "HYBRID"
     assert properties["hybridWeights"]["default"] is None
     assert properties["topK"]["default"] == 10
+    assert properties["includeDetails"]["default"] is False
     assert search_tool.inputSchema["required"] == ["query", "kbId"]
 
 
@@ -204,7 +205,12 @@ def test_kb_search_knowledge_returns_wrapped_slice_results():
     payload = _call_tool(
         server,
         "kb_search_knowledge",
-        {"query": "预算异议怎么处理", "kbId": 1, "topK": 5},
+        {
+            "query": "预算异议怎么处理",
+            "kbId": 1,
+            "topK": 5,
+            "includeDetails": True,
+        },
     )
 
     assert payload["success"] is True
@@ -244,6 +250,80 @@ def test_kb_search_knowledge_returns_wrapped_slice_results():
                 ]
             },
         }
+    ]
+
+
+def test_kb_search_knowledge_returns_full_results_when_details_enabled():
+    searcher = FakeSearcher(
+        result={"results": [{"chunk_id": "c1", "text": "完整正文"}]}
+    )
+    server = create_mcp_server(searcher=searcher)
+
+    payload = _call_tool(
+        server,
+        "kb_search_knowledge",
+        {"query": "客户经营", "kbId": 1, "includeDetails": True},
+    )
+
+    assert payload["data"][0]["id"] == "c1"
+    assert payload["data"][0]["slice"]["fullContent"] == "完整正文"
+
+
+@pytest.mark.parametrize("details_argument", [{}, {"includeDetails": False}])
+def test_kb_search_knowledge_returns_only_compact_fields_by_default_or_when_disabled(
+    details_argument,
+):
+    searcher = FakeSearcher(
+        result={
+            "results": [
+                {
+                    "chunk_id": "c1",
+                    "text": "完整正文",
+                    "citations": [
+                        {"source_path": "案例A/a.txt", "filename": "a.txt"},
+                        {"source_path": "案例B/b.txt", "filename": "b.txt"},
+                    ],
+                }
+            ]
+        }
+    )
+    server = create_mcp_server(searcher=searcher)
+
+    payload = _call_tool(
+        server,
+        "kb_search_knowledge",
+        {"query": "客户经营", "kbId": 1, **details_argument},
+    )
+
+    assert payload["data"] == [
+        {
+            "content": "完整正文",
+            "source_path": "案例A/a.txt",
+            "filename": "a.txt",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "citations",
+    [None, [], ["不是对象"], [{}]],
+)
+def test_compact_kb_search_results_use_empty_source_fields_for_missing_citation(
+    citations,
+):
+    raw = {"text": "正文"}
+    if citations is not None:
+        raw["citations"] = citations
+    server = create_mcp_server(searcher=FakeSearcher(result={"results": [raw]}))
+
+    payload = _call_tool(
+        server,
+        "kb_search_knowledge",
+        {"query": "客户经营", "kbId": 1, "includeDetails": False},
+    )
+
+    assert payload["data"] == [
+        {"content": "正文", "source_path": "", "filename": ""}
     ]
 
 

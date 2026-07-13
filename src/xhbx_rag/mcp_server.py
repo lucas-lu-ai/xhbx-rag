@@ -270,6 +270,7 @@ def create_mcp_server(
         retrievalMode: str = SUPPORTED_KB_RETRIEVAL_MODE,
         hybridWeights: dict[str, Any] | None = None,
         topK: int = DEFAULT_KB_TOP_K,
+        includeDetails: bool = False,
     ) -> dict:
         stripped_query = str(query or "").strip()
         if not stripped_query:
@@ -305,7 +306,12 @@ def create_mcp_server(
             )
         except Exception as exc:
             return _mcp_error("500", _safe_error_message(exc))
-        return _mcp_success(_format_kb_search_results(result))
+        formatted = (
+            _format_kb_search_results(result)
+            if includeDetails
+            else _format_compact_kb_search_results(result)
+        )
+        return _mcp_success(formatted)
 
     def search_knowledge(
         query: str,
@@ -452,6 +458,34 @@ def _normalize_knowledge_types(knowledge_types: list[str] | None) -> list[str]:
         for knowledge_type in knowledge_types
         if str(knowledge_type).strip()
     ]
+
+
+def _format_compact_kb_search_results(
+    result: dict[str, Any],
+) -> list[dict[str, str]]:
+    items: list[dict[str, str]] = []
+    raw_results = result.get("results", [])
+    if not isinstance(raw_results, list):
+        return items
+    for raw in raw_results:
+        if not isinstance(raw, dict):
+            continue
+        citations = raw.get("citations")
+        first_citation = (
+            citations[0]
+            if isinstance(citations, list)
+            and citations
+            and isinstance(citations[0], dict)
+            else {}
+        )
+        items.append(
+            {
+                "content": str(raw.get("text") or ""),
+                "source_path": str(first_citation.get("source_path") or ""),
+                "filename": str(first_citation.get("filename") or ""),
+            }
+        )
+    return items
 
 
 def _format_kb_search_results(result: dict[str, Any]) -> list[dict[str, Any]]:
