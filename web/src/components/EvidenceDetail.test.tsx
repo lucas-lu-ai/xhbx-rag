@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 
 import { EvidenceDetail } from "./EvidenceDetail";
-import { installFetchStub, runRegisteredCleanups } from "../test-utils";
+import { runRegisteredCleanups } from "../test-utils";
 import type {
   EvidenceFeedback,
   EvidenceFeedbackDecision,
@@ -128,20 +128,55 @@ test("默认展示第一条来源摘录，点击其它引用切换", async () =>
   expect(screen.getByText("第二条引用原文")).toBeInTheDocument();
 });
 
-test("在 Finder 中显示文件调用 reveal 接口", async () => {
-  const user = userEvent.setup();
-  const { requests } = installFetchStub();
+test("来源详情合并显示位置与定位且不再提供 Finder 按钮", () => {
   render(<EvidenceDetail evidence={evidence} index={0} />);
 
-  await user.click(screen.getByRole("button", { name: "在 Finder 中显示文件" }));
+  expect(screen.getByText("位置与定位")).toBeInTheDocument();
+  expect(screen.getByText("L1 · 精确定位")).toBeInTheDocument();
+  expect(screen.queryByText("位置")).not.toBeInTheDocument();
+  expect(screen.queryByText("定位")).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole("button", { name: "在 Finder 中显示文件" })
+  ).not.toBeInTheDocument();
+});
 
-  expect(await screen.findByText("已在 Finder 中显示文件。")).toBeInTheDocument();
-  expect(requests).toContainEqual(
-    expect.objectContaining({
-      url: "/api/source/reveal",
-      body: { source_path: "data/案例A/第2节.track-0.txt" }
-    })
+test.each([
+  {
+    name: "仅有位置",
+    citation: { display_location: "L12" },
+    expected: "L12"
+  },
+  {
+    name: "仅有定位置信度",
+    citation: { locator_confidence: "approximate" },
+    expected: "近似定位"
+  },
+  {
+    name: "位置和定位置信度均缺失",
+    citation: {},
+    expected: "未提供"
+  }
+])("来源详情$name时显示$expected", ({ citation, expected }) => {
+  render(
+    <EvidenceDetail
+      evidence={{
+        ...evidence,
+        citations: [
+          {
+            filename: "片段.txt",
+            source_type: "txt",
+            source_path: "data/片段.txt",
+            display_excerpt: "片段原文",
+            ...citation
+          }
+        ]
+      }}
+      index={0}
+    />
   );
+
+  expect(screen.getByText("位置与定位")).toBeInTheDocument();
+  expect(screen.getByText(expected)).toBeInTheDocument();
 });
 
 function FeedbackHarness({

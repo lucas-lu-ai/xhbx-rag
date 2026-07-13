@@ -1,13 +1,11 @@
 import {
   ChevronDown,
   ChevronUp,
-  ExternalLink,
   LoaderCircle,
   Save
 } from "lucide-react";
 import { useEffect, useId, useRef, useState } from "react";
 
-import { revealSource } from "../api";
 import {
   parseEvidenceText,
   type EvidenceTextSegment
@@ -89,7 +87,6 @@ export function EvidenceDetail({
   const citations = dedupeCitations(evidence.citations ?? []);
   const [citationIndex, setCitationIndex] = useState(0);
   const [showAllCitations, setShowAllCitations] = useState(false);
-  const [revealMessage, setRevealMessage] = useState("");
   const [retrievalJudgement, setRetrievalJudgement] = useState<
     RetrievalFeedbackJudgement | undefined
   >(feedback?.retrieval_judgement);
@@ -118,6 +115,14 @@ export function EvidenceDetail({
     requestId: number;
   } | null>(null);
   const selectedCitation = citations[citationIndex];
+  const citationLocation = selectedCitation
+    ? [
+        selectedCitation.display_location,
+        formatLocatorConfidence(selectedCitation.locator_confidence)
+      ]
+        .filter(Boolean)
+        .join(" · ") || "未提供"
+    : "未提供";
   const meta = formatEvidenceMeta(evidence.metadata);
   const citationNumber = index + 1;
   const knowledgeName = meta || "未命名知识";
@@ -265,18 +270,6 @@ export function EvidenceDetail({
         ? "answer"
         : null;
 
-  async function handleReveal() {
-    if (!selectedCitation?.source_path) {
-      return;
-    }
-    try {
-      await revealSource({ source_path: selectedCitation.source_path });
-      setRevealMessage("已在 Finder 中显示文件。");
-    } catch (error) {
-      setRevealMessage(error instanceof Error ? error.message : "无法显示文件。");
-    }
-  }
-
   return (
     <article
       className="evidence-detail"
@@ -318,7 +311,6 @@ export function EvidenceDetail({
                 aria-pressed={itemIndex === citationIndex}
                 onClick={() => {
                   setCitationIndex(itemIndex);
-                  setRevealMessage("");
                 }}
               >
                 {label}
@@ -357,20 +349,9 @@ export function EvidenceDetail({
                 "未知文件"}
             </strong>
           </div>
-          <div className="detail-grid">
-            <div className="detail-block">
-              <span>位置</span>
-              <strong>
-                {selectedCitation.display_location || "未提供精确位置"}
-              </strong>
-            </div>
-            <div className="detail-block">
-              <span>定位</span>
-              <strong>
-                {formatLocatorConfidence(selectedCitation.locator_confidence) ||
-                  "未提供"}
-              </strong>
-            </div>
+          <div className="detail-block">
+            <span>位置与定位</span>
+            <strong>{citationLocation}</strong>
           </div>
           <div className="excerpt-box">
             <span>原文摘录</span>
@@ -380,16 +361,6 @@ export function EvidenceDetail({
                 "没有摘录内容。"}
             </p>
           </div>
-          <button
-            className="secondary-button"
-            type="button"
-            disabled={!selectedCitation.can_reveal}
-            onClick={() => void handleReveal()}
-          >
-            <ExternalLink size={18} aria-hidden="true" />
-            在 Finder 中显示文件
-          </button>
-          {revealMessage && <p className="meta-text">{revealMessage}</p>}
         </div>
       )}
       {onSubmitFeedback && (
