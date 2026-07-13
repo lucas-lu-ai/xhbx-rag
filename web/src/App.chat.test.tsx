@@ -656,7 +656,7 @@ test("streams thinking deltas and collapses them after the answer arrives", asyn
   ).toBeInTheDocument();
 });
 
-test("selects an evidence source and reveals the source file", async () => {
+test("selects an evidence source and shows details without Finder actions", async () => {
   const user = userEvent.setup();
   const { requests } = installFetchStub();
   render(<App />);
@@ -670,16 +670,14 @@ test("selects an evidence source and reveals the source file", async () => {
 
   expect(sourceButton).toHaveAttribute("aria-pressed", "true");
   expect(screen.getByText("data/案例A/第2节.track-0.txt")).toBeInTheDocument();
-
-  await user.click(screen.getByRole("button", { name: "在 Finder 中显示文件" }));
-
-  expect(await screen.findByText("已在 Finder 中显示文件。")).toBeInTheDocument();
-  expect(requests).toContainEqual(
-    expect.objectContaining({
-      url: "/api/source/reveal",
-      body: { source_path: "data/案例A/第2节.track-0.txt" }
-    })
-  );
+  expect(screen.getByText("位置与定位")).toBeInTheDocument();
+  expect(screen.getByText("L1")).toBeInTheDocument();
+  expect(
+    screen.queryByRole("button", { name: "在 Finder 中显示文件" })
+  ).not.toBeInTheDocument();
+  expect(
+    requests.some(({ url }) => url.endsWith("/api/source/reveal"))
+  ).toBe(false);
 });
 
 test("shows retrieval evidence used by the answer model", async () => {
