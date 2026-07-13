@@ -40,7 +40,7 @@ export function evidenceIndexForPrefix(
 }
 
 // 从答案级引用（selected=true）收集被答案引用的证据序号（1-based）。
-// 旧数据没有 selected/evidence_index 标记时返回空集合，仅少一个徽标不影响展示。
+// 旧数据没有 selected/evidence_index 标记时无法识别模型实际引用，因此不展示或自动选择引用证据。
 export function citedEvidenceIndexes(citations: Citation[]): Set<number> {
   const indexes = new Set<number>();
   for (const citation of citations) {

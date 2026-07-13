@@ -44,9 +44,15 @@ test("引用视图按原始证据顺序保留索引并生成连续可见序号",
 });
 
 test("默认选中第一条实际引用的证据", () => {
+  const nonLeadingCitations = [citations[0], citations[1]];
+
   expect(
-    evidenceDetailContext.firstEvidenceKey("turn-1", citations, evidences)
-  ).toBe("turn-1:evidence-0");
+    evidenceDetailContext.firstEvidenceKey(
+      "turn-1",
+      nonLeadingCitations,
+      evidences
+    )
+  ).toBe("turn-1:evidence-2");
 });
 
 test("没有实际引用时不回退选中召回证据", () => {
@@ -64,5 +70,44 @@ test("没有实际引用时不回退选中召回证据", () => {
   ).toBeNull();
   expect(
     evidenceDetailContext.firstEvidenceKey("turn-1", [], evidences)
+  ).toBeNull();
+});
+
+test("重复引用同一证据时只生成一条引用视图", () => {
+  const duplicateCitations: Citation[] = [
+    citations[0],
+    { ...citations[0] }
+  ];
+
+  expect(
+    evidenceDetailContext.citedEvidenceEntries(
+      evidences,
+      evidenceDetailContext.citedEvidenceIndexes(duplicateCitations)
+    )
+  ).toEqual([
+    { evidence: evidences[2], evidenceIndex: 2, displayIndex: 0 }
+  ]);
+});
+
+test("无效引用索引不生成引用视图且不会自动选中证据", () => {
+  const invalidCitations: Citation[] = [0, -1, 1.5, 4].map(
+    (evidenceIndex) => ({
+      ...citations[0],
+      evidence_index: evidenceIndex
+    })
+  );
+
+  expect(
+    evidenceDetailContext.citedEvidenceEntries(
+      evidences,
+      evidenceDetailContext.citedEvidenceIndexes(invalidCitations)
+    )
+  ).toEqual([]);
+  expect(
+    evidenceDetailContext.firstEvidenceKey(
+      "turn-1",
+      invalidCitations,
+      evidences
+    )
   ).toBeNull();
 });
