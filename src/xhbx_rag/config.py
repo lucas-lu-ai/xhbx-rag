@@ -14,6 +14,12 @@ class ConfigError(ValueError):
 
 
 @dataclass(frozen=True)
+class WebRetrievalLimits:
+    top_n: int = 20
+    top_k: int = 5
+
+
+@dataclass(frozen=True)
 class RetrievalConfig:
     api_key: str
     base_url: str
@@ -180,6 +186,36 @@ def ingestion_limits_from_env(
         max_compression_ratio=ratio,
         max_path_chars=defaults.max_path_chars,
     )
+
+
+def web_retrieval_limits_from_env(
+    env: Mapping[str, str] | None = None,
+    env_file: Path | None = Path(".env"),
+) -> WebRetrievalLimits:
+    values = load_env_values(env=env, env_file=env_file)
+    defaults = WebRetrievalLimits()
+
+    def bounded_int(key: str, default: int, maximum: int) -> int:
+        raw = values.get(key, "").strip()
+        if not raw:
+            return default
+        try:
+            parsed = int(raw)
+        except ValueError as exc:
+            raise ConfigError(
+                f"{key} 必须是 1 到 {maximum} 之间的整数"
+            ) from exc
+        if not 1 <= parsed <= maximum:
+            raise ConfigError(f"{key} 必须是 1 到 {maximum} 之间的整数")
+        return parsed
+
+    limits = WebRetrievalLimits(
+        top_n=bounded_int("WEB_RETRIEVAL_TOP_N", defaults.top_n, 100),
+        top_k=bounded_int("WEB_RETRIEVAL_TOP_K", defaults.top_k, 20),
+    )
+    if limits.top_k > limits.top_n:
+        raise ConfigError("WEB_RETRIEVAL_TOP_K 不能大于 WEB_RETRIEVAL_TOP_N")
+    return limits
 
 
 def _strip_quotes(value: str) -> str:

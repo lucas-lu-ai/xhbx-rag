@@ -2,7 +2,13 @@ from pathlib import Path
 
 import pytest
 
-from xhbx_rag.config import ConfigError, RetrievalConfig, ingestion_limits_from_env
+from xhbx_rag.config import (
+    ConfigError,
+    RetrievalConfig,
+    WebRetrievalLimits,
+    ingestion_limits_from_env,
+    web_retrieval_limits_from_env,
+)
 
 
 def _required_env(**overrides: str) -> dict[str, str]:
@@ -156,6 +162,56 @@ def test_retrieval_config_can_skip_chat_keys_for_mcp_retrieval() -> None:
     assert config.model_name == ""
     assert config.embedding_model_name == "embed"
     assert config.rerank_model_name == "rerank"
+
+
+def test_web_retrieval_limits_use_defaults() -> None:
+    assert web_retrieval_limits_from_env(env={}, env_file=None) == WebRetrievalLimits(
+        top_n=20,
+        top_k=5,
+    )
+
+
+def test_web_retrieval_limits_read_custom_values() -> None:
+    assert web_retrieval_limits_from_env(
+        env={"WEB_RETRIEVAL_TOP_N": "30", "WEB_RETRIEVAL_TOP_K": "8"},
+        env_file=None,
+    ) == WebRetrievalLimits(top_n=30, top_k=8)
+
+
+@pytest.mark.parametrize(
+    ("env", "message"),
+    [
+        (
+            {"WEB_RETRIEVAL_TOP_N": "abc"},
+            "WEB_RETRIEVAL_TOP_N 必须是 1 到 100 之间的整数",
+        ),
+        (
+            {"WEB_RETRIEVAL_TOP_N": "0"},
+            "WEB_RETRIEVAL_TOP_N 必须是 1 到 100 之间的整数",
+        ),
+        (
+            {"WEB_RETRIEVAL_TOP_N": "101"},
+            "WEB_RETRIEVAL_TOP_N 必须是 1 到 100 之间的整数",
+        ),
+        (
+            {"WEB_RETRIEVAL_TOP_K": "0"},
+            "WEB_RETRIEVAL_TOP_K 必须是 1 到 20 之间的整数",
+        ),
+        (
+            {"WEB_RETRIEVAL_TOP_K": "21"},
+            "WEB_RETRIEVAL_TOP_K 必须是 1 到 20 之间的整数",
+        ),
+        (
+            {"WEB_RETRIEVAL_TOP_N": "4", "WEB_RETRIEVAL_TOP_K": "5"},
+            "WEB_RETRIEVAL_TOP_K 不能大于 WEB_RETRIEVAL_TOP_N",
+        ),
+    ],
+)
+def test_web_retrieval_limits_reject_invalid_values(
+    env: dict[str, str], message: str
+) -> None:
+    with pytest.raises(ConfigError, match=message):
+        web_retrieval_limits_from_env(env=env, env_file=None)
 
 
 def test_ingestion_limits_use_defaults_and_read_overrides() -> None:
