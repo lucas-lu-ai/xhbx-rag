@@ -1077,7 +1077,9 @@ dd {
   flex: 1;
   gap: 12px;
   padding: 18px;
+  min-width: 0;
   min-height: 0;
+  overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
 }
@@ -1089,6 +1091,8 @@ dd {
 .source-stack {
   display: grid;
   gap: 10px;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .evidence-section {
@@ -1235,12 +1239,15 @@ dd {
 .evidence-detail-slot {
   display: grid;
   gap: 12px;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .evidence-detail {
   display: grid;
   gap: 10px;
   min-width: 0;
+  max-width: 100%;
 }
 
 .evidence-detail .evidence-text {
@@ -1658,7 +1665,8 @@ dd {
 .evidence-text {
   margin-top: 8px;
   max-height: 220px;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
   color: #26344d;
   font-size: 13px;
   line-height: 1.65;
@@ -1671,6 +1679,8 @@ dd {
   flex-wrap: wrap;
   gap: 6px;
   margin-top: 10px;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .evidence-source-more {
@@ -1702,6 +1712,9 @@ dd {
 }
 
 .evidence-source.selectable {
+  display: block;
+  width: 100%;
+  max-width: 100%;
   min-height: 30px;
   text-align: left;
   white-space: nowrap;

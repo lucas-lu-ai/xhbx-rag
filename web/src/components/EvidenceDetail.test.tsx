@@ -129,6 +129,43 @@ test("默认展示第一条来源摘录，点击其它引用切换", async () =>
   expect(screen.getByText("第二条引用原文")).toBeInTheDocument();
 });
 
+test("长来源按钮保留可省略的样式契约和完整悬停信息", () => {
+  const filename =
+    "超长来源[最终版](含特殊字符)+复核.*-".repeat(6) + "片段.txt";
+  const sourcePath =
+    "data/课程资料/超长章节路径/".repeat(8) + filename;
+  const displayLocation =
+    "第一章 · 第二节 · 客户需求分析与方案设计/".repeat(8) + "L123-L456";
+  const title = `${filename} · ${displayLocation}`;
+
+  render(
+    <EvidenceDetail
+      evidence={{
+        ...evidence,
+        citations: [
+          {
+            filename,
+            source_type: "txt",
+            source_path: sourcePath,
+            display_location: displayLocation,
+            display_excerpt: "长来源摘录",
+            can_reveal: false
+          }
+        ]
+      }}
+      index={0}
+    />
+  );
+
+  const sourceButton = screen.getByTitle(title);
+  expect(sourceButton).toHaveClass("evidence-source", "selectable");
+  expect(sourceButton).toHaveAttribute("title", title);
+  expect(sourceButton).toHaveAttribute(
+    "title",
+    expect.stringContaining(filename)
+  );
+});
+
 test("来源详情合并显示位置与定位且不再提供 Finder 按钮", () => {
   render(<EvidenceDetail evidence={evidence} index={0} />);
 
