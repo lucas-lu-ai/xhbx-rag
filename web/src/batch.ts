@@ -9,12 +9,16 @@ type ParseBatchDelimitedInputArgs = {
   text: string;
   sourceLabel: string;
   sourceFormat: BatchSourceFormat;
+  topN?: number;
+  topK?: number;
 };
 
 type ParseBatchTableInputArgs = {
   rows: unknown[][];
   sourceLabel: string;
   sourceFormat: BatchSourceFormat;
+  topN?: number;
+  topK?: number;
 };
 
 type BuildBackfilledDelimitedTextArgs = {
@@ -33,19 +37,25 @@ export const BATCH_TEMPLATE_FILE_NAME = "批量问题模板.xlsx";
 export function parseBatchDelimitedInput({
   text,
   sourceLabel,
-  sourceFormat
+  sourceFormat,
+  topN = DEFAULT_TOP_N,
+  topK = DEFAULT_TOP_K
 }: ParseBatchDelimitedInputArgs): BatchRunState {
   return parseBatchTableInput({
     rows: parseCommaDelimited(text),
     sourceLabel,
-    sourceFormat
+    sourceFormat,
+    topN,
+    topK
   });
 }
 
 export function parseBatchTableInput({
   rows: rawRows,
   sourceLabel,
-  sourceFormat
+  sourceFormat,
+  topN = DEFAULT_TOP_N,
+  topK = DEFAULT_TOP_K
 }: ParseBatchTableInputArgs): BatchRunState {
   const parsedRows = rawRows.map((row) => row.map(cellToString));
   const headers = parsedRows[0] ?? [];
@@ -68,8 +78,8 @@ export function parseBatchTableInput({
         row_index: rowIndex,
         query,
         input_answer: row[1] ?? "",
-        top_n: DEFAULT_TOP_N,
-        top_k: DEFAULT_TOP_K,
+        top_n: topN,
+        top_k: topK,
         status: "pending",
         process_steps: [],
         streaming_answer: ""

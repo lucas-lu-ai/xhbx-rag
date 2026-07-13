@@ -15,7 +15,8 @@ import {
   jsonResponse,
   makeXlsxFile,
   readXlsxBlob,
-  runRegisteredCleanups
+  runRegisteredCleanups,
+  statusPayload
 } from "./test-utils";
 import type { BatchRunDetail, BatchRunProgress, BatchRunSummary } from "./types";
 
@@ -128,6 +129,13 @@ test("开始批量运行创建服务端任务并切换到批量会话", async ()
   let created = false;
   const { requests } = installFetchStub((url, init) => {
     const method = init?.method ?? "GET";
+    if (url.endsWith("/api/status")) {
+      return jsonResponse({
+        ...statusPayload,
+        web_retrieval_top_n: 30,
+        web_retrieval_top_k: 8
+      });
+    }
     if (url.endsWith("/api/batch-runs") && method === "POST") {
       created = true;
       return jsonResponse(summary, { status: 201 });
@@ -172,8 +180,8 @@ test("开始批量运行创建服务端任务并切换到批量会话", async ()
             row_index: 1,
             query: "客户说每年不能超过80万怎么办？",
             input_answer: "人工答案",
-            top_n: 20,
-            top_k: 5
+            top_n: 30,
+            top_k: 8
           }
         ]
       }

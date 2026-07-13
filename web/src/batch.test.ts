@@ -140,6 +140,18 @@ test("parseBatchTableInput 解析 xlsx 第一张 sheet 的问题和原始答案"
   ]);
 });
 
+test("parseBatchTableInput 使用传入的检索数量", () => {
+  const state = parseBatchTableInput({
+    rows: [["问题", "答案"], ["客户预算有限怎么办？", ""]],
+    sourceLabel: "questions.csv",
+    sourceFormat: "csv",
+    topN: 30,
+    topK: 8
+  });
+
+  expect(state.questions[0]).toMatchObject({ top_n: 30, top_k: 8 });
+});
+
 test("parseBatchDelimitedInput 未闭合引号时报错", () => {
   expect(() =>
     parseBatchDelimitedInput({
@@ -314,4 +326,3 @@ test("download name helpers 基于源文件名和扩展生成导出文件名", (
   expect(backfilledDownloadName("")).toBe("batch-backfilled.csv");
   expect(badCaseJsonlDownloadName("")).toBe("batch-bad-cases.jsonl");
 });
-

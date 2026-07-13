@@ -21,9 +21,11 @@ import type {
 
 type BatchCreateViewProps = {
   onCreated: (summary: BatchRunSummary) => void;
+  topN: number;
+  topK: number;
 };
 
-export function BatchCreateView({ onCreated }: BatchCreateViewProps) {
+export function BatchCreateView({ onCreated, topN, topK }: BatchCreateViewProps) {
   const [batchText, setBatchText] = useState("");
   const [batchState, setBatchState] = useState<BatchRunState | null>(null);
   const [parseError, setParseError] = useState("");
@@ -42,7 +44,9 @@ export function BatchCreateView({ onCreated }: BatchCreateViewProps) {
         parseBatchDelimitedInput({
           text,
           sourceLabel: nextSourceLabel,
-          sourceFormat: nextSourceFormat
+          sourceFormat: nextSourceFormat,
+          topN,
+          topK
         })
       );
       setParseError("");
@@ -87,7 +91,9 @@ export function BatchCreateView({ onCreated }: BatchCreateViewProps) {
         const parsed = parseBatchTableInput({
           rows: tableRows,
           sourceLabel: file.name,
-          sourceFormat: nextSourceFormat
+          sourceFormat: nextSourceFormat,
+          topN,
+          topK
         });
         setBatchText(buildBackfilledDelimitedText(parsed));
         setSourceLabel(file.name);

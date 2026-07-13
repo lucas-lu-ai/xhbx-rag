@@ -1158,7 +1158,11 @@ export function App({
         )}
 
         {creatingBatch ? (
-          <BatchCreateView onCreated={handleBatchCreated} />
+          <BatchCreateView
+            onCreated={handleBatchCreated}
+            topN={status.web_retrieval_top_n}
+            topK={status.web_retrieval_top_k}
+          />
         ) : effectiveSelection.kind === "batch" ? (
           <BatchRunView
             key={effectiveSelection.id}
