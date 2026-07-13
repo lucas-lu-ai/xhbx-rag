@@ -51,16 +51,33 @@ export function citedEvidenceIndexes(citations: Citation[]): Set<number> {
   return indexes;
 }
 
-// 回答完成后自动选中第一条证据：优先被答案引用的，其次第一条。
+export type CitedEvidenceEntry = {
+  evidence: RetrievalEvidence;
+  evidenceIndex: number;
+  displayIndex: number;
+};
+
+export function citedEvidenceEntries(
+  evidences: RetrievalEvidence[],
+  citedIndexes: Set<number>
+): CitedEvidenceEntry[] {
+  const entries: CitedEvidenceEntry[] = [];
+  evidences.forEach((evidence, evidenceIndex) => {
+    if (!citedIndexes.has(evidenceIndex + 1)) return;
+    entries.push({ evidence, evidenceIndex, displayIndex: entries.length });
+  });
+  return entries;
+}
+
+// 回答完成后自动选中第一条被答案实际引用的证据；没有实际引用则不选中。
 export function firstEvidenceKey(
   keyPrefix: string,
   citations: Citation[],
   evidences: RetrievalEvidence[]
 ): string | null {
-  if (evidences.length === 0) {
-    return null;
-  }
-  const cited = citedEvidenceIndexes(citations);
-  const citedIndex = evidences.findIndex((_, index) => cited.has(index + 1));
-  return evidenceKey(keyPrefix, citedIndex >= 0 ? citedIndex : 0);
+  const firstEntry = citedEvidenceEntries(
+    evidences,
+    citedEvidenceIndexes(citations)
+  )[0];
+  return firstEntry ? evidenceKey(keyPrefix, firstEntry.evidenceIndex) : null;
 }
