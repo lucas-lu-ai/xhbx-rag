@@ -28,6 +28,11 @@ test("uses default retrieval and citation limits", async () => {
 
   render(<App />);
 
+  const qaPanel = screen.getByRole("main", { name: "RAG 问答" });
+  expect(
+    within(qaPanel).queryByText("销售知识库问答")
+  ).not.toBeInTheDocument();
+  expect(within(qaPanel).queryByText("xhbx-rag Web")).not.toBeInTheDocument();
   expect(await screen.findByLabelText("召回数量")).toHaveValue(20);
   expect(screen.getByLabelText("引用数量")).toHaveValue(5);
 });

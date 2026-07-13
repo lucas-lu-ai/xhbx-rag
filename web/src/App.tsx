@@ -1148,13 +1148,6 @@ export function App({
       />
 
       <main className="qa-panel" aria-label="RAG 问答">
-        <header className="panel-header">
-          <div>
-            <p className="eyebrow">xhbx-rag Web</p>
-            <h1>销售知识库问答</h1>
-          </div>
-        </header>
-
         {(statusError || status.errors.length > 0) && (
           <div className="status-banner error" role="status">
             <AlertCircle size={18} aria-hidden="true" />

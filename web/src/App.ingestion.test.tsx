@@ -38,6 +38,9 @@ test("打开入库工作台后上传、预检并确认 draft", async () => {
   window.history.replaceState(null, "", "/?view=ingestion");
   render(<App />);
 
+  expect(
+    screen.getByRole("heading", { name: "文档入库工作台" })
+  ).toBeInTheDocument();
   await user.click(screen.getByRole("radio", { name: "案例知识库" }));
   await user.upload(
     screen.getByLabelText("上传文档或 ZIP"),
