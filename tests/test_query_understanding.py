@@ -131,11 +131,14 @@ def test_query_understanding_prompt_mentions_training_course() -> None:
         (["case"], ["case"]),
         (["course"], ["course"]),
         (["course", "case", "course"], ["course", "case"]),
+        ([], ["case", "course"]),
+        (None, ["case", "course"]),
         (["unknown", ""], ["case", "course"]),
+        (["unknown", "case", "unknown"], ["case"]),
     ],
 )
 def test_query_understanding_normalizes_collection_targets(
-    collection_targets: list[str], expected: list[str]
+    collection_targets: list[str] | None, expected: list[str]
 ) -> None:
     result = QueryUnderstanding.model_validate(
         {
@@ -167,8 +170,9 @@ def test_query_understanding_prompt_explains_collection_routing() -> None:
     from xhbx_rag.query_understanding import _SYSTEM_PROMPT
 
     assert "collection_targets" in _SYSTEM_PROMPT
-    assert "case" in _SYSTEM_PROMPT
-    assert "course" in _SYSTEM_PROMPT
+    assert '案例实战、绩优经验类问题选择 ["case"]' in _SYSTEM_PROMPT
+    assert '课程教材、标准流程类问题选择 ["course"]' in _SYSTEM_PROMPT
+    assert '混合问题或无法确定时选择 ["case", "course"]' in _SYSTEM_PROMPT
 
 
 def test_query_understanding_normalizes_empty_filter_arrays_to_blank_strings() -> None:
