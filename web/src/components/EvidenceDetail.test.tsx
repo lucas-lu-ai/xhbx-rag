@@ -5,7 +5,8 @@ import { useState } from "react";
 import { EvidenceDetail } from "./EvidenceDetail";
 import { installFetchStub, runRegisteredCleanups } from "../test-utils";
 import type {
-  EvidenceFeedbackJudgement,
+  EvidenceFeedback,
+  EvidenceFeedbackDecision,
   RetrievalEvidence
 } from "../types";
 
@@ -143,189 +144,296 @@ test("在 Finder 中显示文件调用 reveal 接口", async () => {
   );
 });
 
-test("打标只提供应该用与不该用两个选项", () => {
-  render(
-    <EvidenceDetail
-      evidence={evidence}
-      index={0}
-      feedbackJudgement="should_use"
-      onToggleFeedback={() => {}}
-    />
+function FeedbackHarness({
+  onSubmit = vi.fn().mockResolvedValue(undefined),
+  initialFeedback
+}: {
+  onSubmit?: (decision: EvidenceFeedbackDecision) => Promise<void>;
+  initialFeedback?: EvidenceFeedback;
+}) {
+  const [feedback, setFeedback] = useState<EvidenceFeedback | undefined>(
+    initialFeedback
   );
 
-  expect(screen.getByLabelText("引用1打标")).toBeInTheDocument();
-  expect(screen.getByLabelText("引用1应该用")).toBeChecked();
-  expect(screen.getByLabelText("引用1不该用")).toBeInTheDocument();
-  expect(screen.queryByLabelText("引用1排序太低")).not.toBeInTheDocument();
-});
+  async function handleSubmit(decision: EvidenceFeedbackDecision) {
+    await onSubmit(decision);
+    setFeedback({
+      ...decision,
+      chunk_id: evidence.chunk_id,
+      label: "案例A · 需求分析",
+      text_preview: evidence.text_preview ?? evidence.text ?? ""
+    });
+  }
 
-test("点击应该用立即选中并落地正向 bad case", async () => {
-  const user = userEvent.setup();
-  const onSubmitUseful = vi.fn().mockResolvedValue(undefined);
-  render(<FeedbackHarness onSubmitUseful={onSubmitUseful} />);
-
-  await user.click(screen.getByLabelText("引用1应该用"));
-
-  expect(screen.getByLabelText("引用1应该用")).toBeChecked();
-  expect(onSubmitUseful).toHaveBeenCalledTimes(1);
-  expect(await screen.findByText("已记录可用反馈。")).toBeInTheDocument();
-  expect(screen.getByLabelText("引用1应该用")).toBeDisabled();
-  expect(screen.getByLabelText("引用1不该用")).toBeDisabled();
-
-  await user.click(screen.getByLabelText("引用1不该用"));
-
-  expect(onSubmitUseful).toHaveBeenCalledTimes(1);
-  expect(screen.queryByLabelText("不可用理由")).not.toBeInTheDocument();
-});
-
-// 受控 harness：复刻 BadCasePanel 的 toggle 语义（同判定再点取消、不同判定覆盖），
-// 用于断言应该用/不该用的单选互斥与选中态。
-function FeedbackHarness({
-  onSubmitUseful,
-  onSubmitNotUseful
-}: {
-  onSubmitUseful?: (() => Promise<void>) | null;
-  onSubmitNotUseful?: (reason: string) => Promise<void>;
-}) {
-  const [judgement, setJudgement] = useState<
-    EvidenceFeedbackJudgement | undefined
-  >(undefined);
   return (
     <EvidenceDetail
       evidence={evidence}
       index={0}
-      feedbackJudgement={judgement}
-      onToggleFeedback={(next) =>
-        setJudgement((current) => (current === next ? undefined : next))
-      }
-      onSubmitUseful={
-        onSubmitUseful === null
-          ? undefined
-          : (onSubmitUseful ?? vi.fn().mockResolvedValue(undefined))
-      }
-      onSubmitNotUseful={onSubmitNotUseful ?? vi.fn().mockResolvedValue(undefined)}
+      feedback={feedback}
+      onSubmitFeedback={handleSubmit}
     />
   );
 }
 
-test("点击不该用立即选中并展开理由输入，保存后提交理由", async () => {
-  const user = userEvent.setup();
-  const onSubmitNotUseful = vi.fn().mockResolvedValue(undefined);
-  render(<FeedbackHarness onSubmitNotUseful={onSubmitNotUseful} />);
+test("初始只显示召回准确性维度且使用单选按钮", () => {
+  render(<FeedbackHarness />);
 
-  await user.click(screen.getByLabelText("引用1不该用"));
-  // 点击后立即呈选中态，不等保存。
-  expect(screen.getByLabelText("引用1不该用")).toBeChecked();
-  expect(screen.getByLabelText("不可用理由")).toBeInTheDocument();
-  // 理由为空时不能保存。
   expect(
-    screen.getByRole("button", { name: "保存不可用反馈" })
-  ).toBeDisabled();
-
-  await user.type(
-    screen.getByLabelText("不可用理由"),
-    "该证据与客户问题无关。"
+    screen.getByRole("group", { name: "召回是否准确？" })
+  ).toBeInTheDocument();
+  expect(screen.getByLabelText("引用1召回准确")).toHaveAttribute(
+    "type",
+    "radio"
   );
-  await user.click(screen.getByRole("button", { name: "保存不可用反馈" }));
-
-  expect(onSubmitNotUseful).toHaveBeenCalledWith("该证据与客户问题无关。");
-  expect(await screen.findByText("已记录不可用反馈。")).toBeInTheDocument();
-  expect(screen.queryByLabelText("不可用理由")).not.toBeInTheDocument();
-  expect(screen.getByLabelText("引用1不该用")).toBeChecked();
-  expect(screen.getByLabelText("引用1应该用")).toBeDisabled();
-  expect(screen.getByLabelText("引用1不该用")).toBeDisabled();
+  expect(screen.getByLabelText("引用1召回不准确")).toHaveAttribute(
+    "type",
+    "radio"
+  );
+  expect(
+    screen.queryByRole("group", { name: "回答是否正确参考该引用？" })
+  ).not.toBeInTheDocument();
 });
 
-test("反馈保存失败后不锁定选项并允许重试", async () => {
+test("选择召回准确后显示回答参考维度且不提交", async () => {
   const user = userEvent.setup();
-  const onSubmitUseful = vi
+  const onSubmit = vi.fn().mockResolvedValue(undefined);
+  render(<FeedbackHarness onSubmit={onSubmit} />);
+
+  await user.click(screen.getByLabelText("引用1召回准确"));
+
+  expect(screen.getByLabelText("引用1召回准确")).toBeChecked();
+  expect(
+    screen.getByRole("group", { name: "回答是否正确参考该引用？" })
+  ).toBeInTheDocument();
+  expect(screen.getByLabelText("引用1参考正确")).not.toBeChecked();
+  expect(screen.getByLabelText("引用1参考不正确")).not.toBeChecked();
+  expect(onSubmit).not.toHaveBeenCalled();
+});
+
+test("召回不准确要求填写原因并提交 trimmed payload", async () => {
+  const user = userEvent.setup();
+  const onSubmit = vi.fn().mockResolvedValue(undefined);
+  render(<FeedbackHarness onSubmit={onSubmit} />);
+
+  await user.click(screen.getByLabelText("引用1召回不准确"));
+
+  const reason = screen.getByLabelText("召回不准确原因");
+  expect(reason).toHaveAttribute(
+    "placeholder",
+    "例如：该引用与客户问题无关、客户或案例不匹配，未能回答当前异议。"
+  );
+  expect(screen.getByRole("button", { name: "保存反馈" })).toBeDisabled();
+
+  await user.type(reason, "  该引用与客户问题无关。  ");
+  await user.click(screen.getByRole("button", { name: "保存反馈" }));
+
+  expect(onSubmit).toHaveBeenCalledWith({
+    retrieval_judgement: "inaccurate",
+    answer_usage_judgement: "not_applicable",
+    reason: "该引用与客户问题无关。"
+  });
+  expect(await screen.findByText("已记录引用反馈。")).toBeInTheDocument();
+});
+
+test("参考不正确要求填写原因并提交 trimmed payload", async () => {
+  const user = userEvent.setup();
+  const onSubmit = vi.fn().mockResolvedValue(undefined);
+  render(<FeedbackHarness onSubmit={onSubmit} />);
+
+  await user.click(screen.getByLabelText("引用1召回准确"));
+  await user.click(screen.getByLabelText("引用1参考不正确"));
+
+  const reason = screen.getByLabelText("参考不正确原因");
+  expect(reason).toHaveAttribute(
+    "placeholder",
+    "例如：回答曲解了引用原意、超出证据范围，或遗漏了关键限制。"
+  );
+  expect(screen.getByRole("button", { name: "保存反馈" })).toBeDisabled();
+
+  await user.type(reason, "  回答超出了证据范围。  ");
+  await user.click(screen.getByRole("button", { name: "保存反馈" }));
+
+  expect(onSubmit).toHaveBeenCalledWith({
+    retrieval_judgement: "accurate",
+    answer_usage_judgement: "incorrect",
+    reason: "回答超出了证据范围。"
+  });
+});
+
+test("参考正确时立即提交并在保存后锁定所有单选按钮", async () => {
+  const user = userEvent.setup();
+  const onSubmit = vi.fn().mockResolvedValue(undefined);
+  render(<FeedbackHarness onSubmit={onSubmit} />);
+
+  await user.click(screen.getByLabelText("引用1召回准确"));
+  await user.click(screen.getByLabelText("引用1参考正确"));
+
+  expect(onSubmit).toHaveBeenCalledWith({
+    retrieval_judgement: "accurate",
+    answer_usage_judgement: "correct"
+  });
+  expect(await screen.findByText("已记录引用反馈。")).toBeInTheDocument();
+  for (const radio of screen.getAllByRole("radio")) {
+    expect(radio).toBeDisabled();
+  }
+});
+
+test("切换召回维度会清空不兼容的回答选择与原因", async () => {
+  const user = userEvent.setup();
+  render(<FeedbackHarness />);
+
+  await user.click(screen.getByLabelText("引用1召回准确"));
+  await user.click(screen.getByLabelText("引用1参考不正确"));
+  await user.type(screen.getByLabelText("参考不正确原因"), "填了一半");
+  await user.click(screen.getByLabelText("引用1召回不准确"));
+
+  expect(screen.queryByLabelText("引用1参考不正确")).not.toBeInTheDocument();
+  expect(screen.getByLabelText("召回不准确原因")).toHaveValue("");
+
+  await user.click(screen.getByLabelText("引用1召回准确"));
+  expect(screen.getByLabelText("引用1参考不正确")).not.toBeChecked();
+  expect(screen.queryByLabelText("召回不准确原因")).not.toBeInTheDocument();
+});
+
+test("取消召回负向会清空两个维度与原因", async () => {
+  const user = userEvent.setup();
+  const onSubmit = vi.fn();
+  render(<FeedbackHarness onSubmit={onSubmit} />);
+
+  await user.click(screen.getByLabelText("引用1召回不准确"));
+  await user.type(screen.getByLabelText("召回不准确原因"), "填了一半");
+  await user.click(screen.getByRole("button", { name: "取消" }));
+
+  expect(screen.getByLabelText("引用1召回准确")).not.toBeChecked();
+  expect(screen.getByLabelText("引用1召回不准确")).not.toBeChecked();
+  expect(screen.queryByLabelText("召回不准确原因")).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole("group", { name: "回答是否正确参考该引用？" })
+  ).not.toBeInTheDocument();
+  expect(onSubmit).not.toHaveBeenCalled();
+});
+
+test("取消回答负向会保留召回准确并清空回答与原因", async () => {
+  const user = userEvent.setup();
+  render(<FeedbackHarness />);
+
+  await user.click(screen.getByLabelText("引用1召回准确"));
+  await user.click(screen.getByLabelText("引用1参考不正确"));
+  await user.type(screen.getByLabelText("参考不正确原因"), "填了一半");
+  await user.click(screen.getByRole("button", { name: "取消" }));
+
+  expect(screen.getByLabelText("引用1召回准确")).toBeChecked();
+  expect(screen.getByLabelText("引用1参考正确")).not.toBeChecked();
+  expect(screen.getByLabelText("引用1参考不正确")).not.toBeChecked();
+  expect(screen.queryByLabelText("参考不正确原因")).not.toBeInTheDocument();
+});
+
+test("正向保存失败会清空回答选择并允许重新点击提交", async () => {
+  const user = userEvent.setup();
+  const onSubmit = vi
     .fn()
     .mockRejectedValueOnce(new Error("保存失败"))
     .mockResolvedValueOnce(undefined);
-  render(<FeedbackHarness onSubmitUseful={onSubmitUseful} />);
+  render(<FeedbackHarness onSubmit={onSubmit} />);
 
-  await user.click(screen.getByLabelText("引用1应该用"));
+  await user.click(screen.getByLabelText("引用1召回准确"));
+  await user.click(screen.getByLabelText("引用1参考正确"));
 
-  expect(screen.getByLabelText("引用1应该用")).not.toBeDisabled();
-  expect(screen.getByLabelText("引用1不该用")).not.toBeDisabled();
+  expect(await screen.findByText("保存失败")).toBeInTheDocument();
+  expect(screen.getByLabelText("引用1参考正确")).not.toBeChecked();
+  expect(screen.getByLabelText("引用1参考正确")).not.toBeDisabled();
 
-  await user.click(screen.getByLabelText("引用1应该用"));
-  await user.click(screen.getByLabelText("引用1应该用"));
-
-  expect(onSubmitUseful).toHaveBeenCalledTimes(2);
-  expect(await screen.findByText("已记录可用反馈。")).toBeInTheDocument();
-  expect(screen.getByLabelText("引用1应该用")).toBeDisabled();
-  expect(screen.getByLabelText("引用1不该用")).toBeDisabled();
+  await user.click(screen.getByLabelText("引用1参考正确"));
+  expect(onSubmit).toHaveBeenCalledTimes(2);
+  expect(await screen.findByText("已记录引用反馈。")).toBeInTheDocument();
 });
 
-test("应该用与不该用单选互斥", async () => {
+test("负向保存失败会保留原因表单并允许重试", async () => {
   const user = userEvent.setup();
-  render(<FeedbackHarness onSubmitUseful={null} />);
+  const onSubmit = vi
+    .fn()
+    .mockRejectedValueOnce(new Error("保存失败"))
+    .mockResolvedValueOnce(undefined);
+  render(<FeedbackHarness onSubmit={onSubmit} />);
 
-  await user.click(screen.getByLabelText("引用1应该用"));
-  expect(screen.getByLabelText("引用1应该用")).toBeChecked();
+  await user.click(screen.getByLabelText("引用1召回不准确"));
+  await user.type(screen.getByLabelText("召回不准确原因"), "证据不相关");
+  await user.click(screen.getByRole("button", { name: "保存反馈" }));
 
-  await user.click(screen.getByLabelText("引用1不该用"));
-  expect(screen.getByLabelText("引用1不该用")).toBeChecked();
-  expect(screen.getByLabelText("引用1应该用")).not.toBeChecked();
+  expect(await screen.findByText("保存失败")).toBeInTheDocument();
+  expect(screen.getByLabelText("召回不准确原因")).toHaveValue("证据不相关");
+  expect(screen.getByRole("button", { name: "保存反馈" })).not.toBeDisabled();
 
-  // 反向切回应该用，同时收起理由框。
-  await user.click(screen.getByLabelText("引用1应该用"));
-  expect(screen.getByLabelText("引用1应该用")).toBeChecked();
-  expect(screen.getByLabelText("引用1不该用")).not.toBeChecked();
-  expect(screen.queryByLabelText("不可用理由")).not.toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "保存反馈" }));
+  expect(onSubmit).toHaveBeenCalledTimes(2);
+  expect(await screen.findByText("已记录引用反馈。")).toBeInTheDocument();
 });
 
-test("取消理由输入恢复之前的判定且不提交", async () => {
-  const user = userEvent.setup();
-  const onSubmitNotUseful = vi.fn();
+test("已保存反馈会初始化选择并锁定控件", () => {
   render(
     <FeedbackHarness
-      onSubmitUseful={null}
-      onSubmitNotUseful={onSubmitNotUseful}
+      initialFeedback={{
+        chunk_id: "c1",
+        retrieval_judgement: "accurate",
+        answer_usage_judgement: "incorrect",
+        reason: "回答遗漏了限制",
+        label: "案例A · 需求分析",
+        text_preview: "客户担心预算"
+      }}
     />
   );
 
-  await user.click(screen.getByLabelText("引用1应该用"));
-  await user.click(screen.getByLabelText("引用1不该用"));
-  await user.type(screen.getByLabelText("不可用理由"), "填了一半");
-  await user.click(screen.getByRole("button", { name: "取消" }));
-
-  expect(screen.queryByLabelText("不可用理由")).not.toBeInTheDocument();
-  expect(onSubmitNotUseful).not.toHaveBeenCalled();
-  // 恢复打开理由框之前的“应该用”。
-  expect(screen.getByLabelText("引用1应该用")).toBeChecked();
-  expect(screen.getByLabelText("引用1不该用")).not.toBeChecked();
+  expect(screen.getByLabelText("引用1召回准确")).toBeChecked();
+  expect(screen.getByLabelText("引用1参考不正确")).toBeChecked();
+  expect(screen.queryByLabelText("参考不正确原因")).not.toBeInTheDocument();
+  for (const radio of screen.getAllByRole("radio")) {
+    expect(radio).toBeDisabled();
+  }
 });
 
-test("原本未打标时取消理由输入清空判定", async () => {
-  const user = userEvent.setup();
-  render(<FeedbackHarness />);
+test("切换引用后再返回会恢复对应的已保存选择", () => {
+  const savedFeedback: EvidenceFeedback = {
+    chunk_id: "c1",
+    retrieval_judgement: "accurate",
+    answer_usage_judgement: "correct",
+    label: "案例A · 需求分析",
+    text_preview: "客户担心预算"
+  };
+  const onSubmitFeedback = vi.fn().mockResolvedValue(undefined);
+  const { rerender } = render(
+    <EvidenceDetail
+      evidence={evidence}
+      index={0}
+      feedback={savedFeedback}
+      onSubmitFeedback={onSubmitFeedback}
+    />
+  );
 
-  await user.click(screen.getByLabelText("引用1不该用"));
-  await user.click(screen.getByRole("button", { name: "取消" }));
+  rerender(
+    <EvidenceDetail
+      evidence={{ ...evidence, chunk_id: "c2" }}
+      index={1}
+      onSubmitFeedback={onSubmitFeedback}
+    />
+  );
+  expect(screen.getByLabelText("引用2召回准确")).not.toBeChecked();
 
-  expect(screen.getByLabelText("引用1不该用")).not.toBeChecked();
-  expect(screen.getByLabelText("引用1应该用")).not.toBeChecked();
+  rerender(
+    <EvidenceDetail
+      evidence={evidence}
+      index={0}
+      feedback={savedFeedback}
+      onSubmitFeedback={onSubmitFeedback}
+    />
+  );
+  expect(screen.getByLabelText("引用1召回准确")).toBeChecked();
+  expect(screen.getByLabelText("引用1参考正确")).toBeChecked();
 });
 
-test("已是不该用时再点取消本地判定并收起理由框", async () => {
-  const user = userEvent.setup();
-  render(<FeedbackHarness />);
-
-  await user.click(screen.getByLabelText("引用1不该用"));
-  expect(screen.getByLabelText("不可用理由")).toBeInTheDocument();
-
-  await user.click(screen.getByLabelText("引用1不该用"));
-
-  expect(screen.getByLabelText("引用1不该用")).not.toBeChecked();
-  expect(screen.queryByLabelText("不可用理由")).not.toBeInTheDocument();
-});
-
-test("没有打标回调时不渲染判定操作", () => {
+test("没有提交回调时不渲染反馈区", () => {
   render(<EvidenceDetail evidence={evidence} index={0} />);
 
-  expect(screen.queryByLabelText("引用1应该用")).not.toBeInTheDocument();
+  expect(screen.queryByText("召回是否准确？")).not.toBeInTheDocument();
 });
 
 test("正文只按固定顺序展示三个异议字段", () => {

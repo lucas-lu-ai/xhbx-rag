@@ -1259,7 +1259,7 @@ dd {
   margin-top: 0;
 }
 
-.evidence-not-useful-form {
+.evidence-feedback-reason-form {
   display: grid;
   gap: 8px;
   border: 1px solid rgb(220 38 38 / 0.24);
@@ -1268,11 +1268,11 @@ dd {
   padding: 10px 12px;
 }
 
-.evidence-not-useful-form textarea {
+.evidence-feedback-reason-form textarea {
   background: rgb(255 255 255 / 0.85);
 }
 
-.evidence-not-useful-actions {
+.evidence-feedback-reason-actions {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -1576,7 +1576,30 @@ dd {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.evidence-feedback {
+  display: grid;
+  gap: 12px;
   margin-top: 10px;
+}
+
+.evidence-feedback-dimension {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  margin: 0;
+  border: 0;
+  padding: 0;
+}
+
+.evidence-feedback-dimension legend {
+  margin: 0 0 7px;
+  color: var(--color-foreground);
+  padding: 0;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.4;
 }
 
 .evidence-feedback-actions label {
@@ -1602,6 +1625,11 @@ dd {
 
 .evidence-feedback-actions label:has(input:disabled) {
   opacity: 0.65;
+}
+
+.evidence-feedback-actions label:has(input:focus-visible) {
+  outline: 2px solid rgb(79 70 229 / 0.45);
+  outline-offset: 2px;
 }
 
 .evidence-header {

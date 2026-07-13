@@ -178,18 +178,29 @@ export type BadCaseProblemTag =
   | "compliance_risk"
   | "other";
 
+// 仅供 BadCasePanel 迁移期间保留；新引用反馈 UI 不再使用该单维度判定。
 export type EvidenceFeedbackJudgement =
   | "should_use"
   | "should_not_use"
   | "ranking_low";
 
-export type EvidenceFeedback = {
+export type RetrievalFeedbackJudgement = "accurate" | "inaccurate";
+
+export type AnswerUsageFeedbackJudgement =
+  | "correct"
+  | "incorrect"
+  | "not_applicable";
+
+export type EvidenceFeedbackDecision = {
+  retrieval_judgement: RetrievalFeedbackJudgement;
+  answer_usage_judgement: AnswerUsageFeedbackJudgement;
+  reason?: string;
+};
+
+export type EvidenceFeedback = EvidenceFeedbackDecision & {
   chunk_id?: string;
-  judgement: EvidenceFeedbackJudgement;
   label: string;
   text_preview: string;
-  // “不该用”反馈附带的不可用理由；后端 evidence_feedback 为宽松 dict，可透传。
-  reason?: string;
 };
 
 export type BadCaseRequest = {

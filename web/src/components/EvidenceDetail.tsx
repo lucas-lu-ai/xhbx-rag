@@ -6,7 +6,7 @@ import {
   LoaderCircle,
   Save
 } from "lucide-react";
-import { Fragment, useId, useState } from "react";
+import { Fragment, useEffect, useId, useState } from "react";
 
 import { revealSource } from "../api";
 import {
@@ -22,7 +22,10 @@ import {
   formatScore
 } from "../format";
 import type {
-  EvidenceFeedbackJudgement,
+  AnswerUsageFeedbackJudgement,
+  EvidenceFeedback,
+  EvidenceFeedbackDecision,
+  RetrievalFeedbackJudgement,
   RetrievalEvidence
 } from "../types";
 
@@ -462,12 +465,8 @@ type EvidenceDetailProps = {
   evidence: RetrievalEvidence;
   relatedEvidences?: RetrievalEvidence[];
   index: number;
-  feedbackJudgement?: EvidenceFeedbackJudgement;
-  onToggleFeedback?: (judgement: EvidenceFeedbackJudgement) => void;
-  // “应该用”提交入口：点击后立即落地一条正向 bad case（无需理由）。
-  onSubmitUseful?: () => Promise<void>;
-  // “不该用”提交入口：填写理由后立即落地 bad case（聊天/批量各自注入）。
-  onSubmitNotUseful?: (reason: string) => Promise<void>;
+  feedback?: EvidenceFeedback;
+  onSubmitFeedback?: (decision: EvidenceFeedbackDecision) => Promise<void>;
 };
 
 // 右侧引用明细：异议处理摘要、来源引用溯源与逐证据打标。
@@ -476,25 +475,31 @@ export function EvidenceDetail({
   evidence,
   relatedEvidences = [],
   index,
-  feedbackJudgement,
-  onToggleFeedback,
-  onSubmitUseful,
-  onSubmitNotUseful
+  feedback,
+  onSubmitFeedback
 }: EvidenceDetailProps) {
   // 折叠抽取阶段留下的逐字重复引用；不同副本文件（路径不同）保留。
   const citations = dedupeCitations(evidence.citations ?? []);
   const [citationIndex, setCitationIndex] = useState(0);
   const [showAllCitations, setShowAllCitations] = useState(false);
   const [revealMessage, setRevealMessage] = useState("");
-  const [reasonOpen, setReasonOpen] = useState(false);
+  const [retrievalJudgement, setRetrievalJudgement] = useState<
+    RetrievalFeedbackJudgement | undefined
+  >(feedback?.retrieval_judgement);
+  const [answerUsageJudgement, setAnswerUsageJudgement] = useState<
+    Exclude<AnswerUsageFeedbackJudgement, "not_applicable"> | undefined
+  >(
+    feedback?.answer_usage_judgement === "correct" ||
+      feedback?.answer_usage_judgement === "incorrect"
+      ? feedback.answer_usage_judgement
+      : undefined
+  );
   const [reason, setReason] = useState("");
   const [saving, setSaving] = useState(false);
-  const [feedbackSaved, setFeedbackSaved] = useState(false);
   const [feedbackMessage, setFeedbackMessage] = useState("");
   const [feedbackError, setFeedbackError] = useState("");
-  // 打开理由框前的判定，取消时恢复（应该用/不该用是单选互斥）。
-  const [previousJudgement, setPreviousJudgement] =
-    useState<EvidenceFeedbackJudgement | null>(null);
+  const retrievalRadioName = useId();
+  const answerUsageRadioName = useId();
   const selectedCitation = citations[citationIndex];
   const meta = formatEvidenceMeta(evidence.metadata);
   const citationNumber = index + 1;
@@ -503,82 +508,117 @@ export function EvidenceDetail({
   const text = evidence.text || evidence.text_preview || "没有正文内容。";
   const textSegments = parseEvidenceText(text);
 
-  // 点击“应该用”立即选中并落地一条正向 bad case（无需理由）；
-  // 已勾选时再点则取消本地判定，已落地的 bad case 不撤回。
-  async function handleUsefulToggle() {
+  useEffect(() => {
+    setRetrievalJudgement(feedback?.retrieval_judgement);
+    setAnswerUsageJudgement(
+      feedback?.answer_usage_judgement === "correct" ||
+        feedback?.answer_usage_judgement === "incorrect"
+        ? feedback.answer_usage_judgement
+        : undefined
+    );
+    setReason("");
+  }, [
+    evidence.chunk_id,
+    feedback?.answer_usage_judgement,
+    feedback?.retrieval_judgement,
+    index
+  ]);
+
+  function clearFeedbackStatus() {
     setFeedbackMessage("");
     setFeedbackError("");
-    if (feedbackJudgement === "should_use") {
-      onToggleFeedback?.("should_use");
-      return;
-    }
-    setReasonOpen(false);
+  }
+
+  function handleRetrievalChange(next: RetrievalFeedbackJudgement) {
+    clearFeedbackStatus();
+    setRetrievalJudgement(next);
+    setAnswerUsageJudgement(undefined);
     setReason("");
-    onToggleFeedback?.("should_use");
-    if (!onSubmitUseful) {
-      return;
+  }
+
+  async function submitDecision(decision: EvidenceFeedbackDecision) {
+    if (!onSubmitFeedback) {
+      return false;
     }
     setSaving(true);
+    setFeedbackError("");
     try {
-      await onSubmitUseful();
-      setFeedbackSaved(true);
-      setFeedbackMessage("已记录可用反馈。");
+      await onSubmitFeedback(decision);
+      setFeedbackMessage("已记录引用反馈。");
+      return true;
     } catch (error) {
       setFeedbackError(error instanceof Error ? error.message : "无法保存反馈。");
+      return false;
     } finally {
       setSaving(false);
     }
   }
 
-  // 点击“不该用”立即选中（单选互斥，自动取消“应该用”）并展开理由输入；
-  // 已勾选时再点则取消本地判定并收起理由框，已落地的 bad case 不撤回。
-  function handleNotUsefulToggle() {
-    setFeedbackMessage("");
-    setFeedbackError("");
-    if (feedbackJudgement === "should_not_use") {
-      setReasonOpen(false);
-      setReason("");
-      onToggleFeedback?.("should_not_use");
-      return;
-    }
-    setPreviousJudgement(feedbackJudgement ?? null);
-    onToggleFeedback?.("should_not_use");
-    setReasonOpen(true);
-  }
-
-  // 取消理由输入：收起表单并恢复打开前的判定。
-  function handleReasonCancel() {
-    setReasonOpen(false);
+  async function handleAnswerUsageChange(
+    next: Exclude<AnswerUsageFeedbackJudgement, "not_applicable">
+  ) {
+    clearFeedbackStatus();
+    setAnswerUsageJudgement(next);
     setReason("");
-    setFeedbackError("");
-    if (previousJudgement === "should_use") {
-      onToggleFeedback?.("should_use");
-    } else {
-      onToggleFeedback?.("should_not_use");
+    if (next === "correct") {
+      const saved = await submitDecision({
+        retrieval_judgement: "accurate",
+        answer_usage_judgement: "correct"
+      });
+      if (!saved) {
+        setAnswerUsageJudgement(undefined);
+      }
     }
   }
 
-  async function handleNotUsefulSubmit() {
+  function handleReasonCancel() {
+    clearFeedbackStatus();
+    if (retrievalJudgement === "inaccurate") {
+      setRetrievalJudgement(undefined);
+      setAnswerUsageJudgement(undefined);
+    } else {
+      setAnswerUsageJudgement(undefined);
+    }
+    setReason("");
+  }
+
+  async function handleReasonSubmit() {
     const trimmed = reason.trim();
-    if (!trimmed || !onSubmitNotUseful) {
+    if (!trimmed) {
       return;
     }
-    setSaving(true);
-    setFeedbackError("");
-    try {
-      await onSubmitNotUseful(trimmed);
-      setFeedbackSaved(true);
-      setReasonOpen(false);
+    const decision: EvidenceFeedbackDecision | null =
+      retrievalJudgement === "inaccurate"
+        ? {
+            retrieval_judgement: "inaccurate",
+            answer_usage_judgement: "not_applicable",
+            reason: trimmed
+          }
+        : retrievalJudgement === "accurate" &&
+            answerUsageJudgement === "incorrect"
+          ? {
+              retrieval_judgement: "accurate",
+              answer_usage_judgement: "incorrect",
+              reason: trimmed
+            }
+          : null;
+    if (!decision) {
+      return;
+    }
+    const saved = await submitDecision(decision);
+    if (saved) {
       setReason("");
-      setFeedbackMessage("已记录不可用反馈。");
-    } catch (error) {
-      setFeedbackError(
-        error instanceof Error ? error.message : "无法保存反馈。"
-      );
-    } finally {
-      setSaving(false);
     }
   }
+
+  const feedbackLocked = Boolean(feedback) || saving;
+  const reasonKind =
+    retrievalJudgement === "inaccurate"
+      ? "retrieval"
+      : retrievalJudgement === "accurate" &&
+          answerUsageJudgement === "incorrect"
+        ? "answer"
+        : null;
 
   async function handleReveal() {
     if (!selectedCitation?.source_path) {
@@ -707,37 +747,74 @@ export function EvidenceDetail({
           {revealMessage && <p className="meta-text">{revealMessage}</p>}
         </div>
       )}
-      {onToggleFeedback && (
-        <div
-          className="evidence-feedback-actions"
-          aria-label={`引用${citationNumber}打标`}
-        >
-          <label>
-            <input
-              type="checkbox"
-              aria-label={`引用${citationNumber}应该用`}
-              checked={feedbackJudgement === "should_use"}
-              disabled={saving || feedbackSaved}
-              onChange={() => void handleUsefulToggle()}
-            />
-            <span>应该用</span>
-          </label>
-          <label>
-            <input
-              type="checkbox"
-              aria-label={`引用${citationNumber}不该用`}
-              checked={feedbackJudgement === "should_not_use"}
-              disabled={saving || feedbackSaved}
-              onChange={handleNotUsefulToggle}
-            />
-            <span>不该用</span>
-          </label>
+      {onSubmitFeedback && (
+        <div className="evidence-feedback">
+          <fieldset className="evidence-feedback-dimension">
+            <legend>召回是否准确？</legend>
+            <div className="evidence-feedback-actions">
+              <label>
+                <input
+                  type="radio"
+                  name={retrievalRadioName}
+                  aria-label={`引用${citationNumber}召回准确`}
+                  checked={retrievalJudgement === "accurate"}
+                  disabled={feedbackLocked}
+                  onChange={() => handleRetrievalChange("accurate")}
+                />
+                <span>准确</span>
+              </label>
+              <label>
+                <input
+                  type="radio"
+                  name={retrievalRadioName}
+                  aria-label={`引用${citationNumber}召回不准确`}
+                  checked={retrievalJudgement === "inaccurate"}
+                  disabled={feedbackLocked}
+                  onChange={() => handleRetrievalChange("inaccurate")}
+                />
+                <span>不准确</span>
+              </label>
+            </div>
+          </fieldset>
+          {retrievalJudgement === "accurate" && (
+            <fieldset className="evidence-feedback-dimension">
+              <legend>回答是否正确参考该引用？</legend>
+              <div className="evidence-feedback-actions">
+                <label>
+                  <input
+                    type="radio"
+                    name={answerUsageRadioName}
+                    aria-label={`引用${citationNumber}参考正确`}
+                    checked={answerUsageJudgement === "correct"}
+                    disabled={feedbackLocked}
+                    onChange={() => void handleAnswerUsageChange("correct")}
+                  />
+                  <span>参考正确</span>
+                </label>
+                <label>
+                  <input
+                    type="radio"
+                    name={answerUsageRadioName}
+                    aria-label={`引用${citationNumber}参考不正确`}
+                    checked={answerUsageJudgement === "incorrect"}
+                    disabled={feedbackLocked}
+                    onChange={() => void handleAnswerUsageChange("incorrect")}
+                  />
+                  <span>参考不正确</span>
+                </label>
+              </div>
+            </fieldset>
+          )}
         </div>
       )}
-      {reasonOpen && (
-        <div className="evidence-not-useful-form">
+      {onSubmitFeedback && reasonKind && !feedback && (
+        <div className="evidence-feedback-reason-form">
           <label className="text-field">
-            <span>不可用理由</span>
+            <span>
+              {reasonKind === "retrieval"
+                ? "召回不准确原因"
+                : "参考不正确原因"}
+            </span>
             <textarea
               rows={3}
               value={reason}
@@ -745,22 +822,26 @@ export function EvidenceDetail({
                 setReason(event.target.value);
                 setFeedbackError("");
               }}
-              placeholder="例如：该证据与客户问题无关，不应作为回答依据。"
+              placeholder={
+                reasonKind === "retrieval"
+                  ? "例如：该引用与客户问题无关、客户或案例不匹配，未能回答当前异议。"
+                  : "例如：回答曲解了引用原意、超出证据范围，或遗漏了关键限制。"
+              }
             />
           </label>
-          <div className="evidence-not-useful-actions">
+          <div className="evidence-feedback-reason-actions">
             <button
               className="secondary-button compact-button"
               type="button"
               disabled={saving || !reason.trim()}
-              onClick={() => void handleNotUsefulSubmit()}
+              onClick={() => void handleReasonSubmit()}
             >
               {saving ? (
                 <LoaderCircle className="spin" size={16} aria-hidden="true" />
               ) : (
                 <Save size={16} aria-hidden="true" />
               )}
-              保存不可用反馈
+              保存反馈
             </button>
             <button
               className="inline-button compact-button"
@@ -771,9 +852,9 @@ export function EvidenceDetail({
               取消
             </button>
           </div>
-          {feedbackError && <p className="form-error">{feedbackError}</p>}
         </div>
       )}
+      {feedbackError && <p className="form-error">{feedbackError}</p>}
       {feedbackMessage && <p className="success-text">{feedbackMessage}</p>}
     </article>
   );
