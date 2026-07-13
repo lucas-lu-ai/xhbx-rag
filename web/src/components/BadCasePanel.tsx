@@ -13,6 +13,7 @@ import type {
 } from "../types";
 import { EvidenceDetail } from "./EvidenceDetail";
 import {
+  citedEvidenceEntries,
   citedEvidenceIndexes,
   evidenceIndexForPrefix,
   useEvidenceDetail
@@ -27,7 +28,7 @@ type BadCasePanelProps = {
   onSavedBadCase?: (payload: BadCaseRequest) => void;
 };
 
-// 检索证据面板：紧凑证据列表 + 右侧证据明细。
+// 知识引用面板：紧凑引用列表 + 右侧证据明细。
 // 回答级整体反馈已下线，反馈只在证据明细里以“不该用 + 理由”落地 bad case。
 export function BadCasePanel({
   turn,
@@ -44,14 +45,16 @@ export function BadCasePanel({
   const submitFeedback =
     submit ?? ((payload: BadCaseRequest) => submitBadCase(payload));
   const citedIndexes = citedEvidenceIndexes(response.citations);
-  // 选中证据属于本轮问答时，把明细 portal 到右侧面板；
+  const citedEntries = citedEvidenceEntries(evidences, citedIndexes);
+  // 选中证据属于本轮问答且被模型实际引用时，把明细 portal 到右侧面板；
   // 打标状态留在本组件，明细里的判定操作直接读写同一份反馈。
   const selectedEvidenceIndex = evidenceIndexForPrefix(
     selectedEvidenceKey,
     turn.id
   );
-  const selectedEvidence =
-    selectedEvidenceIndex !== null ? evidences[selectedEvidenceIndex] : undefined;
+  const selectedEntry = citedEntries.find(
+    ({ evidenceIndex }) => evidenceIndex === selectedEvidenceIndex
+  );
 
   function toggleEvidenceFeedback(
     index: number,
@@ -158,7 +161,7 @@ export function BadCasePanel({
 
   return (
     <section className="bad-case-panel">
-      {evidences.length > 0 && (
+      {citedEntries.length > 0 && (
         <EvidenceList
           evidences={evidences}
           keyPrefix={turn.id}
@@ -167,35 +170,40 @@ export function BadCasePanel({
           onSelectEvidence={onSelectEvidence}
         />
       )}
-      {selectedEvidenceIndex !== null &&
-        selectedEvidence &&
+      {selectedEntry &&
         container &&
         createPortal(
           <EvidenceDetail
             key={selectedEvidenceKey}
-            evidence={selectedEvidence}
+            evidence={selectedEntry.evidence}
             relatedEvidences={evidences}
-            index={selectedEvidenceIndex}
-            cited={citedIndexes.has(selectedEvidenceIndex + 1)}
+            index={selectedEntry.displayIndex}
+            cited
             feedbackJudgement={
               evidenceFeedback[
-                evidenceFeedbackKey(selectedEvidenceIndex, selectedEvidence)
+                evidenceFeedbackKey(
+                  selectedEntry.evidenceIndex,
+                  selectedEntry.evidence
+                )
               ]?.judgement
             }
             onToggleFeedback={(judgement) =>
               toggleEvidenceFeedback(
-                selectedEvidenceIndex,
-                selectedEvidence,
+                selectedEntry.evidenceIndex,
+                selectedEntry.evidence,
                 judgement
               )
             }
             onSubmitUseful={() =>
-              submitEvidenceUseful(selectedEvidenceIndex, selectedEvidence)
+              submitEvidenceUseful(
+                selectedEntry.evidenceIndex,
+                selectedEntry.evidence
+              )
             }
             onSubmitNotUseful={(reason) =>
               submitEvidenceNotUseful(
-                selectedEvidenceIndex,
-                selectedEvidence,
+                selectedEntry.evidenceIndex,
+                selectedEntry.evidence,
                 reason
               )
             }

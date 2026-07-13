@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 
 import { EvidenceList } from "./EvidenceList";
 import type { RetrievalEvidence } from "../types";
@@ -27,59 +27,78 @@ function renderList(
     <EvidenceList
       evidences={sampleEvidences}
       keyPrefix="turn-1"
-      citedIndexes={new Set([1])}
+      citedIndexes={new Set([2])}
       {...props}
     />
   );
 }
 
 function expandList() {
-  fireEvent.click(screen.getByRole("button", { name: /检索证据/ }));
+  fireEvent.click(screen.getByRole("button", { name: /知识引用/ }));
 }
 
-test("证据列表默认折叠，点击标题展开、再点击折叠", () => {
+test("知识引用列表默认折叠，点击标题展开、再点击折叠", () => {
   renderList();
 
-  const toggle = screen.getByRole("button", { name: /检索证据/ });
+  const toggle = screen.getByRole("button", { name: /知识引用/ });
   expect(toggle).toHaveAttribute("aria-expanded", "false");
   expect(
-    screen.queryByRole("region", { name: "检索证据列表" })
+    screen.queryByRole("region", { name: "知识引用列表" })
   ).not.toBeInTheDocument();
 
   fireEvent.click(toggle);
   expect(toggle).toHaveAttribute("aria-expanded", "true");
-  expect(screen.getByText("案例A · 需求分析")).toBeInTheDocument();
+  expect(
+    screen.getByRole("region", { name: "知识引用列表" })
+  ).toBeInTheDocument();
 
   fireEvent.click(toggle);
   expect(toggle).toHaveAttribute("aria-expanded", "false");
-  expect(screen.queryByText("案例A · 需求分析")).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole("region", { name: "知识引用列表" })
+  ).not.toBeInTheDocument();
 });
 
-test("标题栏显示证据总数与答案引用条数", () => {
+test("标题栏只显示知识引用条数，不显示答案引用文案", () => {
   renderList();
 
-  expect(screen.getByText("2 条 · 答案引用 1 条")).toBeInTheDocument();
+  expect(screen.getByText("知识引用")).toBeInTheDocument();
+  expect(screen.getByText("1 条")).toBeInTheDocument();
+  expect(screen.queryByText(/答案引用/)).not.toBeInTheDocument();
 });
 
-test("紧凑行显示名称、类型、引用徽标、重排分与单行预览", () => {
+test("只显示实际引用知识，序号连续且不显示答案引用徽标", () => {
   renderList();
   expandList();
 
-  const rows = screen.getAllByRole("button", { name: /案例A|证据 2/ });
-  expect(rows).toHaveLength(2);
-  expect(screen.getByText("案例A · 需求分析")).toBeInTheDocument();
-  expect(screen.getByText("异议处理")).toBeInTheDocument();
-  expect(screen.getByText("答案引用")).toBeInTheDocument();
-  expect(screen.getByText("0.91")).toBeInTheDocument();
-  expect(
-    screen.getByText("客户担心预算，可以先承接预算，再对齐保障缺口。")
-  ).toBeInTheDocument();
-  // 没有 metadata 的证据回退到“证据 N”，未知以外的类型正常中文化。
-  expect(screen.getByText("证据 2")).toBeInTheDocument();
-  expect(screen.getByText("销售话术")).toBeInTheDocument();
+  const region = screen.getByRole("region", { name: "知识引用列表" });
+  const rows = within(region).getAllByRole("button");
+  expect(rows).toHaveLength(1);
+  expect(within(rows[0]).getByText("1")).toBeInTheDocument();
+  expect(within(rows[0]).getByText("未命名知识")).toBeInTheDocument();
+  expect(within(rows[0]).getByText("销售话术")).toBeInTheDocument();
+  expect(within(rows[0]).getByText("缴费期调整话术。")).toBeInTheDocument();
+  expect(screen.queryByText("案例A · 需求分析")).not.toBeInTheDocument();
+  expect(screen.queryByText("异议处理")).not.toBeInTheDocument();
+  expect(screen.queryByText(/答案引用/)).not.toBeInTheDocument();
 });
 
-test("点击行回调选中 key，选中行 aria-pressed", () => {
+test("紧凑行保留知识名称、类型、重排分与单行预览", () => {
+  renderList({ citedIndexes: new Set([1]) });
+  expandList();
+
+  const row = within(
+    screen.getByRole("region", { name: "知识引用列表" })
+  ).getByRole("button");
+  expect(within(row).getByText("案例A · 需求分析")).toBeInTheDocument();
+  expect(within(row).getByText("异议处理")).toBeInTheDocument();
+  expect(within(row).getByText("0.91")).toBeInTheDocument();
+  expect(
+    within(row).getByText("客户担心预算，可以先承接预算，再对齐保障缺口。")
+  ).toBeInTheDocument();
+});
+
+test("点击可见行回调原始 evidence key，选中行 aria-pressed", () => {
   const onSelectEvidence = vi.fn();
   renderList({
     selectedEvidenceKey: "turn-1:evidence-1",
@@ -87,12 +106,24 @@ test("点击行回调选中 key，选中行 aria-pressed", () => {
   });
   expandList();
 
-  const [firstRow, secondRow] = screen
-    .getAllByRole("button")
-    .filter((button) => button.className.includes("evidence-row"));
-  expect(firstRow).toHaveAttribute("aria-pressed", "false");
-  expect(secondRow).toHaveAttribute("aria-pressed", "true");
+  const row = within(
+    screen.getByRole("region", { name: "知识引用列表" })
+  ).getByRole("button");
+  expect(row).toHaveAttribute("aria-pressed", "true");
 
-  fireEvent.click(firstRow);
-  expect(onSelectEvidence).toHaveBeenCalledWith("turn-1:evidence-0");
+  fireEvent.click(row);
+  expect(onSelectEvidence).toHaveBeenCalledWith("turn-1:evidence-1");
+});
+
+test("没有实际引用时不渲染知识引用区", () => {
+  const { container } = render(
+    <EvidenceList
+      evidences={sampleEvidences}
+      keyPrefix="turn-1"
+      citedIndexes={new Set()}
+    />
+  );
+
+  expect(container).toBeEmptyDOMElement();
+  expect(screen.queryByText("知识引用")).not.toBeInTheDocument();
 });
