@@ -28,8 +28,8 @@ type BadCasePanelProps = {
   onSavedBadCase?: (payload: BadCaseRequest) => void;
 };
 
-// 知识引用面板：紧凑引用列表 + 右侧证据明细。
-// 回答级整体反馈已下线，反馈只在证据明细里以“不该用 + 理由”落地 bad case。
+// 知识引用面板：紧凑引用列表 + 右侧引用明细。
+// 回答级整体反馈已下线，反馈只在引用明细里以“不该用 + 理由”落地 bad case。
 export function BadCasePanel({
   turn,
   response,
@@ -61,7 +61,7 @@ export function BadCasePanel({
     evidence: RetrievalEvidence,
     judgement: EvidenceFeedbackJudgement
   ) {
-    const key = evidenceFeedbackKey(index);
+    const key = evidenceFeedbackKey(turn.id, index);
     setEvidenceFeedback((items) => {
       if (items[key]?.judgement === judgement) {
         const { [key]: _removed, ...rest } = items;
@@ -114,7 +114,7 @@ export function BadCasePanel({
     onSavedBadCase?.(payload);
     setEvidenceFeedback((items) => ({
       ...items,
-      [evidenceFeedbackKey(index)]: entry
+      [evidenceFeedbackKey(turn.id, index)]: entry
     }));
   }
 
@@ -155,7 +155,7 @@ export function BadCasePanel({
     onSavedBadCase?.(payload);
     setEvidenceFeedback((items) => ({
       ...items,
-      [evidenceFeedbackKey(index)]: entry
+      [evidenceFeedbackKey(turn.id, index)]: entry
     }));
   }
 
@@ -180,7 +180,7 @@ export function BadCasePanel({
             index={selectedEntry.displayIndex}
             feedbackJudgement={
               evidenceFeedback[
-                evidenceFeedbackKey(selectedEntry.evidenceIndex)
+                evidenceFeedbackKey(turn.id, selectedEntry.evidenceIndex)
               ]?.judgement
             }
             onToggleFeedback={(judgement) =>
@@ -210,8 +210,8 @@ export function BadCasePanel({
   );
 }
 
-function evidenceFeedbackKey(index: number): string {
-  return `evidence-index:${index}`;
+function evidenceFeedbackKey(turnId: string, index: number): string {
+  return `${turnId}:evidence-index:${index}`;
 }
 
 function evidenceFeedbackLabel(

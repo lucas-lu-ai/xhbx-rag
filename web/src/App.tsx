@@ -150,7 +150,7 @@ export function App({
     loadSessionSelection
   );
   const [creatingBatch, setCreatingBatch] = useState(false);
-  // 右侧证据明细：App 只持有选中 key 与 portal 容器，
+  // 右侧引用明细：App 只持有选中 key 与 portal 容器，
   // 明细内容由拥有反馈状态的 BadCasePanel portal 进来。
   const [selectedEvidenceKey, setSelectedEvidenceKey] = useState<string | null>(
     null

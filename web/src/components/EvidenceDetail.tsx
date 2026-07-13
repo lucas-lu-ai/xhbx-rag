@@ -434,7 +434,7 @@ type EvidenceDetailProps = {
   onSubmitNotUseful?: (reason: string) => Promise<void>;
 };
 
-// 右侧证据明细：正文全文、标签命中、来源引用溯源与逐证据打标。
+// 右侧引用明细：正文全文、标签命中、来源引用溯源与逐证据打标。
 // 切换证据时由父级用 key 重新挂载，内部引用选中态随之重置。
 export function EvidenceDetail({
   evidence,

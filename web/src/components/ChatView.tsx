@@ -129,7 +129,7 @@ export function ChatView({
     }
   }
 
-  // 回答完成后自动选中第一条证据（优先答案引用的），右侧直接出明细。
+  // 回答完成后只自动选中第一条模型实际引用；没有实际引用保持未选中。
   function selectFirstEvidence(turnId: string, response: AnswerResponse) {
     if (!mountedRef.current) {
       return;

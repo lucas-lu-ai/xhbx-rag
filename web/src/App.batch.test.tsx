@@ -742,3 +742,84 @@ test("批量行详情自动选中证据并联动右侧明细", async () => {
     })
   );
 });
+
+test("批量行引用反馈按行与原始 evidence 索引隔离", async () => {
+  const user = userEvent.setup();
+  installStorageStub().setItem(
+    "xhbx-rag.active-session.v1",
+    JSON.stringify({ kind: "batch", id: "run-1" })
+  );
+  const firstResponse = answerPayloadWithEvidences(1, [1]);
+  firstResponse.retrieval_evidences[0].chunk_id = "row-1-chunk";
+  const secondResponse = answerPayloadWithEvidences(1, [1]);
+  secondResponse.retrieval_evidences[0].chunk_id = "row-2-chunk";
+  const detail = batchRunDetail({
+    question_total: 2,
+    question_done: 2,
+    questions: [
+      batchRunQuestionDetail({ response: firstResponse }),
+      batchRunQuestionDetail({
+        row_index: 2,
+        query: "第二行客户问题",
+        response: secondResponse
+      })
+    ]
+  });
+  const { requests } = installFetchStub((url, init) => {
+    const method = init?.method ?? "GET";
+    if (url.endsWith("/api/batch-runs") && method === "GET") {
+      return jsonResponse({ runs: [batchRunSummary()] });
+    }
+    if (
+      (url.endsWith("/api/batch-runs/run-1/rows/1/bad-case") ||
+        url.endsWith("/api/batch-runs/run-1/rows/2/bad-case")) &&
+      method === "POST"
+    ) {
+      return jsonResponse({ ok: true, bad_case_id: "bad-case-row" });
+    }
+    if (url.endsWith("/api/batch-runs/run-1")) {
+      return jsonResponse(detail);
+    }
+    return null;
+  });
+  render(<App />);
+
+  const qaPanel = screen.getByRole("main", { name: "RAG 问答" });
+  const detailPane = screen.getByRole("complementary", {
+    name: "索引和溯源"
+  });
+  await user.click(
+    await within(qaPanel).findByRole("button", {
+      name: /客户说每年不能超过80万怎么办？/
+    })
+  );
+
+  const firstCheckbox = await within(detailPane).findByLabelText(
+    "引用1应该用"
+  );
+  await user.click(firstCheckbox);
+  expect(await screen.findByText("已记录可用反馈。")).toBeInTheDocument();
+  expect(firstCheckbox).toBeChecked();
+  expect(requests).toContainEqual(
+    expect.objectContaining({
+      url: "/api/batch-runs/run-1/rows/1/bad-case",
+      method: "POST",
+      body: expect.objectContaining({
+        evidence_feedback: [
+          expect.objectContaining({ chunk_id: "row-1-chunk" })
+        ]
+      })
+    })
+  );
+
+  await user.click(screen.getByRole("button", { name: "下一行" }));
+  expect(await screen.findByText("第二行客户问题")).toBeInTheDocument();
+  expect(
+    await within(detailPane).findByLabelText("引用1应该用")
+  ).not.toBeChecked();
+
+  await user.click(screen.getByRole("button", { name: "上一行" }));
+  expect(
+    await within(detailPane).findByLabelText("引用1应该用")
+  ).toBeChecked();
+});
