@@ -48,24 +48,17 @@ const evidence: RetrievalEvidence = {
   ]
 };
 
-test("明细渲染正文、标签、合规与元信息", () => {
+test("明细不渲染任何标签，仍保留标题和重排分数", () => {
   render(<EvidenceDetail evidence={evidence} index={0} />);
 
-  expect(
-    screen.getByRole("article", { name: "引用1明细" })
-  ).toBeInTheDocument();
   expect(screen.getByText("引用1：案例A · 需求分析")).toBeInTheDocument();
-  expect(screen.queryByText("证据 1 · 异议处理")).not.toBeInTheDocument();
-  expect(screen.queryByText("答案引用")).not.toBeInTheDocument();
   expect(screen.getByText("重排 0.91")).toBeInTheDocument();
-  expect(screen.queryByText("案例A · 需求分析")).not.toBeInTheDocument();
-  expect(screen.getByLabelText("引用1命中标签")).toBeInTheDocument();
+  expect(screen.queryByLabelText("引用1命中标签")).not.toBeInTheDocument();
+  expect(screen.queryByText("客户画像/高净值客户")).not.toBeInTheDocument();
+  expect(screen.queryByText("标签提权 ×1.2")).not.toBeInTheDocument();
   expect(
-    screen.getByText("客户担心预算，可以先承接预算，再对齐保障缺口。")
-  ).toBeInTheDocument();
-  expect(screen.getByText("客户画像/高净值客户")).toBeInTheDocument();
-  expect(screen.getByText("标签提权 ×1.2")).toBeInTheDocument();
-  expect(screen.getByText("合规注意 · 收益承诺风险")).toBeInTheDocument();
+    screen.queryByText("合规注意 · 收益承诺风险")
+  ).not.toBeInTheDocument();
 });
 
 test("元信息缺失时使用未命名知识作为标题", () => {

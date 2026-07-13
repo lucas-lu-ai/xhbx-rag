@@ -16,13 +16,11 @@ import {
 } from "../evidenceText";
 import {
   dedupeCitations,
-  evidenceComplianceRisks,
   formatEvidenceMeta,
   formatEvidenceSource,
   formatEvidenceSourceCompact,
   formatLocatorConfidence,
-  formatScore,
-  formatTagBoost
+  formatScore
 } from "../format";
 import type {
   EvidenceFeedbackJudgement,
@@ -434,7 +432,7 @@ type EvidenceDetailProps = {
   onSubmitNotUseful?: (reason: string) => Promise<void>;
 };
 
-// 右侧引用明细：正文全文、标签命中、来源引用溯源与逐证据打标。
+// 右侧引用明细：异议处理摘要、来源引用溯源与逐证据打标。
 // 切换证据时由父级用 key 重新挂载，内部引用选中态随之重置。
 export function EvidenceDetail({
   evidence,
@@ -464,9 +462,6 @@ export function EvidenceDetail({
   const citationNumber = index + 1;
   const knowledgeName = meta || "未命名知识";
   const score = formatScore(evidence.rerank_score);
-  const matchedTags = evidence.matched_tag_paths ?? [];
-  const boostLabel = formatTagBoost(evidence.tag_boost_factor);
-  const complianceRisks = evidenceComplianceRisks(evidence.metadata);
   const text = evidence.text || evidence.text_preview || "没有正文内容。";
   const textSegments = parseEvidenceText(text);
   const scriptLookup = buildRelatedScriptLookup(evidence, relatedEvidences);
@@ -571,26 +566,6 @@ export function EvidenceDetail({
           {score && <span>重排 {score}</span>}
         </span>
       </div>
-      {(matchedTags.length > 0 || complianceRisks.length > 0) && (
-        <div
-          className="evidence-tag-hits"
-          aria-label={`引用${citationNumber}命中标签`}
-        >
-          {complianceRisks.length > 0 && (
-            <span className="evidence-compliance-badge">
-              合规注意 · {complianceRisks.join("、")}
-            </span>
-          )}
-          {boostLabel && matchedTags.length > 0 && (
-            <span className="evidence-boost-badge">标签提权 {boostLabel}</span>
-          )}
-          {matchedTags.map((tag) => (
-            <span className="evidence-tag-chip" key={tag}>
-              {tag}
-            </span>
-          ))}
-        </div>
-      )}
       {hasStructuredFields(textSegments) ? (
         <EvidenceStructuredText
           segments={textSegments}
