@@ -16,7 +16,7 @@ from xhbx_rag.config import RetrievalConfig, ingestion_limits_from_env
 from xhbx_rag.embedding import EmbeddingClient
 from xhbx_rag.milvus_store import create_milvus_store
 
-from .bad_cases import save_bad_case
+from .bad_cases import save_bad_case, validate_evidence_feedback_items
 from .batch_routes import router as batch_router
 from .a2a_routes import router as a2a_router
 from .batch_runner import BatchRunner
@@ -87,7 +87,6 @@ _ALLOWED_BAD_CASE_PROBLEM_TAGS = {
     "compliance_risk",
     "other",
 }
-_ALLOWED_EVIDENCE_FEEDBACK_JUDGEMENTS = {"should_use", "should_not_use", "ranking_low"}
 _COLLECTION_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _INGESTION_JOBS_ROOT = (
     project_root_from_module() / ".local" / "web_ingestion" / "jobs"
@@ -192,11 +191,7 @@ class BadCaseRequest(BaseModel):
     def _evidence_feedback_allowed(
         cls, values: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        for value in values:
-            judgement = value.get("judgement")
-            if judgement not in _ALLOWED_EVIDENCE_FEEDBACK_JUDGEMENTS:
-                raise ValueError("证据反馈类型不支持")
-        return values
+        return validate_evidence_feedback_items(values)
 
     @model_validator(mode="after")
     def _top_k_not_greater_than_top_n(self) -> BadCaseRequest:

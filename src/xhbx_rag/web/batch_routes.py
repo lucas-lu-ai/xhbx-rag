@@ -17,9 +17,9 @@ from fastapi import Path as PathParam
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .bad_cases import (
-    EVIDENCE_FEEDBACK_JUDGEMENT_LABELS,
     ISSUE_TYPE_LABELS,
     save_bad_case,
+    validate_evidence_feedback_items,
 )
 
 logger = logging.getLogger(__name__)
@@ -50,7 +50,6 @@ MAX_INPUT_ANSWER_LENGTH = 20000
 
 # bad case 枚举与单问接口保持一致；大集合复用 bad_cases 的标签表作为唯一来源。
 _ALLOWED_BAD_CASE_ISSUE_TYPES = frozenset(ISSUE_TYPE_LABELS)
-_ALLOWED_EVIDENCE_FEEDBACK_JUDGEMENTS = frozenset(EVIDENCE_FEEDBACK_JUDGEMENT_LABELS)
 _ALLOWED_BAD_CASE_FEEDBACK_RESULTS = frozenset(
     {"usable", "inaccurate", "incomplete", "citation_issue", "customer_mismatch"}
 )
@@ -199,11 +198,7 @@ class BatchBadCaseRequest(BaseModel):
     def _evidence_feedback_allowed(
         cls, values: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        for value in values:
-            judgement = value.get("judgement")
-            if judgement not in _ALLOWED_EVIDENCE_FEEDBACK_JUDGEMENTS:
-                raise ValueError("证据反馈类型不支持")
-        return values
+        return validate_evidence_feedback_items(values)
 
     @model_validator(mode="after")
     def _top_k_not_greater_than_top_n(self) -> BatchBadCaseRequest:

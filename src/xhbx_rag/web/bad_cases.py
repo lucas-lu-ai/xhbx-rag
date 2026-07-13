@@ -34,6 +34,15 @@ EVIDENCE_FEEDBACK_JUDGEMENT_LABELS = {
     "should_not_use": "不该用",
     "ranking_low": "该用但排序太低",
 }
+RETRIEVAL_JUDGEMENT_LABELS = {
+    "accurate": "召回准确",
+    "inaccurate": "召回不准确",
+}
+ANSWER_USAGE_JUDGEMENT_LABELS = {
+    "correct": "参考正确",
+    "incorrect": "参考不正确",
+    "not_applicable": "不适用",
+}
 
 
 def save_bad_case(
@@ -59,6 +68,45 @@ def save_bad_case(
         "bad_case_id": record["bad_case_id"],
         "path": str(path),
     }
+
+
+def validate_evidence_feedback_items(
+    values: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    for value in values:
+        retrieval_judgement = value.get("retrieval_judgement")
+        answer_usage_judgement = value.get("answer_usage_judgement")
+        if (
+            "retrieval_judgement" not in value
+            and "answer_usage_judgement" not in value
+        ):
+            if value.get("judgement") not in EVIDENCE_FEEDBACK_JUDGEMENT_LABELS:
+                raise ValueError("证据反馈类型不支持")
+            continue
+
+        if retrieval_judgement not in RETRIEVAL_JUDGEMENT_LABELS:
+            raise ValueError("召回判断不支持")
+        if answer_usage_judgement not in ANSWER_USAGE_JUDGEMENT_LABELS:
+            raise ValueError("回答参考判断不支持")
+        if retrieval_judgement == "accurate" and answer_usage_judgement not in {
+            "correct",
+            "incorrect",
+        }:
+            raise ValueError("证据反馈组合不支持")
+        if (
+            retrieval_judgement == "inaccurate"
+            and answer_usage_judgement != "not_applicable"
+        ):
+            raise ValueError("证据反馈组合不支持")
+        if (
+            retrieval_judgement == "inaccurate"
+            or answer_usage_judgement == "incorrect"
+        ):
+            reason = value.get("reason")
+            if not isinstance(reason, str) or not reason.strip():
+                raise ValueError("负向证据反馈必须填写原因")
+
+    return values
 
 
 def _with_chinese_labels(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -108,5 +156,19 @@ def _with_evidence_feedback_label(value: Any) -> Any:
         item["judgement_label"] = _label_for(
             judgement,
             EVIDENCE_FEEDBACK_JUDGEMENT_LABELS,
+        )
+
+    retrieval_judgement = item.get("retrieval_judgement")
+    if isinstance(retrieval_judgement, str) and retrieval_judgement:
+        item["retrieval_judgement_label"] = _label_for(
+            retrieval_judgement,
+            RETRIEVAL_JUDGEMENT_LABELS,
+        )
+
+    answer_usage_judgement = item.get("answer_usage_judgement")
+    if isinstance(answer_usage_judgement, str) and answer_usage_judgement:
+        item["answer_usage_judgement_label"] = _label_for(
+            answer_usage_judgement,
+            ANSWER_USAGE_JUDGEMENT_LABELS,
         )
     return item

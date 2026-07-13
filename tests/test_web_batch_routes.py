@@ -341,6 +341,61 @@ def test_bad_case_route_double_writes(tmp_path: Path, monkeypatch) -> None:
     assert bad_case["row_index"] == 1
 
 
+def test_bad_case_route_saves_two_dimensional_feedback_in_cache(
+    tmp_path: Path, monkeypatch
+) -> None:
+    client, store, _ = _make_client(tmp_path)
+    run_id = client.post("/api/batch-runs", json=_create_payload()).json()["run_id"]
+    _fail_first_row(store, run_id)
+
+    def fake_save_bad_case(payload: dict, *, bad_case_id=None, project_root=None) -> dict:
+        return {"ok": True, "bad_case_id": bad_case_id, "path": ".local/x.jsonl"}
+
+    monkeypatch.setattr(batch_routes, "save_bad_case", fake_save_bad_case)
+    evidence_feedback = [
+        {
+            "chunk_id": "case-a-1",
+            "retrieval_judgement": "accurate",
+            "answer_usage_judgement": "incorrect",
+            "reason": "回答误用了该证据。",
+        }
+    ]
+
+    response = client.post(
+        f"/api/batch-runs/{run_id}/rows/1/bad-case",
+        json=_bad_case_payload(evidence_feedback=evidence_feedback),
+    )
+
+    assert response.status_code == 200
+    cached_feedback = store.get_question(run_id, 1)["bad_case"]["evidence_feedback"]
+    assert cached_feedback == evidence_feedback
+
+
+def test_bad_case_route_rejects_invalid_two_dimensional_feedback(
+    tmp_path: Path,
+) -> None:
+    client, store, _ = _make_client(tmp_path)
+    run_id = client.post("/api/batch-runs", json=_create_payload()).json()["run_id"]
+    _fail_first_row(store, run_id)
+
+    response = client.post(
+        f"/api/batch-runs/{run_id}/rows/1/bad-case",
+        json=_bad_case_payload(
+            evidence_feedback=[
+                {
+                    "chunk_id": "case-a-1",
+                    "retrieval_judgement": "inaccurate",
+                    "answer_usage_judgement": "correct",
+                    "reason": "召回内容无关。",
+                }
+            ]
+        ),
+    )
+
+    assert response.status_code == 422
+    assert store.get_question(run_id, 1)["bad_case"] is None
+
+
 def test_bad_case_route_rolls_back_cache_when_jsonl_fails(
     tmp_path: Path, monkeypatch
 ) -> None:

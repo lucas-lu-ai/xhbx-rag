@@ -94,6 +94,32 @@ def test_save_bad_case_adds_chinese_labels_for_review_fields(tmp_path: Path) -> 
     assert record["evidence_feedback"][2]["judgement_label"] == "该用但排序太低"
 
 
+def test_save_bad_case_adds_chinese_labels_for_two_dimensional_feedback(
+    tmp_path: Path,
+) -> None:
+    bad_cases.save_bad_case(
+        {
+            **_bad_case_payload(),
+            "evidence_feedback": [
+                {
+                    "chunk_id": "case-a-1",
+                    "retrieval_judgement": "accurate",
+                    "answer_usage_judgement": "incorrect",
+                    "reason": "回答误用了这段准确召回的证据。",
+                }
+            ],
+        },
+        project_root=tmp_path,
+    )
+
+    path = tmp_path / ".local" / "bad_cases" / "bad_cases.jsonl"
+    record = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    feedback = record["evidence_feedback"][0]
+
+    assert feedback["retrieval_judgement_label"] == "召回准确"
+    assert feedback["answer_usage_judgement_label"] == "参考不正确"
+
+
 def test_save_bad_case_appends_multiple_records(tmp_path: Path) -> None:
     first = bad_cases.save_bad_case(_bad_case_payload(), project_root=tmp_path)
     second = bad_cases.save_bad_case(
