@@ -125,6 +125,52 @@ def test_query_understanding_prompt_mentions_training_course() -> None:
     assert "training_course" in _SYSTEM_PROMPT
 
 
+@pytest.mark.parametrize(
+    ("collection_targets", "expected"),
+    [
+        (["case"], ["case"]),
+        (["course"], ["course"]),
+        (["course", "case", "course"], ["course", "case"]),
+        (["unknown", ""], ["case", "course"]),
+    ],
+)
+def test_query_understanding_normalizes_collection_targets(
+    collection_targets: list[str], expected: list[str]
+) -> None:
+    result = QueryUnderstanding.model_validate(
+        {
+            "intent": "general_sales_qa",
+            "rewritten_query": "保险销售案例和标准课程怎么讲？",
+            "needs_retrieval": True,
+            "collection_targets": collection_targets,
+            "filters": {},
+        }
+    )
+
+    assert result.collection_targets == expected
+
+
+def test_query_understanding_defaults_missing_collection_targets_to_all() -> None:
+    result = QueryUnderstanding.model_validate(
+        {
+            "intent": "general_sales_qa",
+            "rewritten_query": "保险销售案例和标准课程怎么讲？",
+            "needs_retrieval": True,
+            "filters": {},
+        }
+    )
+
+    assert result.collection_targets == ["case", "course"]
+
+
+def test_query_understanding_prompt_explains_collection_routing() -> None:
+    from xhbx_rag.query_understanding import _SYSTEM_PROMPT
+
+    assert "collection_targets" in _SYSTEM_PROMPT
+    assert "case" in _SYSTEM_PROMPT
+    assert "course" in _SYSTEM_PROMPT
+
+
 def test_query_understanding_normalizes_empty_filter_arrays_to_blank_strings() -> None:
     result = QueryUnderstanding.model_validate(
         {

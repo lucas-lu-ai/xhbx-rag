@@ -17,6 +17,7 @@ Intent = Literal[
     "general_sales_qa",
     "out_of_scope",
 ]
+CollectionTarget = Literal["case", "course"]
 
 _ALLOWED_CHUNK_TYPES = {
     "customer_journey",
@@ -83,7 +84,19 @@ class QueryUnderstanding(BaseModel):
     intent: Intent
     rewritten_query: str = ""
     needs_retrieval: bool = True
+    collection_targets: list[CollectionTarget] = Field(
+        default_factory=lambda: ["case", "course"]
+    )
     filters: QueryFilters = Field(default_factory=QueryFilters)
+
+    @field_validator("collection_targets", mode="before")
+    @classmethod
+    def _collection_targets(cls, value: object) -> list[str]:
+        targets: list[str] = []
+        for item in _str_list(value):
+            if item in {"case", "course"} and item not in targets:
+                targets.append(item)
+        return targets or ["case", "course"]
 
     @model_validator(mode="after")
     def _require_rewritten_query(self) -> "QueryUnderstanding":
@@ -164,6 +177,10 @@ _SYSTEM_PROMPT = """你是销售洞察 RAG 的查询理解节点。
 - intent: script_search | objection_handling | strategy_search | journey_search | general_sales_qa | out_of_scope
 - rewritten_query: 独立、明确、适合检索的问题；如果 needs_retrieval=false 可为空
 - needs_retrieval: boolean
+- collection_targets: 必须输出的字符串数组，只能使用 case | course
+  - 案例实战、绩优经验类问题选择 ["case"]
+  - 课程教材、标准流程类问题选择 ["course"]
+  - 混合问题或无法确定时选择 ["case", "course"]
 - filters: object，包含 chunk_types, stage, scenario, objection, strategy_names
   - chunk_types 只能使用 customer_journey | strategy | script | objection_handling | training_course，不要输出 qa。
 要求：
