@@ -10,7 +10,6 @@ import { Fragment, useId, useState } from "react";
 
 import { revealSource } from "../api";
 import {
-  hasStructuredFields,
   parseEvidenceText,
   type EvidenceTextSegment
 } from "../evidenceText";
@@ -417,6 +416,45 @@ function EvidenceStructuredText({
   );
 }
 
+const OBJECTION_DETAIL_LABELS = [
+  "客户异议",
+  "异议诊断",
+  "推荐回应"
+] as const;
+
+function EvidenceObjectionText({
+  segments
+}: {
+  segments: EvidenceTextSegment[];
+}) {
+  const values = new Map(
+    segments.flatMap((segment) =>
+      segment.kind === "field" &&
+      OBJECTION_DETAIL_LABELS.some((label) => label === segment.label)
+        ? [[segment.label, segment.value] as const]
+        : []
+    )
+  );
+  const visibleLabels = OBJECTION_DETAIL_LABELS.filter((label) =>
+    values.has(label)
+  );
+
+  if (visibleLabels.length === 0) {
+    return <p className="evidence-text">暂无异议处理内容。</p>;
+  }
+
+  return (
+    <div className="evidence-text evidence-struct">
+      {visibleLabels.map((label) => (
+        <p className="evidence-struct-row" key={label}>
+          <span className="evidence-field-label">{label}</span>
+          <span className="evidence-field-value">{values.get(label)}</span>
+        </p>
+      ))}
+    </div>
+  );
+}
+
 // 来源引用默认最多显示这么多条，超出的收进“展开其余”，避免多副本/多片段刷屏。
 const MAX_VISIBLE_CITATIONS = 4;
 
@@ -464,7 +502,6 @@ export function EvidenceDetail({
   const score = formatScore(evidence.rerank_score);
   const text = evidence.text || evidence.text_preview || "没有正文内容。";
   const textSegments = parseEvidenceText(text);
-  const scriptLookup = buildRelatedScriptLookup(evidence, relatedEvidences);
 
   // 点击“应该用”立即选中并落地一条正向 bad case（无需理由）；
   // 已勾选时再点则取消本地判定，已落地的 bad case 不撤回。
@@ -566,14 +603,7 @@ export function EvidenceDetail({
           {score && <span>重排 {score}</span>}
         </span>
       </div>
-      {hasStructuredFields(textSegments) ? (
-        <EvidenceStructuredText
-          segments={textSegments}
-          scriptLookup={scriptLookup}
-        />
-      ) : (
-        <p className="evidence-text">{text}</p>
-      )}
+      <EvidenceObjectionText segments={textSegments} />
       {citations.length > 0 && (
         <div className="evidence-source-list" aria-label="证据来源">
           {(showAllCitations

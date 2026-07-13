@@ -328,145 +328,41 @@ test("没有打标回调时不渲染判定操作", () => {
   expect(screen.queryByLabelText("引用1应该用")).not.toBeInTheDocument();
 });
 
-test("结构化正文按字段着色区分 AI 归纳与案例原文", () => {
+test("正文只按固定顺序展示三个异议字段", () => {
   const structured: RetrievalEvidence = {
     ...evidence,
     text: [
       "案例：案例A",
-      "知识类型：异议处理",
-      "客户异议：客户说每年不能超过80万",
       "推荐回应：先承接预算，再对齐保障缺口",
+      "异议诊断：预算顾虑背后是保障优先级不清晰",
+      "客户异议：客户说每年不能超过80万",
+      "关联话术：script_009",
       "来源原文：",
       "- 第2节.track-0.txt：客户说每年保费预算不能超过80万"
     ].join("\n")
   };
   render(<EvidenceDetail evidence={structured} index={0} />);
 
-  // 图例说明两种来源。
-  expect(screen.getByText("AI 归纳")).toBeInTheDocument();
-  expect(screen.getByText("案例原文")).toBeInTheDocument();
-  // 模型归纳字段带 generated 标签，原文块带 source 标签。
-  const objectionLabel = screen.getByText("客户异议");
-  expect(objectionLabel.className).toBe("evidence-field-label");
-  expect(
-    screen.getByText("客户说每年不能超过80万")
-  ).toBeInTheDocument();
-  const sourceLabel = screen.getByText("来源原文");
-  expect(sourceLabel.className).toBe("evidence-field-label source");
-  // 来源原文默认折叠，原文不直接渲染。
-  expect(
-    screen.queryByText("第2节.track-0.txt：客户说每年保费预算不能超过80万")
-  ).not.toBeInTheDocument();
+  const detail = screen.getByRole("article", { name: "引用1明细" });
+  const labels = Array.from(
+    detail.querySelectorAll(".evidence-field-label")
+  ).map((node) => node.textContent);
+  expect(labels).toEqual(["客户异议", "异议诊断", "推荐回应"]);
+  expect(screen.queryByText("案例")).not.toBeInTheDocument();
+  expect(screen.queryByText("关联话术")).not.toBeInTheDocument();
+  expect(screen.queryByText("来源原文")).not.toBeInTheDocument();
 });
 
-test("来源原文默认折叠，点击标题展开、再点击折叠", async () => {
-  const user = userEvent.setup();
-  const structured: RetrievalEvidence = {
-    ...evidence,
-    text: [
-      "推荐回应：先承接预算",
-      "来源原文：",
-      "- 第2节.track-0.txt：客户说每年保费预算不能超过80万",
-      "- 第3节.track-0.txt：先看家庭责任额度"
-    ].join("\n")
-  };
-  render(<EvidenceDetail evidence={structured} index={0} />);
+test("正文没有异议字段时显示空状态且不回退原始全文", () => {
+  render(
+    <EvidenceDetail
+      evidence={{ ...evidence, text: "客户担心预算，可以先承接预算。" }}
+      index={0}
+    />
+  );
 
-  const toggle = screen.getByRole("button", { name: /来源原文/ });
-  expect(toggle).toHaveAttribute("aria-expanded", "false");
+  expect(screen.getByText("暂无异议处理内容。")).toBeInTheDocument();
   expect(
-    screen.queryByText("第2节.track-0.txt：客户说每年保费预算不能超过80万")
+    screen.queryByText("客户担心预算，可以先承接预算。")
   ).not.toBeInTheDocument();
-
-  await user.click(toggle);
-  expect(toggle).toHaveAttribute("aria-expanded", "true");
-  expect(
-    screen.getByText("第2节.track-0.txt：客户说每年保费预算不能超过80万")
-  ).toBeInTheDocument();
-  expect(
-    screen.getByText("第3节.track-0.txt：先看家庭责任额度")
-  ).toBeInTheDocument();
-
-  await user.click(toggle);
-  expect(toggle).toHaveAttribute("aria-expanded", "false");
-  expect(
-    screen.queryByText("第2节.track-0.txt：客户说每年保费预算不能超过80万")
-  ).not.toBeInTheDocument();
-});
-
-test("关联话术保持 ID 展示，点击后内联展开完整话术", async () => {
-  const user = userEvent.setup();
-  const structured: RetrievalEvidence = {
-    ...evidence,
-    text: [
-      "案例：案例A",
-      "知识类型：异议处理",
-      "客户异议：保险收益不如银行/产品有坏处吗（精明型客户）",
-      "推荐回应：坦诚告知流动性限制",
-      "关联话术：script_009"
-    ].join("\n"),
-    metadata: {
-      case_name: "案例A",
-      related_script_ids: ["script_009"],
-      related_script_details: [
-        {
-          script_id: "script_009",
-          stage: "产品讲解/异议处理",
-          scenario: "精明型客户质疑保险收益不如银行理财或有坏处",
-          customer_trigger: "客户直接询问收益率、流动性限制或产品缺陷",
-          goal: "坦诚披露弊端以赢得信任",
-          source_quote:
-            "短期没有，长期任何一家金融工具不能和保险相抗衡。",
-          coach_wording:
-            "王总，坦白讲，保险短期内确实没有高收益，本金也有锁定期。",
-          strategy_names: ["性格四象限差异化沟通策略"],
-          follow_up_questions: ["您是否更看重长期确定的现金流安排？"],
-          compliance_notes: ["严禁夸大分红或万能账户结算利率"]
-        }
-      ]
-    }
-  };
-  render(<EvidenceDetail evidence={structured} index={0} />);
-
-  const scriptButton = screen.getByRole("button", { name: "script_009" });
-  expect(scriptButton).toHaveAttribute("aria-expanded", "false");
-  expect(
-    screen.queryByText("精明型客户质疑保险收益不如银行理财或有坏处")
-  ).not.toBeInTheDocument();
-
-  await user.click(scriptButton);
-
-  expect(scriptButton).toHaveAttribute("aria-expanded", "true");
-  expect(
-    screen.getByText("精明型客户质疑保险收益不如银行理财或有坏处")
-  ).toBeInTheDocument();
-  expect(
-    screen.getByText("王总，坦白讲，保险短期内确实没有高收益，本金也有锁定期。")
-  ).toBeInTheDocument();
-  expect(
-    screen.getByText("严禁夸大分红或万能账户结算利率")
-  ).toBeInTheDocument();
-});
-
-test("AI 归纳的 bullet 块默认展开", () => {
-  const structured: RetrievalEvidence = {
-    ...evidence,
-    text: ["关键动作：", "- 先做保障缺口分析", "- 再谈缴费期"].join("\n")
-  };
-  render(<EvidenceDetail evidence={structured} index={0} />);
-
-  // 生成类要点是核心内容，直接展开、无折叠开关。
-  expect(screen.getByText("先做保障缺口分析")).toBeInTheDocument();
-  expect(
-    screen.queryByRole("button", { name: /关键动作/ })
-  ).not.toBeInTheDocument();
-});
-
-test("非结构化正文回退为纯文本展示", () => {
-  render(<EvidenceDetail evidence={evidence} index={0} />);
-
-  expect(
-    screen.getByText("客户担心预算，可以先承接预算，再对齐保障缺口。")
-  ).toBeInTheDocument();
-  expect(screen.queryByText("AI 归纳")).not.toBeInTheDocument();
 });
