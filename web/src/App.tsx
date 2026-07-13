@@ -31,6 +31,7 @@ import { BatchCreateView } from "./components/BatchCreateView";
 import { BatchRunView } from "./components/BatchRunView";
 import { ChatView } from "./components/ChatView";
 import {
+  citedEvidenceIndexes,
   EvidenceDetailContext,
   type EvidenceDetailContextValue
 } from "./components/EvidenceDetailContext";
@@ -790,8 +791,12 @@ export function App({
     () => latestResponseFromTurns(activeChatSession.turns),
     [activeChatSession.turns]
   );
-  const hasEvidenceContext =
-    effectiveSelection.kind === "batch" || Boolean(chatLatestResponse);
+  const hasChatCitations =
+    effectiveSelection.kind === "chat" &&
+    Boolean(
+      chatLatestResponse &&
+        citedEvidenceIndexes(chatLatestResponse.citations).size > 0
+    );
 
   function navigateWorkspace(view: WorkspaceLocation["view"]) {
     navigateWorkspaceLocation(view === "chat" ? { view: "chat" } : { view: "ingestion" });
@@ -1267,7 +1272,7 @@ export function App({
           <div className="evidence-detail-slot" ref={setDetailContainer} />
           {!selectedEvidenceKey && (
             <p className="empty-source">
-              {hasEvidenceContext
+              {hasChatCitations
                 ? "点击一条知识引用查看明细。"
                 : "暂无引用。"}
             </p>

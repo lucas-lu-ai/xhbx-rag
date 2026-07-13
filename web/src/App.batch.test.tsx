@@ -651,17 +651,24 @@ test("批量行详情自动选中证据并联动右侧明细", async () => {
     "xhbx-rag.active-session.v1",
     JSON.stringify({ kind: "batch", id: "run-1" })
   );
+  const response = answerPayloadWithEvidences(2, [2]);
   const detail = batchRunDetail({
     questions: [
       batchRunQuestionDetail({
-        response: answerPayloadWithEvidences(2, [2])
+        response
       })
     ]
   });
-  installFetchStub((url, init) => {
+  const { requests } = installFetchStub((url, init) => {
     const method = init?.method ?? "GET";
     if (url.endsWith("/api/batch-runs") && method === "GET") {
       return jsonResponse({ runs: [batchRunSummary()] });
+    }
+    if (
+      url.endsWith("/api/batch-runs/run-1/rows/1/bad-case") &&
+      method === "POST"
+    ) {
+      return jsonResponse({ ok: true, bad_case_id: "bad-case-8" });
     }
     if (url.endsWith("/api/batch-runs/run-1")) {
       return jsonResponse(detail);
@@ -671,19 +678,23 @@ test("批量行详情自动选中证据并联动右侧明细", async () => {
   render(<App />);
 
   const qaPanel = screen.getByRole("main", { name: "RAG 问答" });
-  await user.click(
-    await within(qaPanel).findByRole("button", {
-      name: /客户说每年不能超过80万怎么办？/
-    })
-  );
+  const detailPane = screen.getByRole("complementary", {
+    name: "索引和溯源"
+  });
+  const questionButton = await within(qaPanel).findByRole("button", {
+    name: /客户说每年不能超过80万怎么办？/
+  });
+  expect(within(detailPane).getByText("暂无引用。")).toBeInTheDocument();
+  expect(
+    within(detailPane).queryByText("点击一条知识引用查看明细。")
+  ).not.toBeInTheDocument();
+
+  await user.click(questionButton);
   expect(
     await screen.findByText("先承接预算，再讨论缴费期和保障缺口。")
   ).toBeInTheDocument();
 
   // 进入详情屏自动选中第一条引用，右侧明细展示正文与来源摘录。
-  const detailPane = screen.getByRole("complementary", {
-    name: "索引和溯源"
-  });
   expect(
     within(detailPane).getByRole("heading", { name: "引用明细" })
   ).toBeInTheDocument();
@@ -712,4 +723,22 @@ test("批量行详情自动选中证据并联动右侧明细", async () => {
   ).not.toBeInTheDocument();
   expect(within(evidenceList).queryByText("答案引用")).not.toBeInTheDocument();
   expect(rows[0]).toHaveAttribute("aria-pressed", "true");
+
+  await user.click(within(detailPane).getByLabelText("引用1应该用"));
+  expect(await screen.findByText("已记录可用反馈。")).toBeInTheDocument();
+  expect(requests).toContainEqual(
+    expect.objectContaining({
+      url: "/api/batch-runs/run-1/rows/1/bad-case",
+      method: "POST",
+      body: expect.objectContaining({
+        evidence_feedback: [
+          expect.objectContaining({
+            chunk_id: "case-a-2",
+            label: "案例A · 阶段2"
+          })
+        ],
+        retrieval_evidences: response.retrieval_evidences
+      })
+    })
+  );
 });

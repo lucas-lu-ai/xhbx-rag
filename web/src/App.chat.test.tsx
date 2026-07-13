@@ -202,6 +202,7 @@ test("titles a new session from the first submitted question and persists it", a
 
 test("只显示模型实际引用的知识并使用连续序号", async () => {
   const user = userEvent.setup();
+  const response = answerPayloadWithEvidences(2, [2]);
   localStorage.setItem(
     "xhbx-rag.chat-sessions.v1",
     JSON.stringify({
@@ -219,15 +220,22 @@ test("只显示模型实际引用的知识并使用连续序号", async () => {
               query: "客户预算有限怎么办？",
               top_n: 20,
               top_k: 10,
-              response: answerPayloadWithEvidences(2, [2])
+              response
             }
           ]
         }
       ]
     })
   );
-  installFetchStub();
+  const { requests } = installFetchStub();
   render(<App />);
+
+  const detailPane = screen.getByRole("complementary", {
+    name: "索引和溯源"
+  });
+  expect(
+    within(detailPane).getByText("点击一条知识引用查看明细。")
+  ).toBeInTheDocument();
 
   await user.click(
     await screen.findByRole("button", { name: /知识引用/ })
@@ -247,6 +255,72 @@ test("只显示模型实际引用的知识并使用连续序号", async () => {
     within(evidenceList).queryByText("证据1正文内容。")
   ).not.toBeInTheDocument();
   expect(within(evidenceList).queryByText("答案引用")).not.toBeInTheDocument();
+
+  await user.click(rows[0]);
+  expect(
+    await within(detailPane).findByText("引用1：案例A · 阶段2")
+  ).toBeInTheDocument();
+  await user.click(within(detailPane).getByLabelText("引用1应该用"));
+
+  expect(await screen.findByText("已记录可用反馈。")).toBeInTheDocument();
+  expect(requests).toContainEqual(
+    expect.objectContaining({
+      url: "/api/bad-cases",
+      body: expect.objectContaining({
+        evidence_feedback: [
+          expect.objectContaining({
+            chunk_id: "case-a-2",
+            label: "案例A · 阶段2"
+          })
+        ],
+        retrieval_evidences: response.retrieval_evidences
+      })
+    })
+  );
+});
+
+test("旧聊天回答没有实际引用标记时显示暂无引用", async () => {
+  localStorage.setItem(
+    "xhbx-rag.chat-sessions.v1",
+    JSON.stringify({
+      version: 1,
+      active_session_id: "session-1",
+      sessions: [
+        {
+          id: "session-1",
+          title: "旧回答",
+          created_at: "2026-07-01T08:00:00.000Z",
+          updated_at: "2026-07-01T08:01:00.000Z",
+          turns: [
+            {
+              id: "turn-1",
+              query: "客户预算有限怎么办？",
+              top_n: 20,
+              top_k: 10,
+              response: {
+                ...answerPayload,
+                citations: answerPayload.citations.map((citation) => ({
+                  ...citation,
+                  selected: undefined
+                }))
+              }
+            }
+          ]
+        }
+      ]
+    })
+  );
+  installFetchStub();
+  render(<App />);
+
+  expect(await screen.findByText("案例知识库")).toBeInTheDocument();
+  const detailPane = screen.getByRole("complementary", {
+    name: "索引和溯源"
+  });
+  expect(within(detailPane).getByText("暂无引用。")).toBeInTheDocument();
+  expect(
+    within(detailPane).queryByText("点击一条知识引用查看明细。")
+  ).not.toBeInTheDocument();
 });
 
 test("loads status and submits a question", async () => {
