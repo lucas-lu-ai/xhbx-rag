@@ -258,7 +258,8 @@ test("submitBadCase posts typed payload", async () => {
     evidence_feedback: [
       {
         chunk_id: "case-a-1",
-        judgement: "should_use",
+        retrieval_judgement: "accurate",
+        answer_usage_judgement: "correct",
         label: "案例A · 需求分析",
         text_preview: "客户需要先看清保障缺口。"
       }

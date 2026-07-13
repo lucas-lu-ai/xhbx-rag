@@ -602,7 +602,7 @@ test("批量行反馈只调批量单入口并本地更新 bad_case", async () =>
   render(<App />);
 
   // 反馈操作在行详情屏内完成：批量不再有回答级反馈，
-  // 证据“不该用”带理由直接落地行级 bad case。
+  // 召回不准确带理由直接落地行级 bad case。
   const qaPanel = screen.getByRole("main", { name: "RAG 问答" });
   await user.click(
     await within(qaPanel).findByRole("button", {
@@ -614,14 +614,14 @@ test("批量行反馈只调批量单入口并本地更新 bad_case", async () =>
   ).toBeInTheDocument();
   expect(screen.queryByText("这个回答可用吗？")).not.toBeInTheDocument();
 
-  await user.click(await screen.findByLabelText("引用1不该用"));
+  await user.click(await screen.findByLabelText("引用1召回不准确"));
   await user.type(
-    screen.getByLabelText("不可用理由"),
+    screen.getByLabelText("召回不准确原因"),
     "该证据与客户问题无关。"
   );
-  await user.click(screen.getByRole("button", { name: "保存不可用反馈" }));
+  await user.click(screen.getByRole("button", { name: "保存反馈" }));
 
-  expect(await screen.findByText("已记录不可用反馈。")).toBeInTheDocument();
+  expect(await screen.findByText("已记录引用反馈。")).toBeInTheDocument();
   expect(requests).toContainEqual(
     expect.objectContaining({
       url: "/api/batch-runs/run-1/rows/1/bad-case",
@@ -629,8 +629,15 @@ test("批量行反馈只调批量单入口并本地更新 bad_case", async () =>
       body: expect.objectContaining({
         query: "客户说每年不能超过80万怎么办？",
         feedback_result: "citation_issue",
-        issue_types: ["citation_issue"],
+        issue_types: ["citation_wrong"],
         problem_detail: "该证据与客户问题无关。",
+        evidence_feedback: [
+          expect.objectContaining({
+            retrieval_judgement: "inaccurate",
+            answer_usage_judgement: "not_applicable",
+            reason: "该证据与客户问题无关。"
+          })
+        ],
         input_answer: "人工答案",
         batch_source_label: "qa.csv"
       })
@@ -724,8 +731,9 @@ test("批量行详情自动选中证据并联动右侧明细", async () => {
   expect(within(evidenceList).queryByText("答案引用")).not.toBeInTheDocument();
   expect(rows[0]).toHaveAttribute("aria-pressed", "true");
 
-  await user.click(within(detailPane).getByLabelText("引用1应该用"));
-  expect(await screen.findByText("已记录可用反馈。")).toBeInTheDocument();
+  await user.click(within(detailPane).getByLabelText("引用1召回准确"));
+  await user.click(within(detailPane).getByLabelText("引用1参考正确"));
+  expect(await screen.findByText("已记录引用反馈。")).toBeInTheDocument();
   expect(requests).toContainEqual(
     expect.objectContaining({
       url: "/api/batch-runs/run-1/rows/1/bad-case",
@@ -734,13 +742,18 @@ test("批量行详情自动选中证据并联动右侧明细", async () => {
         evidence_feedback: [
           expect.objectContaining({
             chunk_id: "case-a-2",
-            label: "案例A · 阶段2"
+            label: "案例A · 阶段2",
+            retrieval_judgement: "accurate",
+            answer_usage_judgement: "correct"
           })
         ],
         retrieval_evidences: response.retrieval_evidences
       })
     })
   );
+  expect(
+    requests.filter((request) => request.url.endsWith("/api/bad-cases"))
+  ).toHaveLength(0);
 });
 
 test("批量行引用反馈按行与原始 evidence 索引隔离", async () => {
@@ -794,12 +807,19 @@ test("批量行引用反馈按行与原始 evidence 索引隔离", async () => {
     })
   );
 
-  const firstCheckbox = await within(detailPane).findByLabelText(
-    "引用1应该用"
+  const firstRetrievalRadio = await within(detailPane).findByLabelText(
+    "引用1召回准确"
   );
-  await user.click(firstCheckbox);
-  expect(await screen.findByText("已记录可用反馈。")).toBeInTheDocument();
-  expect(firstCheckbox).toBeChecked();
+  await user.click(firstRetrievalRadio);
+  const firstAnswerRadio = await within(detailPane).findByLabelText(
+    "引用1参考正确"
+  );
+  await user.click(firstAnswerRadio);
+  expect(await screen.findByText("已记录引用反馈。")).toBeInTheDocument();
+  expect(firstRetrievalRadio).toBeChecked();
+  expect(firstRetrievalRadio).toBeDisabled();
+  expect(firstAnswerRadio).toBeChecked();
+  expect(firstAnswerRadio).toBeDisabled();
   expect(requests).toContainEqual(
     expect.objectContaining({
       url: "/api/batch-runs/run-1/rows/1/bad-case",
@@ -815,11 +835,18 @@ test("批量行引用反馈按行与原始 evidence 索引隔离", async () => {
   await user.click(screen.getByRole("button", { name: "下一行" }));
   expect(await screen.findByText("第二行客户问题")).toBeInTheDocument();
   expect(
-    await within(detailPane).findByLabelText("引用1应该用")
+    await within(detailPane).findByLabelText("引用1召回准确")
   ).not.toBeChecked();
 
   await user.click(screen.getByRole("button", { name: "上一行" }));
-  expect(
-    await within(detailPane).findByLabelText("引用1应该用")
-  ).toBeChecked();
+  const restoredRetrievalRadio = await within(detailPane).findByLabelText(
+    "引用1召回准确"
+  );
+  const restoredAnswerRadio = await within(detailPane).findByLabelText(
+    "引用1参考正确"
+  );
+  expect(restoredRetrievalRadio).toBeChecked();
+  expect(restoredRetrievalRadio).toBeDisabled();
+  expect(restoredAnswerRadio).toBeChecked();
+  expect(restoredAnswerRadio).toBeDisabled();
 });

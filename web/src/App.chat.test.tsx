@@ -260,9 +260,10 @@ test("只显示模型实际引用的知识并使用连续序号", async () => {
   expect(
     await within(detailPane).findByText("引用1：案例A · 阶段2")
   ).toBeInTheDocument();
-  await user.click(within(detailPane).getByLabelText("引用1应该用"));
+  await user.click(within(detailPane).getByLabelText("引用1召回准确"));
+  await user.click(within(detailPane).getByLabelText("引用1参考正确"));
 
-  expect(await screen.findByText("已记录可用反馈。")).toBeInTheDocument();
+  expect(await screen.findByText("已记录引用反馈。")).toBeInTheDocument();
   expect(requests).toContainEqual(
     expect.objectContaining({
       url: "/api/bad-cases",
@@ -723,10 +724,12 @@ test("marks an evidence as useful and saves a usable bad case", async () => {
 
   await user.type(screen.getByLabelText("输入问题"), "客户说每年不能超过80万怎么办？");
   await user.click(screen.getByRole("button", { name: "发送" }));
-  await user.click(await screen.findByLabelText("引用1应该用"));
+  await user.click(await screen.findByLabelText("引用1召回准确"));
+  await user.click(await screen.findByLabelText("引用1参考正确"));
 
-  expect(await screen.findByText("已记录可用反馈。")).toBeInTheDocument();
-  expect(screen.getByLabelText("引用1应该用")).toBeChecked();
+  expect(await screen.findByText("已记录引用反馈。")).toBeInTheDocument();
+  expect(screen.getByLabelText("引用1召回准确")).toBeChecked();
+  expect(screen.getByLabelText("引用1参考正确")).toBeChecked();
   expect(requests).toContainEqual(
     expect.objectContaining({
       url: "/api/bad-cases",
@@ -737,7 +740,8 @@ test("marks an evidence as useful and saves a usable bad case", async () => {
         evidence_feedback: [
           {
             chunk_id: "case-a-2",
-            judgement: "should_use",
+            retrieval_judgement: "accurate",
+            answer_usage_judgement: "correct",
             label: "案例A · 需求分析",
             text_preview: "客户担心预算，可以先承接预算，再对齐保障缺口。"
           }
@@ -747,38 +751,81 @@ test("marks an evidence as useful and saves a usable bad case", async () => {
   );
 });
 
-test("marks an evidence as not useful with a reason and saves a bad case", async () => {
+test("marks an inaccurate retrieval with a reason and saves a citation issue", async () => {
   const user = userEvent.setup();
   const { requests } = installFetchStub();
   render(<App />);
 
   await user.type(screen.getByLabelText("输入问题"), "客户说每年不能超过80万怎么办？");
   await user.click(screen.getByRole("button", { name: "发送" }));
-  await user.click(await screen.findByLabelText("引用1不该用"));
+  await user.click(await screen.findByLabelText("引用1召回不准确"));
   await user.type(
-    screen.getByLabelText("不可用理由"),
+    screen.getByLabelText("召回不准确原因"),
     "该证据与客户问题无关。"
   );
-  await user.click(screen.getByRole("button", { name: "保存不可用反馈" }));
+  await user.click(screen.getByRole("button", { name: "保存反馈" }));
 
-  expect(await screen.findByText("已记录不可用反馈。")).toBeInTheDocument();
-  expect(screen.getByLabelText("引用1不该用")).toBeChecked();
+  expect(await screen.findByText("已记录引用反馈。")).toBeInTheDocument();
+  expect(screen.getByLabelText("引用1召回不准确")).toBeChecked();
   expect(requests).toContainEqual(
     expect.objectContaining({
       url: "/api/bad-cases",
       body: expect.objectContaining({
         query: "客户说每年不能超过80万怎么办？",
         feedback_result: "citation_issue",
-        issue_types: ["citation_issue"],
+        issue_types: ["citation_wrong"],
         problem_detail: "该证据与客户问题无关。",
         note: "该证据与客户问题无关。",
         evidence_feedback: [
           {
             chunk_id: "case-a-2",
-            judgement: "should_not_use",
+            retrieval_judgement: "inaccurate",
+            answer_usage_judgement: "not_applicable",
             label: "案例A · 需求分析",
             text_preview: "客户担心预算，可以先承接预算，再对齐保障缺口。",
             reason: "该证据与客户问题无关。"
+          }
+        ]
+      })
+    })
+  );
+});
+
+test("marks incorrect answer usage with a reason and saves an inaccurate bad case", async () => {
+  const user = userEvent.setup();
+  const { requests } = installFetchStub();
+  render(<App />);
+
+  await user.type(screen.getByLabelText("输入问题"), "客户说每年不能超过80万怎么办？");
+  await user.click(screen.getByRole("button", { name: "发送" }));
+  await user.click(await screen.findByLabelText("引用1召回准确"));
+  await user.click(await screen.findByLabelText("引用1参考不正确"));
+  await user.type(
+    screen.getByLabelText("参考不正确原因"),
+    "回答超出了证据范围。"
+  );
+  await user.click(screen.getByRole("button", { name: "保存反馈" }));
+
+  expect(await screen.findByText("已记录引用反馈。")).toBeInTheDocument();
+  expect(screen.getByLabelText("引用1召回准确")).toBeChecked();
+  expect(screen.getByLabelText("引用1参考不正确")).toBeChecked();
+  expect(requests).toContainEqual(
+    expect.objectContaining({
+      url: "/api/bad-cases",
+      body: expect.objectContaining({
+        query: "客户说每年不能超过80万怎么办？",
+        feedback_result: "inaccurate",
+        issue_types: ["answer_unsupported"],
+        problem_detail: "回答超出了证据范围。",
+        note: "回答超出了证据范围。",
+        evidence_feedback: [
+          {
+            chunk_id: "case-a-2",
+            retrieval_judgement: "accurate",
+            answer_usage_judgement: "incorrect",
+            label: "案例A · 需求分析",
+            text_preview: "客户担心预算，可以先承接预算，再对齐保障缺口。",
+            reason: "回答超出了证据范围。"
           }
         ]
       })

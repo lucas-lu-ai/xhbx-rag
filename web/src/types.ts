@@ -178,12 +178,6 @@ export type BadCaseProblemTag =
   | "compliance_risk"
   | "other";
 
-// 仅供 BadCasePanel 迁移期间保留；新引用反馈 UI 不再使用该单维度判定。
-export type EvidenceFeedbackJudgement =
-  | "should_use"
-  | "should_not_use"
-  | "ranking_low";
-
 export type RetrievalFeedbackJudgement = "accurate" | "inaccurate";
 
 export type AnswerUsageFeedbackJudgement =

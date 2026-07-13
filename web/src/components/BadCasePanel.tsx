@@ -8,7 +8,7 @@ import type {
   BadCaseRequest,
   ChatTurn,
   EvidenceFeedback,
-  EvidenceFeedbackJudgement,
+  EvidenceFeedbackDecision,
   RetrievalEvidence
 } from "../types";
 import { EvidenceDetail } from "./EvidenceDetail";
@@ -29,7 +29,7 @@ type BadCasePanelProps = {
 };
 
 // 知识引用面板：紧凑引用列表 + 右侧引用明细。
-// 回答级整体反馈已下线，反馈只在引用明细里以“不该用 + 理由”落地 bad case。
+// 回答级整体反馈已下线，反馈只在引用明细里按召回与回答参考两个维度落地。
 export function BadCasePanel({
   turn,
   response,
@@ -56,95 +56,60 @@ export function BadCasePanel({
     ({ evidenceIndex }) => evidenceIndex === selectedEvidenceIndex
   );
 
-  function toggleEvidenceFeedback(
+  async function submitEvidenceFeedback(
     index: number,
     evidence: RetrievalEvidence,
-    judgement: EvidenceFeedbackJudgement
+    decision: EvidenceFeedbackDecision
   ) {
-    const key = evidenceFeedbackKey(turn.id, index);
-    setEvidenceFeedback((items) => {
-      if (items[key]?.judgement === judgement) {
-        const { [key]: _removed, ...rest } = items;
-        return rest;
-      }
-      return {
-        ...items,
-        [key]: {
-          chunk_id: evidence.chunk_id,
-          judgement,
-          label: evidenceFeedbackLabel(index, evidence),
-          text_preview: evidenceFeedbackPreview(evidence)
-        }
-      };
-    });
-  }
-
-  // 证据“应该用”即时落地：生成一条正向 bad case（feedback_result=usable，
-  // 不进 bad case JSONL 导出），成功后同步本地判定。
-  async function submitEvidenceUseful(
-    index: number,
-    evidence: RetrievalEvidence
-  ) {
+    const reason = "reason" in decision ? (decision.reason?.trim() ?? "") : "";
+    const normalizedDecision: EvidenceFeedbackDecision =
+      decision.retrieval_judgement === "inaccurate"
+        ? {
+            retrieval_judgement: "inaccurate",
+            answer_usage_judgement: "not_applicable",
+            reason
+          }
+        : decision.answer_usage_judgement === "incorrect"
+          ? {
+              retrieval_judgement: "accurate",
+              answer_usage_judgement: "incorrect",
+              reason
+            }
+          : {
+              retrieval_judgement: "accurate",
+              answer_usage_judgement: "correct"
+            };
     const entry: EvidenceFeedback = {
       chunk_id: evidence.chunk_id,
-      judgement: "should_use",
+      ...normalizedDecision,
       label: evidenceFeedbackLabel(index, evidence),
       text_preview: evidenceFeedbackPreview(evidence)
     };
+    const isRetrievalIssue =
+      normalizedDecision.retrieval_judgement === "inaccurate";
+    const isAnswerIssue =
+      normalizedDecision.answer_usage_judgement === "incorrect";
     const payload: BadCaseRequest = {
       query: turn.query,
       rewritten_query: response.rewritten_query ?? "",
       answer: response.answer,
       top_n: turn.top_n,
       top_k: turn.top_k,
-      feedback_result: "usable",
-      problem_tags: [],
-      problem_detail: "",
-      expected_answer: "",
-      reference_note: "",
-      evidence_feedback: [entry],
-      issue_types: ["usable"],
-      expected_knowledge: "",
-      expected_source: "",
-      note: "",
-      citations: response.citations,
-      retrieval_evidences: evidences
-    };
-    await submitFeedback(payload);
-    onSavedBadCase?.(payload);
-    setEvidenceFeedback((items) => ({
-      ...items,
-      [evidenceFeedbackKey(turn.id, index)]: entry
-    }));
-  }
-
-  // 证据“不该用”即时落地：带理由生成一条 bad case（批量走行级入口），
-  // 成功后同步本地判定，行的“已反馈”状态与导出按钮随之更新。
-  async function submitEvidenceNotUseful(
-    index: number,
-    evidence: RetrievalEvidence,
-    reason: string
-  ) {
-    const entry: EvidenceFeedback = {
-      chunk_id: evidence.chunk_id,
-      judgement: "should_not_use",
-      label: evidenceFeedbackLabel(index, evidence),
-      text_preview: evidenceFeedbackPreview(evidence),
-      reason
-    };
-    const payload: BadCaseRequest = {
-      query: turn.query,
-      rewritten_query: response.rewritten_query ?? "",
-      answer: response.answer,
-      top_n: turn.top_n,
-      top_k: turn.top_k,
-      feedback_result: "citation_issue",
+      feedback_result: isRetrievalIssue
+        ? "citation_issue"
+        : isAnswerIssue
+          ? "inaccurate"
+          : "usable",
       problem_tags: [],
       problem_detail: reason,
       expected_answer: "",
       reference_note: "",
       evidence_feedback: [entry],
-      issue_types: ["citation_issue"],
+      issue_types: isRetrievalIssue
+        ? ["citation_wrong"]
+        : isAnswerIssue
+          ? ["answer_unsupported"]
+          : ["usable"],
       expected_knowledge: "",
       expected_source: "",
       note: reason,
@@ -178,29 +143,16 @@ export function BadCasePanel({
             evidence={selectedEntry.evidence}
             relatedEvidences={evidences}
             index={selectedEntry.displayIndex}
-            feedbackJudgement={
+            feedback={
               evidenceFeedback[
                 evidenceFeedbackKey(turn.id, selectedEntry.evidenceIndex)
-              ]?.judgement
+              ]
             }
-            onToggleFeedback={(judgement) =>
-              toggleEvidenceFeedback(
+            onSubmitFeedback={(decision) =>
+              submitEvidenceFeedback(
                 selectedEntry.evidenceIndex,
                 selectedEntry.evidence,
-                judgement
-              )
-            }
-            onSubmitUseful={() =>
-              submitEvidenceUseful(
-                selectedEntry.evidenceIndex,
-                selectedEntry.evidence
-              )
-            }
-            onSubmitNotUseful={(reason) =>
-              submitEvidenceNotUseful(
-                selectedEntry.evidenceIndex,
-                selectedEntry.evidence,
-                reason
+                decision
               )
             }
           />,
