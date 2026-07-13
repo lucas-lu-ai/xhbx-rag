@@ -366,6 +366,22 @@ test("提交失败时不回填 feedback 且不通知已保存", async () => {
   expect(onSavedBadCase).not.toHaveBeenCalled();
 });
 
+test("onSavedBadCase 同步异常不让已保存反馈丢失或提交失败", async () => {
+  const onSavedBadCase = vi.fn<(payload: BadCaseRequest) => void>(() => {
+    throw new Error("通知失败");
+  });
+  renderPanel("turn-1:evidence-2", { onSavedBadCase });
+
+  fireEvent.click(
+    screen.getByRole("button", { name: "提交准确且参考正确" })
+  );
+
+  await waitFor(() => expect(onSavedBadCase).toHaveBeenCalledTimes(1));
+  expect(screen.getByTestId("mock-feedback")).toHaveTextContent(
+    '"answer_usage_judgement":"correct"'
+  );
+});
+
 test("选中未引用的原始证据时不 portal 详情", () => {
   renderPanel("turn-1:evidence-1");
 

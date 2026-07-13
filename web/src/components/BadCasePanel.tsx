@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
 import { submitBadCase } from "../api";
@@ -6,6 +6,8 @@ import { formatEvidenceMeta } from "../format";
 import type {
   AnswerResponse,
   BadCaseRequest,
+  BadCaseFeedbackResult,
+  BadCaseIssueType,
   ChatTurn,
   EvidenceFeedback,
   EvidenceFeedbackDecision,
@@ -41,6 +43,12 @@ export function BadCasePanel({
   const [evidenceFeedback, setEvidenceFeedback] = useState<
     Record<string, EvidenceFeedback>
   >({});
+  const selectionGenerationRef = useRef(0);
+  const feedbackRequestIdRef = useRef(0);
+  const activeFeedbackRequestRef = useRef<{
+    generation: number;
+    requestId: number;
+  } | null>(null);
   const evidences = response.retrieval_evidences ?? [];
   const submitFeedback =
     submit ?? ((payload: BadCaseRequest) => submitBadCase(payload));
@@ -56,72 +64,77 @@ export function BadCasePanel({
     ({ evidenceIndex }) => evidenceIndex === selectedEvidenceIndex
   );
 
+  // 每次选择变更都推进单调代次；即使 A→B→A 回到相同 key，旧 A 请求也不会复活。
+  // layout effect 在新明细可交互前完成失效，cleanup 同时覆盖卸载与切换间隙。
+  useLayoutEffect(() => {
+    selectionGenerationRef.current += 1;
+    activeFeedbackRequestRef.current = null;
+    return () => {
+      selectionGenerationRef.current += 1;
+      activeFeedbackRequestRef.current = null;
+    };
+  }, [selectedEvidenceKey]);
+
   async function submitEvidenceFeedback(
     index: number,
     evidence: RetrievalEvidence,
     decision: EvidenceFeedbackDecision
   ) {
-    const reason = "reason" in decision ? (decision.reason?.trim() ?? "") : "";
-    const normalizedDecision: EvidenceFeedbackDecision =
-      decision.retrieval_judgement === "inaccurate"
-        ? {
-            retrieval_judgement: "inaccurate",
-            answer_usage_judgement: "not_applicable",
-            reason
-          }
-        : decision.answer_usage_judgement === "incorrect"
-          ? {
-              retrieval_judgement: "accurate",
-              answer_usage_judgement: "incorrect",
-              reason
-            }
-          : {
-              retrieval_judgement: "accurate",
-              answer_usage_judgement: "correct"
-            };
+    const generation = selectionGenerationRef.current;
+    const requestId = feedbackRequestIdRef.current + 1;
+    feedbackRequestIdRef.current = requestId;
+    activeFeedbackRequestRef.current = { generation, requestId };
+    const isCurrentRequest = () =>
+      selectionGenerationRef.current === generation &&
+      activeFeedbackRequestRef.current?.generation === generation &&
+      activeFeedbackRequestRef.current.requestId === requestId;
+    const classification = classifyEvidenceFeedbackDecision(decision);
+    const { normalizedDecision, feedbackResult, issueTypes, reason } =
+      classification;
     const entry: EvidenceFeedback = {
       chunk_id: evidence.chunk_id,
       ...normalizedDecision,
       label: evidenceFeedbackLabel(index, evidence),
       text_preview: evidenceFeedbackPreview(evidence)
     };
-    const isRetrievalIssue =
-      normalizedDecision.retrieval_judgement === "inaccurate";
-    const isAnswerIssue =
-      normalizedDecision.answer_usage_judgement === "incorrect";
     const payload: BadCaseRequest = {
       query: turn.query,
       rewritten_query: response.rewritten_query ?? "",
       answer: response.answer,
       top_n: turn.top_n,
       top_k: turn.top_k,
-      feedback_result: isRetrievalIssue
-        ? "citation_issue"
-        : isAnswerIssue
-          ? "inaccurate"
-          : "usable",
+      feedback_result: feedbackResult,
       problem_tags: [],
       problem_detail: reason,
       expected_answer: "",
       reference_note: "",
       evidence_feedback: [entry],
-      issue_types: isRetrievalIssue
-        ? ["citation_wrong"]
-        : isAnswerIssue
-          ? ["answer_unsupported"]
-          : ["usable"],
+      issue_types: issueTypes,
       expected_knowledge: "",
       expected_source: "",
       note: reason,
       citations: response.citations,
       retrieval_evidences: evidences
     };
-    await submitFeedback(payload);
-    onSavedBadCase?.(payload);
-    setEvidenceFeedback((items) => ({
-      ...items,
-      [evidenceFeedbackKey(turn.id, index)]: entry
-    }));
+    try {
+      await submitFeedback(payload);
+      if (!isCurrentRequest()) {
+        return;
+      }
+      setEvidenceFeedback((items) => ({
+        ...items,
+        [evidenceFeedbackKey(turn.id, index)]: entry
+      }));
+      try {
+        onSavedBadCase?.(payload);
+      } catch {
+        // 通知属于远端保存后的旁路同步，不得把已保存反馈重新暴露为可重试。
+      }
+    } finally {
+      if (isCurrentRequest()) {
+        activeFeedbackRequestRef.current = null;
+      }
+    }
   }
 
   return (
@@ -160,6 +173,61 @@ export function BadCasePanel({
         )}
     </section>
   );
+}
+
+type EvidenceFeedbackClassification = {
+  normalizedDecision: EvidenceFeedbackDecision;
+  feedbackResult: BadCaseFeedbackResult;
+  issueTypes: BadCaseIssueType[];
+  reason: string;
+};
+
+function classifyEvidenceFeedbackDecision(
+  decision: EvidenceFeedbackDecision
+): EvidenceFeedbackClassification {
+  switch (decision.retrieval_judgement) {
+    case "inaccurate":
+      switch (decision.answer_usage_judgement) {
+        case "not_applicable": {
+          const reason = decision.reason.trim();
+          return {
+            normalizedDecision: { ...decision, reason },
+            feedbackResult: "citation_issue",
+            issueTypes: ["citation_wrong"],
+            reason
+          };
+        }
+        default:
+          return assertNever(decision);
+      }
+    case "accurate":
+      switch (decision.answer_usage_judgement) {
+        case "correct":
+          return {
+            normalizedDecision: decision,
+            feedbackResult: "usable",
+            issueTypes: ["usable"],
+            reason: ""
+          };
+        case "incorrect": {
+          const reason = decision.reason.trim();
+          return {
+            normalizedDecision: { ...decision, reason },
+            feedbackResult: "inaccurate",
+            issueTypes: ["answer_unsupported"],
+            reason
+          };
+        }
+        default:
+          return assertNever(decision);
+      }
+    default:
+      return assertNever(decision);
+  }
+}
+
+function assertNever(value: never): never {
+  throw new Error(`未处理的引用反馈判定：${JSON.stringify(value)}`);
 }
 
 function evidenceFeedbackKey(turnId: string, index: number): string {
