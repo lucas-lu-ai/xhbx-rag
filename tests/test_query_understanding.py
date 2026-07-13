@@ -119,12 +119,6 @@ def test_query_understanding_accepts_training_course_chunk_type() -> None:
     assert result.filters.chunk_types == ["training_course"]
 
 
-def test_query_understanding_prompt_mentions_training_course() -> None:
-    from xhbx_rag.query_understanding import _SYSTEM_PROMPT
-
-    assert "training_course" in _SYSTEM_PROMPT
-
-
 @pytest.mark.parametrize(
     ("collection_targets", "expected"),
     [
@@ -166,13 +160,150 @@ def test_query_understanding_defaults_missing_collection_targets_to_all() -> Non
     assert result.collection_targets == ["case", "course"]
 
 
+@pytest.mark.parametrize(
+    ("intent", "chunk_type"),
+    [
+        ("journey_search", "customer_journey"),
+        ("strategy_search", "strategy"),
+        ("script_search", "script"),
+        ("objection_handling", "objection_handling"),
+    ],
+)
+def test_query_understanding_falls_back_to_all_when_case_semantics_miss_case_target(
+    intent: str,
+    chunk_type: str,
+) -> None:
+    result = QueryUnderstanding.model_validate(
+        {
+            "intent": intent,
+            "rewritten_query": "查询案例实战经验",
+            "needs_retrieval": True,
+            "collection_targets": ["course"],
+            "filters": {"chunk_types": [chunk_type]},
+        }
+    )
+
+    assert result.collection_targets == ["case", "course"]
+
+
+@pytest.mark.parametrize(
+    "intent",
+    ["journey_search", "strategy_search", "script_search", "objection_handling"],
+)
+def test_query_understanding_uses_case_intent_as_routing_guard_when_chunk_types_empty(
+    intent: str,
+) -> None:
+    result = QueryUnderstanding.model_validate(
+        {
+            "intent": intent,
+            "rewritten_query": "查询案例实战经验",
+            "needs_retrieval": True,
+            "collection_targets": ["course"],
+            "filters": {"chunk_types": []},
+        }
+    )
+
+    assert result.collection_targets == ["case", "course"]
+
+
+def test_query_understanding_falls_back_to_all_when_course_semantics_miss_course_target() -> None:
+    result = QueryUnderstanding.model_validate(
+        {
+            "intent": "general_sales_qa",
+            "rewritten_query": "查询培训课程",
+            "needs_retrieval": True,
+            "collection_targets": ["case"],
+            "filters": {"chunk_types": ["training_course"]},
+        }
+    )
+
+    assert result.collection_targets == ["case", "course"]
+
+
+@pytest.mark.parametrize("collection_targets", [["case"], ["course"]])
+def test_query_understanding_falls_back_to_all_for_mixed_chunk_types_with_one_target(
+    collection_targets: list[str],
+) -> None:
+    result = QueryUnderstanding.model_validate(
+        {
+            "intent": "general_sales_qa",
+            "rewritten_query": "比较实战话术与培训课程",
+            "needs_retrieval": True,
+            "collection_targets": collection_targets,
+            "filters": {"chunk_types": ["script", "training_course"]},
+        }
+    )
+
+    assert result.collection_targets == ["case", "course"]
+
+
+@pytest.mark.parametrize(
+    ("intent", "chunk_types", "collection_targets"),
+    [
+        ("journey_search", ["customer_journey"], ["case"]),
+        ("strategy_search", ["strategy"], ["case"]),
+        ("script_search", ["script"], ["case"]),
+        ("objection_handling", ["objection_handling"], ["case"]),
+        ("general_sales_qa", ["training_course"], ["course"]),
+    ],
+)
+def test_query_understanding_preserves_semantically_consistent_single_target(
+    intent: str,
+    chunk_types: list[str],
+    collection_targets: list[str],
+) -> None:
+    result = QueryUnderstanding.model_validate(
+        {
+            "intent": intent,
+            "rewritten_query": "查询指定类型知识",
+            "needs_retrieval": True,
+            "collection_targets": collection_targets,
+            "filters": {"chunk_types": chunk_types},
+        }
+    )
+
+    assert result.collection_targets == collection_targets
+
+
+@pytest.mark.parametrize("collection_targets", [["case"], ["course"]])
+def test_query_understanding_preserves_general_qa_target_when_chunk_types_empty(
+    collection_targets: list[str],
+) -> None:
+    result = QueryUnderstanding.model_validate(
+        {
+            "intent": "general_sales_qa",
+            "rewritten_query": "保险销售知识是什么？",
+            "needs_retrieval": True,
+            "collection_targets": collection_targets,
+            "filters": {"chunk_types": []},
+        }
+    )
+
+    assert result.collection_targets == collection_targets
+
+
+def test_query_understanding_does_not_reconcile_targets_when_retrieval_not_needed() -> None:
+    result = QueryUnderstanding.model_validate(
+        {
+            "intent": "out_of_scope",
+            "rewritten_query": "",
+            "needs_retrieval": False,
+            "collection_targets": ["course"],
+            "filters": {"chunk_types": ["script"]},
+        }
+    )
+
+    assert result.collection_targets == ["course"]
+
+
 def test_query_understanding_prompt_explains_collection_routing() -> None:
     from xhbx_rag.query_understanding import _SYSTEM_PROMPT
 
-    assert "collection_targets" in _SYSTEM_PROMPT
-    assert '案例实战、绩优经验类问题选择 ["case"]' in _SYSTEM_PROMPT
-    assert '课程教材、标准流程类问题选择 ["course"]' in _SYSTEM_PROMPT
-    assert '混合问题或无法确定时选择 ["case", "course"]' in _SYSTEM_PROMPT
+    assert "case 包含 customer_journey | strategy | script | objection_handling" in _SYSTEM_PROMPT
+    assert "course 仅包含 training_course" in _SYSTEM_PROMPT
+    assert '同时需要案例和课程时选择 ["case", "course"]' in _SYSTEM_PROMPT
+    assert "collection_targets 必须与 intent 和 filters.chunk_types 一致" in _SYSTEM_PROMPT
+    assert '无法确定时选择 ["case", "course"]' in _SYSTEM_PROMPT
 
 
 def test_query_understanding_normalizes_empty_filter_arrays_to_blank_strings() -> None:

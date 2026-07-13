@@ -632,6 +632,7 @@ def test_answer_question_emits_query_trace_around_understanding(
             "intent": understanding.intent,
             "rewritten_query": understanding.rewritten_query,
             "needs_retrieval": understanding.needs_retrieval,
+            "collection_targets": understanding.collection_targets,
             "filters": understanding.filters.model_dump(mode="json"),
         }
     ]

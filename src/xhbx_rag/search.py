@@ -64,6 +64,7 @@ def emit_query_understood_trace(
             "intent": understanding.intent,
             "rewritten_query": understanding.rewritten_query,
             "needs_retrieval": understanding.needs_retrieval,
+            "collection_targets": understanding.collection_targets,
             "filters": understanding.filters.model_dump(mode="json"),
         },
     )

@@ -527,5 +527,6 @@ def test_search_evidence_emits_step_trace_events() -> None:
         "search.completed",
     ]
     assert trace.events[1].payload["rewritten_query"] == "客户抗拒谈保险时如何开场"
+    assert trace.events[1].payload["collection_targets"] == ["case", "course"]
     assert trace.events[3].payload["candidate_count"] == 2
     assert trace.events[4].payload["results"][0]["chunk_id"] == "c2"

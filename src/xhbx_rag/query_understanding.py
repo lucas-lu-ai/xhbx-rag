@@ -19,12 +19,16 @@ Intent = Literal[
 ]
 CollectionTarget = Literal["case", "course"]
 
+_CASE_CHUNK_TYPES = frozenset(
+    {"customer_journey", "strategy", "script", "objection_handling"}
+)
+_COURSE_CHUNK_TYPES = frozenset({"training_course"})
+_CASE_INTENTS = frozenset(
+    {"journey_search", "strategy_search", "script_search", "objection_handling"}
+)
 _ALLOWED_CHUNK_TYPES = {
-    "customer_journey",
-    "strategy",
-    "script",
-    "objection_handling",
-    "training_course",
+    *_CASE_CHUNK_TYPES,
+    *_COURSE_CHUNK_TYPES,
 }
 
 
@@ -104,6 +108,23 @@ class QueryUnderstanding(BaseModel):
             raise ValueError("needs_retrieval=true 时 rewritten_query 不能为空")
         return self
 
+    @model_validator(mode="after")
+    def _reconcile_collection_targets(self) -> "QueryUnderstanding":
+        if not self.needs_retrieval:
+            return self
+
+        chunk_types = set(self.filters.chunk_types)
+        needs_case = self.intent in _CASE_INTENTS or bool(
+            chunk_types.intersection(_CASE_CHUNK_TYPES)
+        )
+        needs_course = bool(chunk_types.intersection(_COURSE_CHUNK_TYPES))
+        targets = set(self.collection_targets)
+        if (needs_case and "case" not in targets) or (
+            needs_course and "course" not in targets
+        ):
+            self.collection_targets = ["case", "course"]
+        return self
+
 
 class QueryUnderstandingAgent:
     def __init__(
@@ -178,9 +199,12 @@ _SYSTEM_PROMPT = """你是销售洞察 RAG 的查询理解节点。
 - rewritten_query: 独立、明确、适合检索的问题；如果 needs_retrieval=false 可为空
 - needs_retrieval: boolean
 - collection_targets: 必须输出的字符串数组，只能使用 case | course
+  - case 包含 customer_journey | strategy | script | objection_handling
+  - course 仅包含 training_course
   - 案例实战、绩优经验类问题选择 ["case"]
   - 课程教材、标准流程类问题选择 ["course"]
-  - 混合问题或无法确定时选择 ["case", "course"]
+  - 同时需要案例和课程时选择 ["case", "course"]
+  - 无法确定时选择 ["case", "course"]
 - filters: object，包含 chunk_types, stage, scenario, objection, strategy_names
   - chunk_types 只能使用 customer_journey | strategy | script | objection_handling | training_course，不要输出 qa。
 要求：
@@ -189,6 +213,7 @@ _SYSTEM_PROMPT = """你是销售洞察 RAG 的查询理解节点。
 3. 如果问题不属于保险销售知识（案例经验、话术、异议、策略、客户旅程、培训课程），intent=out_of_scope 且 needs_retrieval=false。
 4. 通用解释、作用、价值、原因类问题使用 general_sales_qa，chunk_types 通常留空，除非用户明确限定只查某类知识。
 5. 知识库同时包含绩优案例经验与制式培训课程两类：问"怎么讲这门课/课程内容/标准流程/制式话术/培训教材"倾向 chunk_types=["training_course"]；问"某位绩优如何做成/实战经验"倾向案例四类；不确定时 chunk_types 留空同时检索两类。
+6. collection_targets 必须与 intent 和 filters.chunk_types 一致；混合类型选择两者，不确定时也选择两者。
 """
 
 
