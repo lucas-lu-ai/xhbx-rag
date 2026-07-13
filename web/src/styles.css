@@ -1073,12 +1073,17 @@ dd {
 
 .source-detail {
   display: grid;
+  align-content: start;
   flex: 1;
   gap: 12px;
   padding: 18px;
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
+}
+
+.evidence-detail-slot:empty {
+  display: none;
 }
 
 .source-stack {
