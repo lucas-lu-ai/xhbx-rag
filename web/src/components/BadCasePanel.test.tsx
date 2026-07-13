@@ -4,11 +4,13 @@ import {
   screen,
   waitFor
 } from "@testing-library/react";
+import { useState } from "react";
 
 import type {
   AnswerResponse,
   BadCaseRequest,
   ChatTurn,
+  EvidenceFeedbackJudgement,
   RetrievalEvidence
 } from "../types";
 import { BadCasePanel } from "./BadCasePanel";
@@ -19,12 +21,16 @@ vi.mock("./EvidenceDetail", () => ({
     evidence,
     relatedEvidences,
     index,
+    feedbackJudgement,
+    onToggleFeedback,
     onSubmitUseful,
     onSubmitNotUseful
   }: {
     evidence: RetrievalEvidence;
     relatedEvidences: RetrievalEvidence[];
     index: number;
+    feedbackJudgement?: EvidenceFeedbackJudgement;
+    onToggleFeedback: (judgement: EvidenceFeedbackJudgement) => void;
     onSubmitUseful: () => void;
     onSubmitNotUseful: (reason: string) => void;
   }) => (
@@ -34,6 +40,15 @@ vi.mock("./EvidenceDetail", () => ({
       data-chunk-id={evidence.chunk_id}
       data-related-count={relatedEvidences.length}
     >
+      <span data-testid="mock-feedback-judgement">
+        {feedbackJudgement ?? ""}
+      </span>
+      <button
+        type="button"
+        onClick={() => onToggleFeedback("should_use")}
+      >
+        切换应该用状态
+      </button>
       <button type="button" onClick={onSubmitUseful}>
         提交应该用
       </button>
@@ -82,6 +97,34 @@ const turn: ChatTurn = {
   top_k: 3
 };
 
+const unkeyedEvidences: RetrievalEvidence[] = [
+  { text: "未引用的第一条证据" },
+  { text: "被引用的第二条证据" },
+  { text: "被引用的第三条证据" }
+];
+
+const adjacentCitationResponse: AnswerResponse = {
+  answer: "相邻引用回答",
+  citations: [
+    {
+      display_location: "证据 2",
+      display_excerpt: "被引用的第二条证据",
+      can_reveal: false,
+      selected: true,
+      evidence_index: 2
+    },
+    {
+      display_location: "证据 3",
+      display_excerpt: "被引用的第三条证据",
+      can_reveal: false,
+      selected: true,
+      evidence_index: 3
+    }
+  ],
+  evidence_count: unkeyedEvidences.length,
+  retrieval_evidences: unkeyedEvidences
+};
+
 afterEach(() => {
   document
     .querySelectorAll("[data-testid='evidence-portal']")
@@ -107,6 +150,46 @@ function renderPanel(selectedEvidenceKey: string) {
   );
 
   return { portalContainer, submit };
+}
+
+function FeedbackSelectionHarness({
+  portalContainer
+}: {
+  portalContainer: HTMLElement;
+}) {
+  const [selectedEvidenceKey, setSelectedEvidenceKey] = useState<string | null>(
+    "turn-1:evidence-2"
+  );
+
+  return (
+    <>
+      <button
+        type="button"
+        onClick={() => setSelectedEvidenceKey("turn-1:evidence-1")}
+      >
+        查看原始第 2 条
+      </button>
+      <button
+        type="button"
+        onClick={() => setSelectedEvidenceKey("turn-1:evidence-2")}
+      >
+        查看原始第 3 条
+      </button>
+      <EvidenceDetailContext.Provider
+        value={{
+          container: portalContainer,
+          selectedEvidenceKey,
+          onSelectEvidence: setSelectedEvidenceKey
+        }}
+      >
+        <BadCasePanel
+          turn={turn}
+          response={adjacentCitationResponse}
+          submit={vi.fn().mockResolvedValue({})}
+        />
+      </EvidenceDetailContext.Provider>
+    </>
+  );
 }
 
 test("引用详情使用连续显示索引，同时保留原始证据与完整关联证据", async () => {
@@ -136,4 +219,31 @@ test("选中未引用的原始证据时不 portal 详情", () => {
   renderPanel("turn-1:evidence-1");
 
   expect(screen.queryByTestId("mock-evidence-detail")).not.toBeInTheDocument();
+});
+
+test("反馈 toggle 按原始 evidence 索引隔离相邻引用状态", () => {
+  const portalContainer = document.createElement("div");
+  portalContainer.dataset.testid = "evidence-portal";
+  document.body.appendChild(portalContainer);
+  render(<FeedbackSelectionHarness portalContainer={portalContainer} />);
+
+  expect(
+    screen.getByTestId("mock-feedback-judgement")
+  ).toBeEmptyDOMElement();
+  fireEvent.click(
+    screen.getByRole("button", { name: "切换应该用状态" })
+  );
+  expect(screen.getByTestId("mock-feedback-judgement")).toHaveTextContent(
+    "should_use"
+  );
+
+  fireEvent.click(screen.getByRole("button", { name: "查看原始第 2 条" }));
+  expect(
+    screen.getByTestId("mock-feedback-judgement")
+  ).toBeEmptyDOMElement();
+
+  fireEvent.click(screen.getByRole("button", { name: "查看原始第 3 条" }));
+  expect(screen.getByTestId("mock-feedback-judgement")).toHaveTextContent(
+    "should_use"
+  );
 });
