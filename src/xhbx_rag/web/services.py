@@ -7,7 +7,13 @@ from threading import Lock, Thread
 from typing import Any, Callable, Iterator, Mapping
 
 from xhbx_rag.answer import AnswerAgent, answer_query
-from xhbx_rag.config import ConfigError, RetrievalConfig, load_env_values
+from xhbx_rag.config import (
+    ConfigError,
+    RetrievalConfig,
+    WebRetrievalLimits,
+    load_env_values,
+    web_retrieval_limits_from_env,
+)
 from xhbx_rag.embedding import EmbeddingClient
 from xhbx_rag.milvus_store import configured_collection_names, create_retrieval_store
 from xhbx_rag.observability import (
@@ -55,8 +61,13 @@ _LITE_ANSWER_LOCK = Lock()
 
 
 def get_status() -> dict[str, Any]:
+    default_limits = WebRetrievalLimits()
     try:
         config = RetrievalConfig.from_env()
+        limits = web_retrieval_limits_from_env(
+            env=load_env_values(),
+            env_file=None,
+        )
     except ConfigError as exc:
         return {
             "ok": False,
@@ -68,6 +79,8 @@ def get_status() -> dict[str, Any]:
             "milvus_course_collection": "",
             "milvus_collections": [],
             "batch_concurrency": SERIAL_BATCH_CONCURRENCY,
+            "web_retrieval_top_n": default_limits.top_n,
+            "web_retrieval_top_k": default_limits.top_k,
             "config": _missing_config_map(str(exc)),
             "errors": [str(exc)],
         }
@@ -82,6 +95,8 @@ def get_status() -> dict[str, Any]:
             "milvus_course_collection": "",
             "milvus_collections": [],
             "batch_concurrency": SERIAL_BATCH_CONCURRENCY,
+            "web_retrieval_top_n": default_limits.top_n,
+            "web_retrieval_top_k": default_limits.top_k,
             "config": _missing_config_map(SAFE_CONFIG_PARSE_ERROR),
             "errors": [SAFE_CONFIG_PARSE_ERROR],
         }
@@ -96,6 +111,8 @@ def get_status() -> dict[str, Any]:
         "milvus_course_collection": config.milvus_course_collection,
         "milvus_collections": configured_collection_names(config),
         "batch_concurrency": batch_concurrency(config),
+        "web_retrieval_top_n": limits.top_n,
+        "web_retrieval_top_k": limits.top_k,
         "config": {key: True for key in REQUIRED_CONFIG_KEYS},
         "errors": [],
     }

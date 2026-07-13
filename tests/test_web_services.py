@@ -143,6 +143,7 @@ def _install_closeable_rag_stubs(monkeypatch, error=None) -> list[str]:
 
 def test_get_status_reports_config_success(monkeypatch) -> None:
     monkeypatch.setattr(services.RetrievalConfig, "from_env", _fake_config)
+    monkeypatch.setattr(services, "load_env_values", lambda: {})
 
     status = services.get_status()
 
@@ -153,7 +154,42 @@ def test_get_status_reports_config_success(monkeypatch) -> None:
     assert status["milvus_collection"] == "xhbx_sales_chunks"
     assert status["config"]["API_KEY"] is True
     assert status["config"]["EMBEDDING_API_KEY"] is True
+    assert status["web_retrieval_top_n"] == 20
+    assert status["web_retrieval_top_k"] == 5
     assert status["errors"] == []
+
+
+def test_get_status_reports_custom_web_retrieval_limits(monkeypatch) -> None:
+    monkeypatch.setattr(services.RetrievalConfig, "from_env", _fake_config)
+    monkeypatch.setattr(
+        services,
+        "load_env_values",
+        lambda: {"WEB_RETRIEVAL_TOP_N": "30", "WEB_RETRIEVAL_TOP_K": "8"},
+    )
+
+    status = services.get_status()
+
+    assert status["ok"] is True
+    assert status["web_retrieval_top_n"] == 30
+    assert status["web_retrieval_top_k"] == 8
+
+
+def test_get_status_reports_invalid_web_retrieval_limits_safely(monkeypatch) -> None:
+    monkeypatch.setattr(services.RetrievalConfig, "from_env", _fake_config)
+    monkeypatch.setattr(
+        services,
+        "load_env_values",
+        lambda: {"WEB_RETRIEVAL_TOP_N": "4", "WEB_RETRIEVAL_TOP_K": "5"},
+    )
+
+    status = services.get_status()
+
+    assert status["ok"] is False
+    assert status["errors"] == [
+        "WEB_RETRIEVAL_TOP_K 不能大于 WEB_RETRIEVAL_TOP_N"
+    ]
+    assert status["web_retrieval_top_n"] == 20
+    assert status["web_retrieval_top_k"] == 5
 
 
 def test_get_status_reports_docker_milvus_target(monkeypatch) -> None:
@@ -275,6 +311,8 @@ def test_get_status_reports_config_error(monkeypatch) -> None:
 
     assert status["ok"] is False
     assert status["config"]["API_KEY"] is False
+    assert status["web_retrieval_top_n"] == 20
+    assert status["web_retrieval_top_k"] == 5
     assert status["errors"] == ["缺少必要环境变量: API_KEY"]
 
 
