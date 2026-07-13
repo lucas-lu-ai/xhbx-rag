@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { act, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 
@@ -278,6 +278,39 @@ test("参考正确时立即提交并在保存后锁定所有单选按钮", async
   }
 });
 
+test("参考正确保存中与 feedback 回填后都会锁定所有单选按钮", async () => {
+  const user = userEvent.setup();
+  let resolveSubmit: (() => void) | undefined;
+  const onSubmit = vi.fn(
+    () =>
+      new Promise<void>((resolve) => {
+        resolveSubmit = resolve;
+      })
+  );
+  render(<FeedbackHarness onSubmit={onSubmit} />);
+
+  await user.click(screen.getByLabelText("引用1召回准确"));
+  await user.click(screen.getByLabelText("引用1参考正确"));
+
+  const savingRadios = screen.getAllByRole("radio");
+  expect(savingRadios).toHaveLength(4);
+  for (const radio of savingRadios) {
+    expect(radio).toBeDisabled();
+  }
+
+  expect(resolveSubmit).toBeTypeOf("function");
+  await act(async () => {
+    resolveSubmit?.();
+  });
+
+  expect(screen.getByText("已记录引用反馈。")).toBeInTheDocument();
+  const savedRadios = screen.getAllByRole("radio");
+  expect(savedRadios).toHaveLength(4);
+  for (const radio of savedRadios) {
+    expect(radio).toBeDisabled();
+  }
+});
+
 test("切换召回维度会清空不兼容的回答选择与原因", async () => {
   const user = userEvent.setup();
   render(<FeedbackHarness />);
@@ -346,6 +379,42 @@ test("正向保存失败会清空回答选择并允许重新点击提交", async
   await user.click(screen.getByLabelText("引用1参考正确"));
   expect(onSubmit).toHaveBeenCalledTimes(2);
   expect(await screen.findByText("已记录引用反馈。")).toBeInTheDocument();
+});
+
+test("保存失败后修改召回维度会清除错误", async () => {
+  const user = userEvent.setup();
+  const onSubmit = vi.fn().mockRejectedValue(new Error("保存失败"));
+  render(<FeedbackHarness onSubmit={onSubmit} />);
+
+  await user.click(screen.getByLabelText("引用1召回准确"));
+  await user.click(screen.getByLabelText("引用1参考正确"));
+  expect(await screen.findByText("保存失败")).toBeInTheDocument();
+
+  await user.click(screen.getByLabelText("引用1召回不准确"));
+
+  expect(screen.queryByText("保存失败")).not.toBeInTheDocument();
+  expect(screen.getByLabelText("召回不准确原因")).toBeInTheDocument();
+});
+
+test("成功消息尚未由 feedback 锁定时修改召回维度会清除消息", async () => {
+  const user = userEvent.setup();
+  const onSubmitFeedback = vi.fn().mockResolvedValue(undefined);
+  render(
+    <EvidenceDetail
+      evidence={evidence}
+      index={0}
+      onSubmitFeedback={onSubmitFeedback}
+    />
+  );
+
+  await user.click(screen.getByLabelText("引用1召回准确"));
+  await user.click(screen.getByLabelText("引用1参考正确"));
+  expect(await screen.findByText("已记录引用反馈。")).toBeInTheDocument();
+
+  await user.click(screen.getByLabelText("引用1召回不准确"));
+
+  expect(screen.queryByText("已记录引用反馈。")).not.toBeInTheDocument();
+  expect(screen.getByLabelText("召回不准确原因")).toBeInTheDocument();
 });
 
 test("负向保存失败会保留原因表单并允许重试", async () => {
