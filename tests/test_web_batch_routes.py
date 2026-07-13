@@ -348,7 +348,9 @@ def test_bad_case_route_saves_two_dimensional_feedback_in_cache(
     run_id = client.post("/api/batch-runs", json=_create_payload()).json()["run_id"]
     _fail_first_row(store, run_id)
 
-    def fake_save_bad_case(payload: dict, *, bad_case_id=None, project_root=None) -> dict:
+    def fake_save_bad_case(
+        payload: dict, *, bad_case_id=None, project_root=None
+    ) -> dict:
         return {"ok": True, "bad_case_id": bad_case_id, "path": ".local/x.jsonl"}
 
     monkeypatch.setattr(batch_routes, "save_bad_case", fake_save_bad_case)
@@ -359,6 +361,35 @@ def test_bad_case_route_saves_two_dimensional_feedback_in_cache(
             "answer_usage_judgement": "incorrect",
             "reason": "回答误用了该证据。",
         }
+    ]
+
+    response = client.post(
+        f"/api/batch-runs/{run_id}/rows/1/bad-case",
+        json=_bad_case_payload(evidence_feedback=evidence_feedback),
+    )
+
+    assert response.status_code == 200
+    cached_feedback = store.get_question(run_id, 1)["bad_case"]["evidence_feedback"]
+    assert cached_feedback == evidence_feedback
+
+
+def test_bad_case_route_preserves_legacy_evidence_judgements_in_cache(
+    tmp_path: Path, monkeypatch
+) -> None:
+    client, store, _ = _make_client(tmp_path)
+    run_id = client.post("/api/batch-runs", json=_create_payload()).json()["run_id"]
+    _fail_first_row(store, run_id)
+
+    def fake_save_bad_case(
+        payload: dict, *, bad_case_id=None, project_root=None
+    ) -> dict:
+        return {"ok": True, "bad_case_id": bad_case_id, "path": ".local/x.jsonl"}
+
+    monkeypatch.setattr(batch_routes, "save_bad_case", fake_save_bad_case)
+    evidence_feedback = [
+        {"chunk_id": "case-a-1", "judgement": "should_use"},
+        {"chunk_id": "case-a-2", "judgement": "should_not_use"},
+        {"chunk_id": "case-a-3", "judgement": "ranking_low"},
     ]
 
     response = client.post(

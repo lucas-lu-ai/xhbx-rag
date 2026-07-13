@@ -106,7 +106,18 @@ def test_save_bad_case_adds_chinese_labels_for_two_dimensional_feedback(
                     "retrieval_judgement": "accurate",
                     "answer_usage_judgement": "incorrect",
                     "reason": "回答误用了这段准确召回的证据。",
-                }
+                },
+                {
+                    "chunk_id": "case-b-2",
+                    "retrieval_judgement": "accurate",
+                    "answer_usage_judgement": "correct",
+                },
+                {
+                    "chunk_id": "case-c-3",
+                    "retrieval_judgement": "inaccurate",
+                    "answer_usage_judgement": "not_applicable",
+                    "reason": "召回内容与问题无关。",
+                },
             ],
         },
         project_root=tmp_path,
@@ -118,6 +129,18 @@ def test_save_bad_case_adds_chinese_labels_for_two_dimensional_feedback(
 
     assert feedback["retrieval_judgement_label"] == "召回准确"
     assert feedback["answer_usage_judgement_label"] == "参考不正确"
+    assert (
+        record["evidence_feedback"][1]["retrieval_judgement_label"] == "召回准确"
+    )
+    assert (
+        record["evidence_feedback"][1]["answer_usage_judgement_label"] == "参考正确"
+    )
+    assert (
+        record["evidence_feedback"][2]["retrieval_judgement_label"] == "召回不准确"
+    )
+    assert (
+        record["evidence_feedback"][2]["answer_usage_judgement_label"] == "不适用"
+    )
 
 
 def test_save_bad_case_appends_multiple_records(tmp_path: Path) -> None:

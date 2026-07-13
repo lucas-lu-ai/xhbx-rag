@@ -682,11 +682,22 @@ def test_bad_case_route_accepts_two_dimensional_evidence_feedback(monkeypatch) -
             "issue_types": ["citation_issue"],
             "evidence_feedback": [
                 {
+                    "chunk_id": "case-a-0",
+                    "retrieval_judgement": "accurate",
+                    "answer_usage_judgement": "correct",
+                },
+                {
                     "chunk_id": "case-a-1",
                     "retrieval_judgement": "accurate",
                     "answer_usage_judgement": "incorrect",
                     "reason": "回答误用了该证据。",
-                }
+                },
+                {
+                    "chunk_id": "case-a-2",
+                    "retrieval_judgement": "inaccurate",
+                    "answer_usage_judgement": "not_applicable",
+                    "reason": "召回内容与问题无关。",
+                },
             ],
             "citations": [],
             "retrieval_evidences": [],
@@ -694,10 +705,45 @@ def test_bad_case_route_accepts_two_dimensional_evidence_feedback(monkeypatch) -
     )
 
     assert response.status_code == 200
-    feedback = calls["payload"]["evidence_feedback"][0]
-    assert feedback["retrieval_judgement"] == "accurate"
-    assert feedback["answer_usage_judgement"] == "incorrect"
-    assert feedback["reason"] == "回答误用了该证据。"
+    feedback = calls["payload"]["evidence_feedback"]
+    assert feedback[0]["retrieval_judgement"] == "accurate"
+    assert feedback[0]["answer_usage_judgement"] == "correct"
+    assert feedback[1]["retrieval_judgement"] == "accurate"
+    assert feedback[1]["answer_usage_judgement"] == "incorrect"
+    assert feedback[1]["reason"] == "回答误用了该证据。"
+    assert feedback[2]["retrieval_judgement"] == "inaccurate"
+    assert feedback[2]["answer_usage_judgement"] == "not_applicable"
+    assert feedback[2]["reason"] == "召回内容与问题无关。"
+
+
+def test_bad_case_route_rejects_unknown_answer_usage_judgement(monkeypatch) -> None:
+    def fail_if_called(payload: dict):
+        raise AssertionError("save_bad_case should not be called")
+
+    monkeypatch.setattr(web_app, "save_bad_case", fail_if_called)
+    client = TestClient(web_app.create_app())
+
+    response = client.post(
+        "/api/bad-cases",
+        json={
+            "query": "保单整理对客户有什么作用？",
+            "answer": "answer",
+            "top_n": 20,
+            "top_k": 5,
+            "issue_types": ["citation_issue"],
+            "evidence_feedback": [
+                {
+                    "chunk_id": "case-a-1",
+                    "retrieval_judgement": "accurate",
+                    "answer_usage_judgement": "unknown",
+                }
+            ],
+            "citations": [],
+            "retrieval_evidences": [],
+        },
+    )
+
+    assert response.status_code == 422
 
 
 @pytest.mark.parametrize(
