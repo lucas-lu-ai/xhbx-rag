@@ -115,6 +115,36 @@ test("点击可见行回调原始 evidence key，选中行 aria-pressed", () => 
   expect(onSelectEvidence).toHaveBeenCalledWith("turn-1:evidence-1");
 });
 
+test("稀疏引用显示连续序号，点击仍回调原始 evidence key", () => {
+  const onSelectEvidence = vi.fn();
+  const evidences: RetrievalEvidence[] = [
+    ...sampleEvidences,
+    {
+      chunk_id: "c3",
+      chunk_type: "product_knowledge",
+      text: "第三条产品知识。",
+      citations: []
+    }
+  ];
+  renderList({
+    evidences,
+    citedIndexes: new Set([1, 3]),
+    onSelectEvidence
+  });
+  expandList();
+
+  const rows = within(
+    screen.getByRole("region", { name: "知识引用列表" })
+  ).getAllByRole("button");
+  expect(rows).toHaveLength(2);
+  expect(within(rows[0]).getByText("1")).toBeInTheDocument();
+  expect(within(rows[1]).getByText("2")).toBeInTheDocument();
+  expect(within(rows[1]).getByText("第三条产品知识。")).toBeInTheDocument();
+
+  fireEvent.click(rows[1]);
+  expect(onSelectEvidence).toHaveBeenCalledWith("turn-1:evidence-2");
+});
+
 test("没有实际引用时不渲染知识引用区", () => {
   const { container } = render(
     <EvidenceList
