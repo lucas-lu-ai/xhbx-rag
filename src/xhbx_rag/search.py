@@ -39,6 +39,36 @@ class _Reranker(Protocol):
         """Rerank candidate documents."""
 
 
+def emit_query_received_trace(
+    trace: TraceSink | None,
+    *,
+    query: str,
+    top_n: int,
+    top_k: int,
+) -> None:
+    emit_trace(
+        trace,
+        "search.query_received",
+        {"query": query, "top_n": top_n, "top_k": top_k},
+    )
+
+
+def emit_query_understood_trace(
+    trace: TraceSink | None,
+    understanding: QueryUnderstanding,
+) -> None:
+    emit_trace(
+        trace,
+        "search.query_understood",
+        {
+            "intent": understanding.intent,
+            "rewritten_query": understanding.rewritten_query,
+            "needs_retrieval": understanding.needs_retrieval,
+            "filters": understanding.filters.model_dump(mode="json"),
+        },
+    )
+
+
 def search_evidence(
     query: str,
     query_agent: _QueryAgent,
@@ -49,26 +79,21 @@ def search_evidence(
     top_k: int,
     trace: TraceSink | None = None,
     understanding: QueryUnderstanding | None = None,
+    query_understanding_traces_emitted: bool = False,
 ) -> dict:
-    emit_trace(
-        trace,
-        "search.query_received",
-        {"query": query, "top_n": top_n, "top_k": top_k},
-    )
+    if not query_understanding_traces_emitted:
+        emit_query_received_trace(
+            trace,
+            query=query,
+            top_n=top_n,
+            top_k=top_k,
+        )
     resolved_understanding = (
         understanding if understanding is not None else query_agent.understand(query)
     )
     filters_payload = resolved_understanding.filters.model_dump(mode="json")
-    emit_trace(
-        trace,
-        "search.query_understood",
-        {
-            "intent": resolved_understanding.intent,
-            "rewritten_query": resolved_understanding.rewritten_query,
-            "needs_retrieval": resolved_understanding.needs_retrieval,
-            "filters": filters_payload,
-        },
-    )
+    if not query_understanding_traces_emitted:
+        emit_query_understood_trace(trace, resolved_understanding)
     if (
         not resolved_understanding.needs_retrieval
         or resolved_understanding.intent == "out_of_scope"

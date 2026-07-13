@@ -28,6 +28,7 @@ from xhbx_rag.query_understanding import (
 )
 from xhbx_rag.rerank import RerankClient
 from xhbx_rag.resource_utils import close_resources, is_local_index_open_failure
+from xhbx_rag.search import emit_query_received_trace, emit_query_understood_trace
 
 from .source_paths import (
     can_reveal_source,
@@ -215,6 +216,12 @@ def _answer_question_with_config(
 ) -> dict[str, Any]:
     resources: list[object] = []
     try:
+        emit_query_received_trace(
+            trace,
+            query=query,
+            top_n=top_n,
+            top_k=top_k,
+        )
         query_agent = QueryUnderstandingAgent(
             base_url=config.base_url,
             api_key=config.api_key,
@@ -222,6 +229,7 @@ def _answer_question_with_config(
         )
         resources.append(query_agent)
         understanding = query_agent.understand(query)
+        emit_query_understood_trace(trace, understanding)
         embedding_client = EmbeddingClient(
             base_url=config.embedding_base_url,
             api_key=config.embedding_api_key,
@@ -271,6 +279,7 @@ def _answer_question_with_config(
             top_k=top_k,
             trace=trace,
             understanding=understanding,
+            query_understanding_traces_emitted=True,
         )
     finally:
         _close_resources(resources)

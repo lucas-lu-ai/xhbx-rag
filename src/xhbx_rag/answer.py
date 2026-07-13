@@ -69,7 +69,7 @@ class _SseHttpClient(Protocol):
 
 
 class _QueryAgent(Protocol):
-    def understand(self, query: str) -> object:
+    def understand(self, query: str) -> QueryUnderstanding:
         """Understand and rewrite raw query."""
 
 
@@ -480,10 +480,11 @@ def answer_query(
     top_k: int,
     trace: TraceSink | None = None,
     understanding: QueryUnderstanding | None = None,
+    query_understanding_traces_emitted: bool = False,
 ) -> dict[str, Any]:
     search_result = search_evidence(
         query=query,
-        query_agent=query_agent,  # type: ignore[arg-type]
+        query_agent=query_agent,
         embedding_client=embedding_client,  # type: ignore[arg-type]
         store=store,  # type: ignore[arg-type]
         reranker=reranker,  # type: ignore[arg-type]
@@ -491,6 +492,7 @@ def answer_query(
         top_k=top_k,
         trace=trace,
         understanding=understanding,
+        query_understanding_traces_emitted=query_understanding_traces_emitted,
     )
     return answer_from_search_result(
         search_result,

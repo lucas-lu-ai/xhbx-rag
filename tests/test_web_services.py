@@ -66,6 +66,16 @@ class _FakeStoreComponent:
         self.client = _FakeCloseable(f"{name}.client", calls)
 
 
+class _EventTrace:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.payloads: dict[str, list[dict]] = {}
+
+    def emit(self, step: str, payload) -> None:
+        self.events.append(f"trace:{step}")
+        self.payloads.setdefault(step, []).append(dict(payload))
+
+
 def _query_understanding(
     collection_targets: list[CollectionTarget] | None = None,
 ) -> QueryUnderstanding:
@@ -552,7 +562,7 @@ def test_answer_question_returns_retrieval_evidences_from_answer_context(
 
 def test_answer_question_passes_trace_to_rag_chain(monkeypatch, tmp_path: Path) -> None:
     constructors, calls = _install_rag_stubs(monkeypatch)
-    trace = object()
+    trace = _EventTrace([])
 
     result = services.answer_question(
         query="客户说每年不能超过80万怎么办？",
@@ -565,6 +575,215 @@ def test_answer_question_passes_trace_to_rag_chain(monkeypatch, tmp_path: Path) 
     assert result["answer"] == "先承接预算，再讨论缴费期和保障缺口。"
     assert constructors["store"].milvus_mode == "lite"
     assert calls["trace"] is trace
+
+
+def test_answer_question_emits_query_trace_around_understanding(
+    monkeypatch,
+) -> None:
+    events: list[str] = []
+    trace = _EventTrace(events)
+    understanding = _query_understanding(["case"])
+
+    class QueryAgent:
+        def understand(self, query: str) -> QueryUnderstanding:
+            events.append("query_agent.understand")
+            return understanding
+
+    monkeypatch.setattr(services.RetrievalConfig, "from_env", _fake_config)
+    monkeypatch.setattr(services, "QueryUnderstandingAgent", lambda **kwargs: QueryAgent())
+    monkeypatch.setattr(services, "EmbeddingClient", lambda **kwargs: "embedding")
+    monkeypatch.setattr(
+        services,
+        "create_retrieval_store",
+        lambda config, collection_names=None: "store",
+    )
+    monkeypatch.setattr(services, "RerankClient", lambda **kwargs: "reranker")
+    monkeypatch.setattr(services, "AnswerAgent", lambda **kwargs: "answer-agent")
+
+    def fake_answer_query(**kwargs):
+        events.append("retrieval")
+        return {
+            "original_query": kwargs["query"],
+            "rewritten_query": understanding.rewritten_query,
+            "intent": understanding.intent,
+            "filters": {},
+            "answer": "answer",
+            "citations": [],
+            "evidence_count": 0,
+        }
+
+    monkeypatch.setattr(services, "answer_query", fake_answer_query)
+
+    services.answer_question(query="q", top_n=20, top_k=5, trace=trace)
+
+    assert events[:4] == [
+        "trace:search.query_received",
+        "query_agent.understand",
+        "trace:search.query_understood",
+        "retrieval",
+    ]
+    assert events.count("trace:search.query_received") == 1
+    assert events.count("trace:search.query_understood") == 1
+    assert trace.payloads["search.query_received"] == [
+        {"query": "q", "top_n": 20, "top_k": 5}
+    ]
+    assert trace.payloads["search.query_understood"] == [
+        {
+            "intent": understanding.intent,
+            "rewritten_query": understanding.rewritten_query,
+            "needs_retrieval": understanding.needs_retrieval,
+            "filters": understanding.filters.model_dump(mode="json"),
+        }
+    ]
+
+
+def test_answer_question_emits_received_and_closes_agent_when_understanding_fails(
+    monkeypatch,
+) -> None:
+    events: list[str] = []
+    trace = _EventTrace(events)
+    error = RuntimeError("understand failed")
+
+    class QueryAgent(_FakeHttpComponent):
+        def understand(self, query: str) -> QueryUnderstanding:
+            events.append("query_agent.understand")
+            raise error
+
+    monkeypatch.setattr(services.RetrievalConfig, "from_env", _fake_config)
+    monkeypatch.setattr(
+        services,
+        "QueryUnderstandingAgent",
+        lambda **kwargs: QueryAgent("query_agent", events),
+    )
+    monkeypatch.setattr(
+        services,
+        "EmbeddingClient",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("理解失败后不应创建 embedding client")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="understand failed") as exc_info:
+        services.answer_question(query="q", top_n=20, top_k=5, trace=trace)
+
+    assert exc_info.value is error
+    assert events == [
+        "trace:search.query_received",
+        "query_agent.understand",
+        "query_agent.http_client",
+    ]
+    assert "trace:search.query_understood" not in events
+
+
+def test_answer_question_emits_query_traces_and_closes_resources_when_store_fails(
+    monkeypatch,
+) -> None:
+    events: list[str] = []
+    trace = _EventTrace(events)
+    understanding = _query_understanding(["case"])
+    error = RuntimeError("store failed")
+
+    class QueryAgent(_FakeHttpComponent):
+        def understand(self, query: str) -> QueryUnderstanding:
+            events.append("query_agent.understand")
+            return understanding
+
+    def fail_store(config, collection_names=None):
+        events.append("store.create")
+        raise error
+
+    monkeypatch.setattr(services.RetrievalConfig, "from_env", _fake_config)
+    monkeypatch.setattr(
+        services,
+        "QueryUnderstandingAgent",
+        lambda **kwargs: QueryAgent("query_agent", events),
+    )
+    monkeypatch.setattr(
+        services,
+        "EmbeddingClient",
+        lambda **kwargs: _FakeHttpComponent("embedding_client", events),
+    )
+    monkeypatch.setattr(services, "create_retrieval_store", fail_store)
+
+    with pytest.raises(RuntimeError, match="store failed") as exc_info:
+        services.answer_question(query="q", top_n=20, top_k=5, trace=trace)
+
+    assert exc_info.value is error
+    assert events == [
+        "trace:search.query_received",
+        "query_agent.understand",
+        "trace:search.query_understood",
+        "store.create",
+        "query_agent.http_client",
+        "embedding_client.http_client",
+    ]
+
+
+def test_answer_question_full_chain_understands_once_and_does_not_repeat_query_trace(
+    monkeypatch,
+) -> None:
+    events: list[str] = []
+    trace = _EventTrace(events)
+    understanding = _query_understanding(["case"])
+
+    class QueryAgent:
+        def __init__(self) -> None:
+            self.understand_calls = 0
+
+        def understand(self, query: str) -> QueryUnderstanding:
+            self.understand_calls += 1
+            events.append("query_agent.understand")
+            return understanding
+
+    class Embedding:
+        def embed_query(self, text: str) -> list[float]:
+            events.append("embedding.embed_query")
+            return [0.1]
+
+    class Store:
+        def search(self, vector: list[float], top_k: int, filters: dict) -> list:
+            events.append("store.search")
+            return []
+
+    class Reranker:
+        def rerank(self, query: str, documents: list[str], top_k: int) -> list:
+            events.append("reranker.rerank")
+            return []
+
+    class AnswerAgent:
+        def generate(self, search_result: dict):
+            raise AssertionError("无证据时不应调用 answer agent")
+
+    query_agent = QueryAgent()
+    monkeypatch.setattr(services.RetrievalConfig, "from_env", _fake_config)
+    monkeypatch.setattr(
+        services,
+        "QueryUnderstandingAgent",
+        lambda **kwargs: query_agent,
+    )
+    monkeypatch.setattr(services, "EmbeddingClient", lambda **kwargs: Embedding())
+    monkeypatch.setattr(
+        services,
+        "create_retrieval_store",
+        lambda config, collection_names=None: Store(),
+    )
+    monkeypatch.setattr(services, "RerankClient", lambda **kwargs: Reranker())
+    monkeypatch.setattr(services, "AnswerAgent", lambda **kwargs: AnswerAgent())
+
+    result = services.answer_question(query="q", top_n=20, top_k=5, trace=trace)
+
+    assert result["evidence_count"] == 0
+    assert query_agent.understand_calls == 1
+    assert events[:4] == [
+        "trace:search.query_received",
+        "query_agent.understand",
+        "trace:search.query_understood",
+        "embedding.embed_query",
+    ]
+    assert events.index("store.search") > events.index("embedding.embed_query")
+    assert events.index("reranker.rerank") > events.index("store.search")
+    assert events.count("trace:search.query_received") == 1
+    assert events.count("trace:search.query_understood") == 1
 
 
 def test_answer_question_stream_events_emit_steps_deltas_and_final(
