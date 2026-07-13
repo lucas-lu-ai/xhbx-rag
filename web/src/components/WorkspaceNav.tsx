@@ -1,4 +1,4 @@
-import { FileUp, MessageSquareText } from "lucide-react";
+import { MessageSquareText } from "lucide-react";
 
 import type { WorkspaceLocation } from "../workspaceLocation";
 
@@ -18,17 +18,6 @@ export function WorkspaceNav({ currentView, onNavigate }: WorkspaceNavProps) {
       >
         <MessageSquareText size={18} aria-hidden="true" />
         知识问答
-      </button>
-      <button
-        type="button"
-        aria-current={currentView === "ingestion" ? "page" : undefined}
-        className={
-          currentView === "ingestion" ? "workspace-nav-item active" : "workspace-nav-item"
-        }
-        onClick={() => onNavigate("ingestion")}
-      >
-        <FileUp size={18} aria-hidden="true" />
-        文档入库
       </button>
     </nav>
   );

@@ -35,10 +35,9 @@ test("打开入库工作台后上传、预检并确认 draft", async () => {
     draft: ingestionDraftPayload(),
     jobs: []
   });
+  window.history.replaceState(null, "", "/?view=ingestion");
   render(<App />);
 
-  await user.click(screen.getByRole("button", { name: "文档入库" }));
-  expect(window.location.search).toBe("?view=ingestion");
   await user.click(screen.getByRole("radio", { name: "案例知识库" }));
   await user.upload(
     screen.getByLabelText("上传文档或 ZIP"),
@@ -1509,8 +1508,8 @@ test("dialog fallback 将 Tab 焦点限制在取消与确认按钮之间", async
 test("上传期间禁用文件输入并忽略新的拖放", async () => {
   const user = userEvent.setup();
   const stub = installIngestionApiStub({ jobs: [], deferUpload: true });
+  window.history.replaceState(null, "", "/?view=ingestion");
   render(<App />);
-  await user.click(screen.getByRole("button", { name: "文档入库" }));
   const input = screen.getByLabelText("上传文档或 ZIP");
   const dropZone = input.closest("label");
   if (!dropZone) throw new Error("上传区域不存在");
