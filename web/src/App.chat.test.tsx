@@ -323,6 +323,59 @@ test("旧聊天回答没有实际引用标记时显示暂无引用", async () =>
   ).not.toBeInTheDocument();
 });
 
+test.each([0, 1.5, 99])(
+  "实际引用索引 %s 无法映射到知识时显示暂无引用",
+  async (evidenceIndex) => {
+    localStorage.setItem(
+      "xhbx-rag.chat-sessions.v1",
+      JSON.stringify({
+        version: 1,
+        active_session_id: "session-1",
+        sessions: [
+          {
+            id: "session-1",
+            title: "无效引用索引",
+            created_at: "2026-07-01T08:00:00.000Z",
+            updated_at: "2026-07-01T08:01:00.000Z",
+            turns: [
+              {
+                id: "turn-1",
+                query: "客户预算有限怎么办？",
+                top_n: 20,
+                top_k: 10,
+                response: {
+                  ...answerPayload,
+                  citations: [
+                    {
+                      ...answerPayload.citations[0],
+                      selected: true,
+                      evidence_index: evidenceIndex
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      })
+    );
+    installFetchStub();
+    render(<App />);
+
+    expect(await screen.findByText("案例知识库")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /知识引用/ })
+    ).not.toBeInTheDocument();
+    const detailPane = screen.getByRole("complementary", {
+      name: "索引和溯源"
+    });
+    expect(within(detailPane).getByText("暂无引用。")).toBeInTheDocument();
+    expect(
+      within(detailPane).queryByText("点击一条知识引用查看明细。")
+    ).not.toBeInTheDocument();
+  }
+);
+
 test("loads status and submits a question", async () => {
   const user = userEvent.setup();
   const { requests } = installFetchStub();

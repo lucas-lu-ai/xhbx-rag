@@ -31,6 +31,7 @@ import { BatchCreateView } from "./components/BatchCreateView";
 import { BatchRunView } from "./components/BatchRunView";
 import { ChatView } from "./components/ChatView";
 import {
+  citedEvidenceEntries,
   citedEvidenceIndexes,
   EvidenceDetailContext,
   type EvidenceDetailContextValue
@@ -795,7 +796,10 @@ export function App({
     effectiveSelection.kind === "chat" &&
     Boolean(
       chatLatestResponse &&
-        citedEvidenceIndexes(chatLatestResponse.citations).size > 0
+        citedEvidenceEntries(
+          chatLatestResponse.retrieval_evidences ?? [],
+          citedEvidenceIndexes(chatLatestResponse.citations)
+        ).length > 0
     );
 
   function navigateWorkspace(view: WorkspaceLocation["view"]) {
