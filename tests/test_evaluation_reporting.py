@@ -310,31 +310,39 @@ class _SuccessfulAdapter:
 
 def test_safe_backfill_preserves_node_persistence_failure_category(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import errno
+
     import xhbx_rag.evaluation.workbook as workbook
 
     source = tmp_path / "source.xlsx"
     source.write_bytes(b"original")
     run_dir = tmp_path / "run"
     _, digest = create_input_snapshot(source, run_dir)
+    fake_node = tmp_path / "node"
+    fake_node.write_text("#!/bin/sh\n", encoding="utf-8")
+    fake_node.chmod(0o755)
+    node_modules = tmp_path / "node_modules"
+    node_modules.mkdir()
 
-    class FailingAdapter(_SuccessfulAdapter):
-        def backfill(
-            self,
-            input_path: Path,
-            payload_path: Path,
-            output_path: Path,
-        ) -> Path:
-            del input_path, payload_path, output_path
-            raise workbook.WorkbookAdapterPersistenceError(
-                "工作簿持久化失败：ENOSPC"
-            )
+    def fail_copy(*_args: object, **_kwargs: object) -> None:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(workbook.shutil, "copy2", fail_copy)
+    adapter = workbook.WorkbookAdapter(
+        run_dir,
+        env={
+            "EVALUATION_NODE_BIN": str(fake_node),
+            "EVALUATION_ARTIFACT_NODE_MODULES": str(node_modules),
+        },
+    )
 
     with pytest.raises(WorkbookPersistenceError) as captured:
         safe_backfill(
             source,
             run_dir,
-            FailingAdapter(run_dir),
+            adapter,
             {"运行信息": {}, "汇总指标": {}, "逐题结果": []},
             expected_source_sha256=digest,
         )

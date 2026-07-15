@@ -394,6 +394,8 @@ def test_run_evaluate_command_maps_node_enospc_to_exit_three(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    import errno
+
     import xhbx_rag.evaluation.command as command
     import xhbx_rag.evaluation.workbook as workbook
 
@@ -419,17 +421,18 @@ def test_run_evaluate_command_maps_node_enospc_to_exit_three(
         lambda _config: {"案例知识库": {"存在": True, "数据量": 1}},
     )
     monkeypatch.setattr(command, "_resolve_run_id", lambda _resume: "run-1")
+    fake_node = tmp_path / "node"
+    fake_node.write_text("#!/bin/sh\n", encoding="utf-8")
+    fake_node.chmod(0o755)
+    node_modules = tmp_path / "node_modules"
+    node_modules.mkdir()
+    monkeypatch.setenv("EVALUATION_NODE_BIN", str(fake_node))
+    monkeypatch.setenv("EVALUATION_ARTIFACT_NODE_MODULES", str(node_modules))
 
-    class FailingAdapter:
-        def __init__(self, _adapter_dir: Path) -> None:
-            pass
+    def fail_copy(*_args: object, **_kwargs: object) -> None:
+        raise OSError(errno.ENOSPC, "No space left on device")
 
-        def extract(self, _input_path: Path, _output_path: Path) -> Path:
-            raise workbook.WorkbookAdapterPersistenceError(
-                "工作簿持久化失败：ENOSPC"
-            )
-
-    monkeypatch.setattr(command, "WorkbookAdapter", FailingAdapter)
+    monkeypatch.setattr(workbook.shutil, "copy2", fail_copy)
 
     exit_code = run_evaluate_command(_args(tmp_path))
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import subprocess
@@ -379,6 +380,93 @@ def test_workbook_adapter_wraps_subprocess_start_oserror_in_chinese(
         match="启动 Node 工作簿进程失败：.*node.*模拟进程启动失败",
     ):
         adapter.extract(tmp_path / "input.xlsx", tmp_path / "dataset.json")
+
+
+@pytest.mark.parametrize(
+    "failure_point,error_number",
+    [
+        ("复制脚本", errno.ENOSPC),
+        ("复制脚本", errno.EROFS),
+        ("创建软链接", errno.EDQUOT),
+        ("启动进程", errno.EIO),
+    ],
+)
+def test_workbook_adapter_classifies_pre_node_persistence_oserrors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+    error_number: int,
+) -> None:
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise OSError(error_number, "模拟持久化错误")
+
+    if failure_point == "复制脚本":
+        monkeypatch.setattr(workbook_module.shutil, "copy2", fail)
+    elif failure_point == "创建软链接":
+        monkeypatch.setattr(Path, "symlink_to", fail)
+    else:
+        monkeypatch.setattr(workbook_module.subprocess, "run", fail)
+    adapter = WorkbookAdapter(
+        tmp_path / "run",
+        env={
+            "EVALUATION_NODE_BIN": str(FIXED_NODE_BIN),
+            "EVALUATION_ARTIFACT_NODE_MODULES": str(FIXED_NODE_MODULES),
+        },
+    )
+
+    with pytest.raises(
+        workbook_module.WorkbookAdapterPersistenceError,
+        match="工作簿持久化失败",
+    ) as captured:
+        adapter.extract(tmp_path / "input.xlsx", tmp_path / "dataset.json")
+
+    assert isinstance(captured.value.__cause__, OSError)
+    assert captured.value.__cause__.errno == error_number
+
+
+def test_workbook_adapter_classifies_code_only_persistence_oserror_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_copy(*_args: object, **_kwargs: object) -> None:
+        raise OSError("ENOSPC: no space left on device")
+
+    monkeypatch.setattr(workbook_module.shutil, "copy2", fail_copy)
+    adapter = WorkbookAdapter(
+        tmp_path / "run",
+        env={
+            "EVALUATION_NODE_BIN": str(FIXED_NODE_BIN),
+            "EVALUATION_ARTIFACT_NODE_MODULES": str(FIXED_NODE_MODULES),
+        },
+    )
+
+    with pytest.raises(workbook_module.WorkbookAdapterPersistenceError):
+        adapter.extract(tmp_path / "input.xlsx", tmp_path / "dataset.json")
+
+
+def test_workbook_adapter_keeps_eacces_copy_failure_as_runtime_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_copy(*_args: object, **_kwargs: object) -> None:
+        raise OSError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(workbook_module.shutil, "copy2", fail_copy)
+    adapter = WorkbookAdapter(
+        tmp_path / "run",
+        env={
+            "EVALUATION_NODE_BIN": str(FIXED_NODE_BIN),
+            "EVALUATION_ARTIFACT_NODE_MODULES": str(FIXED_NODE_MODULES),
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="复制工作簿脚本失败") as captured:
+        adapter.extract(tmp_path / "input.xlsx", tmp_path / "dataset.json")
+
+    assert not isinstance(
+        captured.value,
+        workbook_module.WorkbookAdapterPersistenceError,
+    )
 
 
 @pytest.mark.parametrize(

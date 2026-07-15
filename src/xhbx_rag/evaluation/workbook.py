@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import os
 import re
 import shutil
@@ -23,6 +24,11 @@ _PERSISTENCE_ERROR_PHRASES = (
     "read-only file system",
     "input/output error",
     "i/o error",
+)
+_PERSISTENCE_ERRNOS = frozenset(
+    value
+    for name in ("ENOSPC", "EDQUOT", "EROFS", "EIO")
+    if (value := getattr(errno, name, None)) is not None
 )
 
 
@@ -97,6 +103,11 @@ class WorkbookAdapter:
         try:
             shutil.copy2(WORKBOOK_SCRIPT, copied_script)
         except OSError as exc:
+            if _is_persistence_os_error(exc):
+                raise WorkbookAdapterPersistenceError(
+                    "工作簿持久化失败：复制工作簿脚本："
+                    f"{WORKBOOK_SCRIPT} -> {copied_script}：{exc}"
+                ) from exc
             raise RuntimeError(
                 "复制工作簿脚本失败："
                 f"{WORKBOOK_SCRIPT} -> {copied_script}：{exc}"
@@ -115,6 +126,11 @@ class WorkbookAdapter:
                 check=False,
             )
         except OSError as exc:
+            if _is_persistence_os_error(exc):
+                raise WorkbookAdapterPersistenceError(
+                    "工作簿持久化失败：启动 Node 工作簿进程："
+                    f"{node_bin}（工作目录：{adapter_dir}）：{exc}"
+                ) from exc
             raise RuntimeError(
                 "启动 Node 工作簿进程失败："
                 f"{node_bin}（工作目录：{adapter_dir}）：{exc}"
@@ -173,6 +189,11 @@ class WorkbookAdapter:
         try:
             link_path.symlink_to(target, target_is_directory=True)
         except OSError as exc:
+            if _is_persistence_os_error(exc):
+                raise WorkbookAdapterPersistenceError(
+                    "工作簿持久化失败：创建 node_modules 软链接："
+                    f"{link_path} -> {target}：{exc}"
+                ) from exc
             raise RuntimeError(
                 "创建 node_modules 软链接失败："
                 f"{link_path} -> {target}：{exc}"
@@ -205,6 +226,12 @@ def _is_persistence_failure(detail: str) -> bool:
         return True
     normalized = detail.casefold()
     return any(phrase in normalized for phrase in _PERSISTENCE_ERROR_PHRASES)
+
+
+def _is_persistence_os_error(exc: OSError) -> bool:
+    if exc.errno in _PERSISTENCE_ERRNOS:
+        return True
+    return _is_persistence_failure(str(exc))
 
 
 def main(argv: Sequence[str] | None = None) -> int:
