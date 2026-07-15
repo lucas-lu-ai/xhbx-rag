@@ -32,6 +32,208 @@ def _judge_result(**overrides: object) -> JudgeResult:
     return JudgeResult(**values)
 
 
+def _tag_metadata() -> dict[str, object]:
+    return {
+        "knowledge_type": "销售话术",
+        "tag_paths": ["销售技能/需求分析/预算异议"],
+        "business_domains": ["销售技能"],
+        "business_categories": ["需求分析"],
+        "business_tags": ["预算异议"],
+        "sales_stages": ["需求分析"],
+        "customer_segments": ["家庭客户"],
+        "customer_needs": ["保障规划"],
+        "product_categories": ["寿险"],
+        "objection_types": ["预算顾虑"],
+        "compliance_risks": ["适当性风险"],
+        "tagging_method": "规则匹配",
+        "tagging_version": "v1",
+    }
+
+
+def _real_answer_question_response() -> dict[str, object]:
+    complete_citation = {
+        "section_name": "预算异议处理",
+        "source_id": "source-1",
+        "filename": "案例A.docx",
+        "source_type": "docx",
+        "source_path": "data/案例A.docx",
+        "quote": "先承接客户预算。",
+        "context": "客户提出预算顾虑，应先承接再分析保障缺口。",
+        "source_excerpt": "客户提出预算顾虑，应先承接。",
+        "locator": {
+            "line_start": 3,
+            "line_end": 4,
+            "char_start": 20,
+            "char_end": 48,
+            "heading_path": ["预算异议", "回应步骤"],
+        },
+        "locator_confidence": "validated_span",
+        "locator_error": "",
+        "anchor_id": "source-1#line-3",
+        "evidence_index": 1,
+        "selected": True,
+        "display_location": "L3-L4",
+        "display_excerpt": "客户提出预算顾虑，应先承接。",
+        "can_reveal": True,
+    }
+    return {
+        "original_query": "客户预算有限怎么办？",
+        "rewritten_query": "客户预算异议应如何处理？",
+        "intent": "objection_handling",
+        "filters": {
+            "chunk_types": ["objection_handling", "training_course"],
+            "stage": "需求分析",
+            "scenario": "预算沟通",
+            "objection": "预算有限",
+            "strategy_names": ["预算承接策略"],
+        },
+        "answer": "先承接预算，再对齐保障缺口。",
+        "reasoning": "证据支持先承接预算。",
+        "citations": [complete_citation],
+        "evidence_count": 5,
+        "retrieval_evidences": [
+            {
+                "chunk_id": "journey-1",
+                "chunk_type": "customer_journey",
+                "text": "先识别客户当前状态。",
+                "score": 0.81,
+                "rerank_score": 0.91,
+                "matched_tag_paths": ["销售技能/需求分析/预算异议"],
+                "tag_boost_factor": 1.1,
+                "metadata": {
+                    "case_name": "案例A",
+                    "stage": "需求分析",
+                    "customer_state": "担心预算",
+                    **_tag_metadata(),
+                },
+                "citations": [complete_citation],
+            },
+            {
+                "chunk_id": "strategy-1",
+                "chunk_type": "strategy",
+                "text": "使用预算承接策略。",
+                "score": 0.8,
+                "rerank_score": 0.9,
+                "matched_tag_paths": [],
+                "tag_boost_factor": 1.0,
+                "metadata": {
+                    "case_name": "案例A",
+                    "strategy_name": "预算承接策略",
+                    "aliases": ["预算对齐"],
+                    "applicable_stages": ["需求分析"],
+                    "confidence": "high",
+                    "inferred": False,
+                    **_tag_metadata(),
+                },
+                "citations": [],
+            },
+            {
+                "chunk_id": "script-1",
+                "chunk_type": "script",
+                "text": "我理解您对预算的顾虑。",
+                "score": 0.79,
+                "rerank_score": 0.89,
+                "matched_tag_paths": [],
+                "tag_boost_factor": 1.0,
+                "metadata": {
+                    "case_name": "案例A",
+                    "script_id": "script-1",
+                    "stage": "需求分析",
+                    "scenario": "预算沟通",
+                    "customer_trigger": "客户说预算有限",
+                    "strategy_names": ["预算承接策略"],
+                    **_tag_metadata(),
+                },
+                "citations": [],
+            },
+            {
+                "chunk_id": "objection-1",
+                "chunk_type": "objection_handling",
+                "text": "承接预算后再澄清保障缺口。",
+                "score": 0.78,
+                "rerank_score": 0.88,
+                "matched_tag_paths": [],
+                "tag_boost_factor": 1.0,
+                "metadata": {
+                    "case_name": "案例A",
+                    "objection": "预算有限",
+                    "related_strategy_names": ["预算承接策略"],
+                    "related_script_ids": ["script-1"],
+                    "related_script_details": [
+                        {
+                            "script_id": "script-1",
+                            "stage": "需求分析",
+                            "scenario": "预算沟通",
+                            "customer_trigger": "客户说预算有限",
+                            "goal": "澄清保障缺口",
+                            "source_quote": "预算不能再增加了。",
+                            "coach_wording": "我理解您对预算的顾虑。",
+                            "strategy_names": ["预算承接策略"],
+                            "follow_up_questions": ["当前预算上限是多少？"],
+                            "compliance_notes": ["不承诺收益"],
+                        }
+                    ],
+                    **_tag_metadata(),
+                },
+                "citations": [],
+            },
+            {
+                "chunk_id": "course-1",
+                "chunk_type": "training_course",
+                "text": "课程要求先承接预算。",
+                "score": 0.77,
+                "rerank_score": 0.87,
+                "matched_tag_paths": [],
+                "tag_boost_factor": 1.0,
+                "metadata": {
+                    "course_name": "需求分析课",
+                    "course_series": "新人训练营",
+                    "audience": "保险销售新人",
+                    "summary": "预算异议处理方法",
+                    "sales_stages": ["需求分析"],
+                    "slide_start": 5,
+                    "slide_end": 6,
+                    "page_start": 10,
+                    "page_end": 11,
+                    "heading": "预算异议",
+                    "teaching_goals": ["掌握预算承接方法"],
+                    **_tag_metadata(),
+                },
+                "citations": [
+                    {
+                        **complete_citation,
+                        "locator": {
+                            "container": "ppt/slides/slide5.xml",
+                            "page": 10,
+                            "slide": 5,
+                            "slide_start": 5,
+                            "slide_end": 6,
+                            "page_start": 10,
+                            "page_end": 11,
+                            "heading": "预算异议",
+                        },
+                    }
+                ],
+            },
+        ],
+    }
+
+
+def _pure_ascii_keys(value: object) -> list[str]:
+    keys: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(key, str) and key.isascii() and any(
+                character.isalpha() for character in key
+            ):
+                keys.append(key)
+            keys.extend(_pure_ascii_keys(item))
+    elif isinstance(value, list):
+        for item in value:
+            keys.extend(_pure_ascii_keys(item))
+    return keys
+
+
 def test_judge_result_serializes_only_chinese_business_fields() -> None:
     payload = dump_chinese(_judge_result())
 
@@ -86,6 +288,33 @@ def test_evaluation_item_rejects_invalid_excel_row() -> None:
             question="问题",
             reference_answer="答案",
             trace_status="未定位",
+        )
+
+
+def test_evaluation_result_rejects_unknown_trace_status() -> None:
+    with pytest.raises(ValueError):
+        EvaluationResult(
+            item_id="item-1",
+            excel_row=2,
+            question="问题",
+            reference_answer="答案",
+            trace_status="unknown",
+            grade="评测失败",
+            status="评测失败",
+        )
+
+
+def test_evaluation_result_rejects_unknown_error_tag() -> None:
+    with pytest.raises(ValueError, match="不支持的错误标签: retrieval_miss"):
+        EvaluationResult(
+            item_id="item-1",
+            excel_row=2,
+            question="问题",
+            reference_answer="答案",
+            trace_status="未定位",
+            grade="评测失败",
+            status="评测失败",
+            error_tags=["retrieval_miss"],
         )
 
 
@@ -154,6 +383,62 @@ def test_dump_chinese_recursively_maps_answer_response_keys() -> None:
     assert retrieval_evidence["chunk类型"] == "course"
     assert retrieval_evidence["元数据"] == {"模型选中": True}
     assert "original_query" not in answer_response
+
+
+def test_dump_chinese_maps_real_answer_question_response_shape() -> None:
+    result = EvaluationResult(
+        item_id="item-1",
+        excel_row=2,
+        question="客户预算有限怎么办？",
+        reference_answer="先承接预算，再对齐保障缺口。",
+        trace_status="完整支持",
+        answer="先承接预算，再对齐保障缺口。",
+        answer_response=_real_answer_question_response(),
+        grade="优秀",
+        status="已完成",
+    )
+
+    payload = dump_chinese(result)
+    answer_response = payload["问答原始结果"]
+    filters = answer_response["过滤条件"]
+    evidence = answer_response["检索证据"][0]
+    citation = answer_response["引用"][0]
+
+    assert filters["知识类型过滤"] == ["objection_handling", "training_course"]
+    assert filters["销售阶段"] == "需求分析"
+    assert evidence["chunk_id"] == "journey-1"
+    assert evidence["重排得分"] == 0.91
+    assert evidence["命中标签路径"] == ["销售技能/需求分析/预算异议"]
+    assert evidence["标签加权系数"] == 1.1
+    assert evidence["元数据"]["案例名称"] == "案例A"
+    assert citation["章节名称"] == "预算异议处理"
+    assert citation["来源ID"] == "source-1"
+    assert citation["来源定位"]["起始行"] == 3
+    assert set(_pure_ascii_keys(payload)) == {"chunk_id"}
+
+
+def test_dump_chinese_rejects_unknown_ascii_business_key() -> None:
+    result = EvaluationResult(
+        item_id="item-1",
+        excel_row=2,
+        question="问题",
+        reference_answer="参考答案",
+        trace_status="未定位",
+        answer_response={
+            "answer": "回答",
+            "retrieval_evidences": [
+                {
+                    "chunk_id": "chunk-1",
+                    "future_business_field": "不应静默放行",
+                }
+            ],
+        },
+        grade="评测失败",
+        status="评测失败",
+    )
+
+    with pytest.raises(ValueError, match="对外结果包含英文业务字段"):
+        dump_chinese(result)
 
 
 @pytest.mark.parametrize(

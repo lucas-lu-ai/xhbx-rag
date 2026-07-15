@@ -6,6 +6,7 @@ from xhbx_rag.evaluation.models import (
     EvaluationResult,
     GoldEvidence,
     JudgeResult,
+    TraceStatus,
 )
 from xhbx_rag.evaluation.serialization import dump_chinese
 
@@ -17,6 +18,7 @@ __all__ = [
     "EvaluationResult",
     "GoldEvidence",
     "JudgeResult",
+    "TraceStatus",
     "dump_chinese",
     "load_evaluation_config",
 ]

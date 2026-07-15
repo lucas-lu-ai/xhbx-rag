@@ -13,6 +13,14 @@ ERROR_TAGS = (
     "裁判执行失败",
 )
 EvaluationGrade = Literal["优秀", "合格", "不合格", "问答失败", "评测失败"]
+TraceStatus = Literal["完整支持", "部分支持", "未定位"]
+
+
+def _validated_error_tags(values: list[str]) -> list[str]:
+    invalid = [value for value in values if value not in ERROR_TAGS]
+    if invalid:
+        raise ValueError(f"不支持的错误标签: {', '.join(invalid)}")
+    return values
 
 
 class ChineseModel(BaseModel):
@@ -32,9 +40,7 @@ class EvaluationItem(ChineseModel):
     excel_row: int = Field(alias="Excel行号", ge=2)
     question: str = Field(alias="问题", min_length=1)
     reference_answer: str = Field(alias="参考答案", min_length=1)
-    trace_status: Literal["完整支持", "部分支持", "未定位"] = Field(
-        alias="溯源状态"
-    )
+    trace_status: TraceStatus = Field(alias="溯源状态")
     primary_chunk_id: str = Field(default="", alias="主chunk_id")
     gold_chunk_ids: list[str] = Field(default_factory=list, alias="黄金chunk_id列表")
     gold_evidences: list[GoldEvidence] = Field(default_factory=list, alias="黄金证据")
@@ -56,10 +62,7 @@ class JudgeResult(ChineseModel):
     @field_validator("error_tags")
     @classmethod
     def validate_error_tags(cls, values: list[str]) -> list[str]:
-        invalid = [value for value in values if value not in ERROR_TAGS]
-        if invalid:
-            raise ValueError(f"不支持的错误标签: {', '.join(invalid)}")
-        return values
+        return _validated_error_tags(values)
 
 
 class DeterministicScores(ChineseModel):
@@ -77,7 +80,7 @@ class EvaluationResult(ChineseModel):
     excel_row: int = Field(alias="Excel行号")
     question: str = Field(alias="问题")
     reference_answer: str = Field(alias="参考答案")
-    trace_status: str = Field(alias="溯源状态")
+    trace_status: TraceStatus = Field(alias="溯源状态")
     answer: str = Field(default="", alias="智能体回答")
     answer_response: dict = Field(default_factory=dict, alias="问答原始结果")
     duration_seconds: float = Field(default=0, alias="耗时（秒）", ge=0)
@@ -91,3 +94,8 @@ class EvaluationResult(ChineseModel):
     status: Literal["已完成", "问答失败", "评测失败"] = Field(alias="评测状态")
     error_tags: list[str] = Field(default_factory=list, alias="错误标签")
     error_summary: str = Field(default="", alias="错误摘要")
+
+    @field_validator("error_tags")
+    @classmethod
+    def validate_error_tags(cls, values: list[str]) -> list[str]:
+        return _validated_error_tags(values)
