@@ -761,14 +761,22 @@ def _is_secret_key(value: object) -> bool:
     tokens = set(re.findall(r"[a-z0-9]+", separated.lower()))
     if tokens & {"key", "token", "secret", "password"}:
         return True
-    compact_secret_names = {
-        "apikey",
-        "accesstoken",
-        "refreshtoken",
-        "authtoken",
-        "clientsecret",
-    }
-    return bool(tokens & compact_secret_names)
+    credential_key_prefixes = (
+        "private",
+        "api",
+        "client",
+        "access",
+        "auth",
+        "signing",
+        "encryption",
+        "milvus",
+    )
+    for token in tokens:
+        if token.endswith(("token", "secret", "password")):
+            return True
+        if any(f"{prefix}key" in token for prefix in credential_key_prefixes):
+            return True
+    return False
 
 
 def _contains_english_metadata_key(

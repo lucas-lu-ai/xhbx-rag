@@ -851,8 +851,82 @@ def test_run_metadata_rejects_mixed_and_camel_case_secret_keys(
 
 
 @pytest.mark.parametrize(
+    "secret_key",
+    [
+        "访问privatekey值",
+        "访问clientpassword值",
+        "访问milvustoken值",
+        "访问apikey值",
+        "访问clientkey值",
+        "访问accesskey值",
+        "访问authkey值",
+        "访问signingkey值",
+        "访问encryptionkey值",
+        "访问milvuskey值",
+        "访问servicetoken值",
+        "访问vendorsecret值",
+        "访问databasepassword值",
+    ],
+)
+def test_run_metadata_rejects_contiguous_ascii_credential_names(
+    tmp_path: Path,
+    secret_key: str,
+) -> None:
+    write_kwargs = {
+        "run_dir": tmp_path,
+        "fingerprint": "fingerprint",
+        "config_payload": {secret_key: "secret"},
+    }
+
+    with pytest.raises(ValueError, match="不得包含密钥"):
+        write_run_metadata(**write_kwargs)
+
+    assert not (tmp_path / "run.json").exists()
+
+
+@pytest.mark.parametrize(
+    "secret_key",
+    [
+        "访问privatekey值",
+        "访问clientpassword值",
+        "访问milvustoken值",
+    ],
+)
+def test_run_metadata_rejects_contiguous_credentials_in_multilevel_sequences(
+    tmp_path: Path,
+    secret_key: str,
+) -> None:
+    config_payload = {
+        "嵌套配置": [
+            (
+                {
+                    "更深配置": (
+                        [{secret_key: "nested-secret"}],
+                    )
+                },
+            )
+        ]
+    }
+
+    with pytest.raises(ValueError, match="不得包含密钥"):
+        write_run_metadata(
+            tmp_path,
+            fingerprint="fingerprint",
+            config_payload=config_payload,
+        )
+
+    assert not (tmp_path / "run.json").exists()
+
+
+@pytest.mark.parametrize(
     "safe_key",
-    ["monkey备注", "hockey得分", "tokenization方式"],
+    [
+        "monkey备注",
+        "hockey得分",
+        "tokenization方式",
+        "secretary名称",
+        "passwordless开关",
+    ],
 )
 def test_run_metadata_secret_scan_avoids_substring_false_positives(
     tmp_path: Path,
