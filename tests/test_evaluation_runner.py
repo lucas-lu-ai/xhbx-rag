@@ -307,6 +307,21 @@ def test_preflight_rejects_all_missing_or_empty_collections() -> None:
     assert client.calls[-1] == ("close", None)
 
 
+def test_preflight_rejects_empty_primary_collection_when_course_is_nonempty() -> None:
+    client = _ReadOnlyMilvusClient({"case": 0, "course": 2})
+
+    with pytest.raises(
+        EvaluationPreflightError,
+        match="主案例 collection 为空：case",
+    ):
+        preflight_docker_milvus(
+            _retrieval_config(),
+            client_factory=lambda **_kwargs: client,
+        )
+
+    assert client.calls[-1] == ("close", None)
+
+
 def test_preflight_rejects_nonempty_collection_stuck_loading() -> None:
     client = _ReadOnlyMilvusClient(
         {"case": 3, "course": 0},

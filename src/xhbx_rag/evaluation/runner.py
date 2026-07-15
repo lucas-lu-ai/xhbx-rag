@@ -134,6 +134,11 @@ def preflight_docker_milvus(
 
     if not any(int(row["数据量"]) > 0 for row in stats.values()):
         raise EvaluationPreflightError("Docker Milvus 目标 collection 均为空")
+    primary_stats = stats.get(config.milvus_collection)
+    if primary_stats is None or int(primary_stats["数据量"]) <= 0:
+        raise EvaluationPreflightError(
+            f"Docker Milvus 主案例 collection 为空：{config.milvus_collection}"
+        )
     return stats
 
 
