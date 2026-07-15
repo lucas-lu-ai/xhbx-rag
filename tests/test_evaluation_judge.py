@@ -6,6 +6,7 @@ from typing import Any
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 import xhbx_rag.evaluation.judge as judge_module
 from xhbx_rag.evaluation.config import EvaluationConfig
@@ -14,7 +15,12 @@ from xhbx_rag.evaluation.judge import (
     JudgeEvaluationError,
     build_judge_messages,
 )
-from xhbx_rag.evaluation.models import ERROR_TAGS, EvaluationItem, GoldEvidence
+from xhbx_rag.evaluation.models import (
+    ERROR_TAGS,
+    EvaluationItem,
+    GoldEvidence,
+    JudgeResult,
+)
 
 
 API_KEY = "judge-secret-key"
@@ -326,7 +332,12 @@ def test_final_judge_error_has_no_sensitive_original_exception_chain() -> None:
     error = exc_info.value
     assert error.__cause__ is None
     assert error.__context__ is None
-    exception_text = _exception_graph_and_judge_locals(error)
+    judge_locals = _judge_traceback_locals(error)
+    assert judge_locals
+    assert all("self" not in values for values in judge_locals)
+    exception_text = _deep_sensitive_text(
+        {"异常": error, "裁判帧局部": judge_locals}
+    )
     assert API_KEY not in exception_text
     assert unbounded_output not in exception_text
 
@@ -346,6 +357,48 @@ def test_judge_rejects_english_reason_after_all_retries() -> None:
 
     assert len(client.requests) == 3
     assert API_KEY not in str(exc_info.value)
+
+
+def test_judge_retries_valid_result_that_echoes_secret() -> None:
+    unsafe_response = valid_judge_response(
+        **{"扣分原因": f"回答基本正确，但回显了 {API_KEY}。"}
+    )
+    client = FakeClient([unsafe_response, valid_judge_response()])
+    agent = EvaluationJudgeAgent(make_config(), http_client=client)
+
+    result = agent.evaluate(make_item(), make_answer())
+
+    assert len(client.requests) == 2
+    assert "上一次输出无法通过评测结构校验" in (
+        client.requests[1]["json"]["messages"][-1]["content"]
+    )
+    result_json = result.model_dump_json(by_alias=True)
+    assert API_KEY not in result_json
+
+
+def test_judge_rejects_sensitive_strings_in_result_lists_after_retries() -> None:
+    unsafe_response = valid_judge_response(
+        **{
+            "参考答案关键点": [f"客户手机号 13812345678", API_KEY],
+            "已覆盖关键点": ["邮箱 customer@example.com"],
+            "缺失关键点": ["身份证 11010519491231002X"],
+        }
+    )
+    client = FakeClient([unsafe_response, unsafe_response, unsafe_response])
+    agent = EvaluationJudgeAgent(make_config(), http_client=client)
+
+    with pytest.raises(
+        JudgeEvaluationError,
+        match="裁判输出包含敏感信息",
+    ) as exc_info:
+        agent.evaluate(make_item(), make_answer())
+
+    assert len(client.requests) == 3
+    error_text = _deep_sensitive_text(exc_info.value)
+    assert API_KEY not in error_text
+    assert "13812345678" not in error_text
+    assert "customer@example.com" not in error_text
+    assert "11010519491231002X" not in error_text
 
 
 def test_judge_requires_both_reason_and_suggestion_to_contain_chinese() -> None:
@@ -373,6 +426,44 @@ def test_repair_prompt_truncates_invalid_output_and_uses_safe_error_summary() ->
     assert "已截断" in repair_prompt
     assert len(repair_prompt) < len(invalid_output)
     assert API_KEY not in repair_prompt
+
+
+def test_repair_prompt_sanitizes_common_pii_and_phone_formats() -> None:
+    unsafe_values = _unsafe_pii_values()
+    unsafe_output = "；".join([API_KEY, *unsafe_values])
+    client = FakeClient(
+        [response_with_content(unsafe_output), valid_judge_response()]
+    )
+    agent = EvaluationJudgeAgent(make_config(), http_client=client)
+
+    agent.evaluate(make_item(), make_answer())
+
+    repair_prompt = client.requests[1]["json"]["messages"][-1]["content"]
+    assert API_KEY not in repair_prompt
+    assert all(value not in repair_prompt for value in unsafe_values)
+    assert "+86" not in repair_prompt
+    assert "0086" not in repair_prompt
+    assert "邮箱已隐藏" in repair_prompt
+    assert "手机号已隐藏" in repair_prompt
+    assert "身份证号已隐藏" in repair_prompt
+
+
+def test_safe_judge_error_sanitizes_common_pii_and_phone_formats() -> None:
+    unsafe_values = _unsafe_pii_values()
+    unsafe_message = "；".join([API_KEY, *unsafe_values])
+
+    message = judge_module.safe_judge_error(
+        ValueError(unsafe_message),
+        secret=API_KEY,
+    )
+
+    assert API_KEY not in message
+    assert all(value not in message for value in unsafe_values)
+    assert "+86" not in message
+    assert "0086" not in message
+    assert "邮箱已隐藏" in message
+    assert "手机号已隐藏" in message
+    assert "身份证号已隐藏" in message
 
 
 def test_build_judge_messages_projects_only_safe_scoring_context() -> None:
@@ -491,6 +582,109 @@ def test_evaluate_keeps_all_context_categories_within_explicit_budgets() -> None
     )
 
 
+def test_fit_json_value_guarantees_budget_for_nested_arrays_and_escapes() -> None:
+    value = {
+        "标题路径": [f"标题{index}\\\"" for index in range(10_000)],
+        "正文": "\\\"复杂正文" * 10_000,
+    }
+
+    fitted = judge_module._fit_json_value(
+        value,
+        judge_module.CITATION_CHAR_BUDGET - 2,
+    )
+
+    assert (
+        _compact_json_chars(fitted)
+        <= judge_module.CITATION_CHAR_BUDGET - 2
+    )
+    assert "省略" in json.dumps(fitted, ensure_ascii=False)
+
+
+@pytest.mark.parametrize("heading_count", [10_000, 30_000])
+def test_single_oversized_citation_cannot_evict_other_context_categories(
+    heading_count: int,
+) -> None:
+    escaped_text = "\\\"复杂内容" * 8_000
+    item = make_item().model_copy(
+        update={
+            "question": escaped_text,
+            "reference_answer": escaped_text,
+            "gold_evidences": [
+                GoldEvidence(
+                    chunk_id="gold-real",
+                    source_path="safe/gold.docx",
+                    locator="安全定位",
+                    excerpt=escaped_text,
+                    support_note=escaped_text,
+                )
+            ],
+        }
+    )
+    answer_response = {
+        "answer": escaped_text,
+        "retrieval_evidences": [
+            {
+                "chunk_id": "retrieval-real",
+                "chunk_type": "script",
+                "text": escaped_text,
+            }
+        ],
+        "citations": [
+            {
+                "evidence_index": 1,
+                "chunk_id": "retrieval-real",
+                "source_path": "safe/citation.docx",
+                "locator": {
+                    "line_start": 1,
+                    "heading_path": [
+                        f"标题{index}\\\""
+                        for index in range(heading_count)
+                    ],
+                },
+                "quote": escaped_text,
+            }
+        ],
+    }
+
+    messages = build_judge_messages(item, answer_response, secret=API_KEY)
+
+    user_prompt = messages[1]["content"]
+    context = _user_context(messages)
+    assert json.loads(user_prompt.split("评测上下文：\n", 1)[1]) == context
+    assert len(user_prompt) <= judge_module.JUDGE_CONTEXT_CHAR_BUDGET
+    assert (
+        _compact_json_chars(context["问题"])
+        <= judge_module.QUESTION_CHAR_LIMIT
+    )
+    assert (
+        _compact_json_chars(context["参考答案"])
+        <= judge_module.REFERENCE_ANSWER_CHAR_LIMIT
+    )
+    assert (
+        _compact_json_chars(context["智能体回答"])
+        <= judge_module.ANSWER_CHAR_LIMIT
+    )
+    assert (
+        _compact_json_chars(context["黄金证据"])
+        <= judge_module.GOLD_EVIDENCE_CHAR_BUDGET
+    )
+    assert (
+        _compact_json_chars(context["检索证据"])
+        <= judge_module.RETRIEVAL_EVIDENCE_CHAR_BUDGET
+    )
+    assert (
+        _compact_json_chars(context["引用"])
+        <= judge_module.CITATION_CHAR_BUDGET
+    )
+    assert context["黄金证据"][0]["chunk_id"] == "gold-real"
+    assert context["检索证据"][0]["chunk_id"] == "retrieval-real"
+    citation = context["引用"][0]
+    assert citation["chunk_id"] == "retrieval-real"
+    heading_path = citation["来源定位"]["标题路径"]
+    assert len(heading_path) < heading_count
+    assert any("省略" in value for value in heading_path)
+
+
 def test_http_status_error_is_not_converted_to_format_retry() -> None:
     request = _sensitive_httpx_request()
     response_request = _sensitive_httpx_request()
@@ -542,6 +736,47 @@ def test_transport_error_without_bound_request_is_preserved() -> None:
     assert len(client.requests) == 1
 
 
+@pytest.mark.parametrize("error_kind", ["transport", "status"])
+def test_http_error_after_format_retry_clears_prior_sensitive_locals(
+    error_kind: str,
+) -> None:
+    prior_output = API_KEY + "-前一轮原始模型输出" * 3_000
+    request = _sensitive_httpx_request()
+    if error_kind == "transport":
+        expected_error: httpx.HTTPError = httpx.ReadTimeout(
+            "裁判读取超时",
+            request=request,
+        )
+        second_outcome: object = expected_error
+    else:
+        response_request = _sensitive_httpx_request()
+        response = httpx.Response(503, request=response_request)
+        expected_error = httpx.HTTPStatusError(
+            "Service Unavailable",
+            request=request,
+            response=response,
+        )
+        second_outcome = FakeResponse({}, status_error=expected_error)
+    client = FakeClient(
+        [response_with_content(prior_output), second_outcome]
+    )
+    agent = EvaluationJudgeAgent(make_config(), http_client=client)
+
+    with pytest.raises(type(expected_error)) as exc_info:
+        agent.evaluate(make_item(), make_answer())
+
+    error = exc_info.value
+    assert error is expected_error
+    judge_locals = _judge_traceback_locals(error)
+    assert judge_locals
+    assert all("self" not in values for values in judge_locals)
+    sensitive_text = _deep_sensitive_text(
+        {"异常": error, "裁判帧局部": judge_locals}
+    )
+    assert API_KEY not in sensitive_text
+    assert prior_output not in sensitive_text
+
+
 def test_injected_client_is_not_closed_by_agent_context_manager() -> None:
     client = FakeClient([valid_judge_response()])
 
@@ -570,8 +805,8 @@ def test_owned_client_is_closed_once(monkeypatch: pytest.MonkeyPatch) -> None:
     assert client.close_calls == 1
 
 
-def _exception_graph_and_judge_locals(error: BaseException) -> str:
-    parts: list[str] = []
+def _judge_traceback_locals(error: BaseException) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
     pending = [error]
     seen: set[int] = set()
     while pending:
@@ -579,21 +814,85 @@ def _exception_graph_and_judge_locals(error: BaseException) -> str:
         if id(current) in seen:
             continue
         seen.add(id(current))
-        parts.extend((str(current), repr(current)))
         traceback = current.__traceback__
         while traceback is not None:
             frame = traceback.tb_frame
             if frame.f_globals.get("__name__") == "xhbx_rag.evaluation.judge":
-                parts.extend(
-                    f"{name}={value!r}"
-                    for name, value in frame.f_locals.items()
-                )
+                rows.append(dict(frame.f_locals))
             traceback = traceback.tb_next
         if current.__cause__ is not None:
             pending.append(current.__cause__)
         if current.__context__ is not None:
             pending.append(current.__context__)
-    return "\n".join(parts)
+    return rows
+
+
+def _deep_sensitive_text(value: object, seen: set[int] | None = None) -> str:
+    visited = seen if seen is not None else set()
+    if isinstance(value, str):
+        return value
+    if value is None or isinstance(value, (bool, int, float)):
+        return repr(value)
+    if id(value) in visited:
+        return ""
+    visited.add(id(value))
+    if isinstance(value, dict):
+        return "\n".join(
+            text
+            for key, item in value.items()
+            for text in (
+                _deep_sensitive_text(key, visited),
+                _deep_sensitive_text(item, visited),
+            )
+        )
+    if isinstance(value, (list, tuple, set)):
+        return "\n".join(
+            _deep_sensitive_text(item, visited) for item in value
+        )
+    if isinstance(value, JudgeResult):
+        return _deep_sensitive_text(value.model_dump(), visited)
+    if isinstance(value, EvaluationConfig):
+        return _deep_sensitive_text(vars(value), visited)
+    if isinstance(value, EvaluationJudgeAgent):
+        return _deep_sensitive_text(vars(value), visited)
+    if isinstance(value, ValidationError):
+        return "\n".join(
+            (
+                str(value),
+                repr(value),
+                _deep_sensitive_text(
+                    value.errors(include_input=True, include_context=True),
+                    visited,
+                ),
+            )
+        )
+    if isinstance(value, json.JSONDecodeError):
+        return "\n".join((str(value), repr(value), value.doc))
+    if isinstance(value, httpx.HTTPError):
+        details: list[object] = [str(value), repr(value), vars(value)]
+        try:
+            details.append(dict(value.request.headers))
+        except RuntimeError:
+            pass
+        response = getattr(value, "response", None)
+        if response is not None:
+            try:
+                details.append(dict(response.request.headers))
+            except RuntimeError:
+                pass
+        return _deep_sensitive_text(details, visited)
+    if isinstance(value, BaseException):
+        return _deep_sensitive_text(
+            [
+                str(value),
+                repr(value),
+                vars(value),
+                value.__cause__,
+                value.__context__,
+            ],
+            visited,
+        )
+    return repr(value)
 
 
 def _sensitive_httpx_request() -> httpx.Request:
@@ -701,3 +1000,16 @@ def _compact_json_chars(value: object) -> int:
             separators=(",", ":"),
         )
     )
+
+
+def _unsafe_pii_values() -> list[str]:
+    return [
+        "联系人customer@example.com",
+        "手机13812345678",
+        "国际+8613812345678",
+        "国际+86 138 1234 5678",
+        "国际8613812345678",
+        "国际0086-13812345678",
+        "分隔138-1234-5678",
+        "证件11010519491231002X",
+    ]

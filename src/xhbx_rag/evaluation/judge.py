@@ -28,6 +28,8 @@ RETRIEVAL_EVIDENCE_CHAR_BUDGET = 20_000
 CITATION_CHAR_BUDGET = 6_000
 JUDGE_CONTEXT_CHAR_BUDGET = 50_000
 MIN_PROJECTED_ITEM_CHARS = 256
+NESTED_LIST_ITEM_LIMITS = (4_096, 1_024, 256, 64, 16, 4, 1, 0)
+NESTED_STRING_CHAR_LIMITS = (4_096, 2_048, 1_024, 512, 256, 128, 64, 32, 16)
 SECRET_PLACEHOLDER = "【API密钥已隐藏】"
 EMAIL_PLACEHOLDER = "【邮箱已隐藏】"
 PHONE_PLACEHOLDER = "【手机号已隐藏】"
@@ -78,6 +80,10 @@ class _ChineseExplanationError(ValueError):
     """扣分原因或改进建议没有使用中文。"""
 
 
+class _UnsafeJudgeOutputError(ValueError):
+    """裁判结果包含不允许返回的敏感字符串。"""
+
+
 class EvaluationJudgeAgent:
     def __init__(
         self,
@@ -98,40 +104,65 @@ class EvaluationJudgeAgent:
         item: EvaluationItem,
         answer_response: dict[str, Any],
     ) -> JudgeResult:
+        http_client = self.http_client
+        endpoint = (
+            self.config.judge_base_url.rstrip("/") + "/chat/completions"
+        )
+        model_name = self.config.judge_model_name
+        timeout = self.config.judge_timeout
+        retry_attempts = self.config.judge_retry_attempts
+        api_key = self.config.judge_api_key
         base_messages = build_judge_messages(
             item,
             answer_response,
-            secret=self.config.judge_api_key,
+            secret=api_key,
         )
         del item, answer_response
         messages = base_messages
-        last_error: ValueError | RecursionError | None = None
+        last_error_message = "裁判输出未通过校验"
+        response: _JudgeResponse | None = None
+        payload: object = None
+        content = ""
+        invalid_output = ""
+        result: JudgeResult | None = None
 
-        for _attempt in range(self.config.judge_retry_attempts + 1):
+        for _attempt in range(retry_attempts + 1):
+            response = None
+            payload = None
+            content = ""
+            invalid_output = ""
+            result = None
             try:
-                response = self.http_client.post(
-                    self.config.judge_base_url.rstrip("/")
-                    + "/chat/completions",
+                response = http_client.post(
+                    endpoint,
                     headers={
-                        "Authorization": (
-                            f"Bearer {self.config.judge_api_key}"
-                        ),
+                        "Authorization": f"Bearer {api_key}",
                         "Content-Type": "application/json",
                     },
                     json={
-                        "model": self.config.judge_model_name,
+                        "model": model_name,
                         "messages": messages,
                         "temperature": 0,
                         "response_format": {"type": "json_object"},
                     },
-                    timeout=self.config.judge_timeout,
+                    timeout=timeout,
                 )
                 response.raise_for_status()
             except httpx.HTTPError as exc:
                 _redact_http_error_headers(exc)
+                response = None
+                payload = None
+                content = ""
+                invalid_output = ""
+                result = None
+                last_error_message = ""
+                base_messages = []
+                messages = []
+                api_key = ""
+                http_client = None  # type: ignore[assignment]
+                del self
                 raise
 
-            invalid_output = ""
             try:
                 payload = response.json()
                 invalid_output = _safe_payload_text(payload)
@@ -144,25 +175,37 @@ class EvaluationJudgeAgent:
                     result.reason,
                     result.improvement_suggestion,
                 )
+                require_safe_judge_result(result, api_key)
                 return result
             except (ValidationError, ValueError, RecursionError) as exc:
-                last_error = exc
+                last_error_message = safe_judge_error(
+                    exc,
+                    secret=api_key,
+                )
                 messages = repair_messages(
                     base_messages,
                     invalid_output,
                     exc,
-                    secret=self.config.judge_api_key,
+                    secret=api_key,
                 )
+                response = None
+                payload = None
+                content = ""
+                invalid_output = ""
+                result = None
 
-        final_message = safe_judge_error(
-            last_error,
-            secret=self.config.judge_api_key,
-        )
-        last_error = None
+        final_message = last_error_message
+        last_error_message = ""
         response = None
         payload = None
         content = ""
         invalid_output = ""
+        result = None
+        base_messages = []
+        messages = []
+        api_key = ""
+        http_client = None  # type: ignore[assignment]
+        del self
         raise JudgeEvaluationError(final_message)
 
     def close(self) -> None:
@@ -194,11 +237,11 @@ def build_judge_messages(
     raw_retrieval_evidences = answer_response.get("retrieval_evidences", [])
     raw_citations = answer_response.get("citations", [])
     context = {
-        "问题": _bounded_text(
+        "问题": _fit_json_string(
             _sanitize_prompt_text(item.question, secret),
             QUESTION_CHAR_LIMIT,
         ),
-        "参考答案": _bounded_text(
+        "参考答案": _fit_json_string(
             _sanitize_prompt_text(item.reference_answer, secret),
             REFERENCE_ANSWER_CHAR_LIMIT,
         ),
@@ -218,7 +261,7 @@ def build_judge_messages(
             budget=GOLD_EVIDENCE_CHAR_BUDGET,
             projector=_project_gold_evidence,
         ),
-        "智能体回答": _bounded_text(answer, ANSWER_CHAR_LIMIT),
+        "智能体回答": _fit_json_string(answer, ANSWER_CHAR_LIMIT),
         "检索证据": _project_collection(
             _dict_rows(raw_retrieval_evidences),
             secret=secret,
@@ -389,6 +432,8 @@ def _project_collection(
             projected[-1] = marker
         else:
             projected.append(marker)
+    if _compact_json_chars(projected) > budget:
+        projected = [{"省略说明": "该类别单项超过上下文预算，已省略"}]
     return projected
 
 
@@ -407,12 +452,20 @@ def _project_string_list(
     suffix = f"...（另有 {omitted} 项已省略）..." if omitted else None
     suffix_chars = _compact_json_chars(suffix) + 1 if suffix else 0
     available = budget - suffix_chars - 2 - max(0, len(selected) - 1)
-    item_limit = max(16, available // len(selected) - 2)
-    projected = [_bounded_text(value, item_limit) for value in selected]
+    item_budget = max(18, available // len(selected))
+    projected = [_fit_json_string(value, item_budget) for value in selected]
     if suffix:
         projected.append(suffix)
     while _compact_json_chars(projected) > budget and len(projected) > 1:
         projected.pop(-2 if suffix else -1)
+        omitted += 1
+        suffix = f"...（另有 {omitted} 项已省略）..."
+        if projected and "项已省略" in projected[-1]:
+            projected[-1] = suffix
+        else:
+            projected.append(suffix)
+    if _compact_json_chars(projected) > budget:
+        projected = ["...（列表内容超过上下文预算，已省略）..."]
     return projected
 
 
@@ -422,61 +475,122 @@ def _fit_json_value(
 ) -> dict[str, object]:
     if _compact_json_chars(value) <= budget:
         return value
-    max_length = max(_string_lengths(value), default=32)
-    limit = max_length
-    candidate = value
-    while _compact_json_chars(candidate) > budget and limit > 16:
-        limit = max(16, int(limit * 0.6))
-        candidate = _truncate_strings(value, limit)
-    return candidate
+    for list_limit in NESTED_LIST_ITEM_LIMITS:
+        for string_limit in NESTED_STRING_CHAR_LIMITS:
+            candidate = _limit_nested_value(
+                value,
+                string_limit=string_limit,
+                list_limit=list_limit,
+            )
+            if _compact_json_chars(candidate) <= budget:
+                return candidate
+    minimal = _minimalize_nested_value(value)
+    if isinstance(minimal, dict) and _compact_json_chars(minimal) <= budget:
+        return minimal
+    fallback = {"省略说明": "该项内容超过上下文预算，已省略"}
+    return fallback if _compact_json_chars(fallback) <= budget else {}
 
 
 def _fit_context_json(context: dict[str, object], budget: int) -> str:
     encoded = _compact_json(context)
     if len(encoded) <= budget:
         return encoded
-    candidate: dict[str, object] = context
-    for limit in (2_048, 1_024, 512, 256, 128, 64):
-        candidate = _truncate_strings(context, limit)
+    candidate = dict(context)
+    for divisor in (2, 4, 8, 16):
+        candidate["问题"] = _fit_json_string(
+            str(context["问题"]),
+            max(64, QUESTION_CHAR_LIMIT // divisor),
+        )
+        candidate["参考答案"] = _fit_json_string(
+            str(context["参考答案"]),
+            max(64, REFERENCE_ANSWER_CHAR_LIMIT // divisor),
+        )
+        candidate["智能体回答"] = _fit_json_string(
+            str(context["智能体回答"]),
+            max(64, ANSWER_CHAR_LIMIT // divisor),
+        )
         encoded = _compact_json(candidate)
         if len(encoded) <= budget:
             return encoded
-    minimal = {
-        key: (
-            [{"省略说明": "该类别内容因整体上下文预算已省略"}]
-            if isinstance(value, list)
-            else _bounded_text(str(value), 64)
+    for key in ("引用", "黄金证据", "检索证据"):
+        wrapped = _fit_json_value(
+            {key: candidate[key]},
+            max(256, _compact_json_chars(candidate[key]) // 2),
         )
-        for key, value in context.items()
-    }
+        candidate[key] = wrapped.get(
+            key,
+            [{"省略说明": "该类别内容因整体上下文预算已省略"}],
+        )
+        encoded = _compact_json(candidate)
+        if len(encoded) <= budget:
+            return encoded
+    minimal = dict(candidate)
+    for key in ("引用", "黄金证据", "检索证据"):
+        minimal[key] = [{"省略说明": "该类别内容因整体上下文预算已省略"}]
+    minimal["黄金chunk_id列表"] = ["...（列表已省略）..."]
+    minimal["问题"] = "...（问题已省略）..."
+    minimal["参考答案"] = "...（参考答案已省略）..."
+    minimal["智能体回答"] = "...（回答已省略）..."
     return _compact_json(minimal)
 
 
-def _truncate_strings(value: Any, limit: int) -> Any:
+def _fit_json_string(text: str, budget: int) -> str:
+    if _compact_json_chars(text) <= budget:
+        return text
+    limit = min(len(text), max(16, budget))
+    while limit > 16:
+        candidate = _bounded_text(text, limit)
+        if _compact_json_chars(candidate) <= budget:
+            return candidate
+        limit = max(16, int(limit * 0.7))
+    marker = "...（内容超过 JSON 预算，已省略）..."
+    return marker if _compact_json_chars(marker) <= budget else ""
+
+
+def _limit_nested_value(
+    value: Any,
+    *,
+    string_limit: int,
+    list_limit: int,
+) -> Any:
     if isinstance(value, str):
-        return _bounded_text(value, limit)
+        return _bounded_text(value, string_limit)
     if isinstance(value, list):
-        return [_truncate_strings(item, limit) for item in value]
+        selected = [
+            _limit_nested_value(
+                item,
+                string_limit=string_limit,
+                list_limit=list_limit,
+            )
+            for item in value[:list_limit]
+        ]
+        omitted = len(value) - len(selected)
+        if omitted:
+            selected.append(f"...（另有 {omitted} 项已省略）...")
+        return selected
     if isinstance(value, dict):
         return {
-            key: _truncate_strings(item, limit)
+            key: _limit_nested_value(
+                item,
+                string_limit=string_limit,
+                list_limit=list_limit,
+            )
             for key, item in value.items()
         }
     return value
 
 
-def _string_lengths(value: object) -> list[int]:
+def _minimalize_nested_value(value: Any) -> Any:
     if isinstance(value, str):
-        return [len(value)]
+        return _fit_json_string(value, 48)
     if isinstance(value, list):
-        return [length for item in value for length in _string_lengths(item)]
+        return ["...（列表内容已省略）..."] if value else []
     if isinstance(value, dict):
-        return [
-            length
-            for item in value.values()
-            for length in _string_lengths(item)
-        ]
-    return []
+        return {
+            key: _minimalize_nested_value(item)
+            for key, item in value.items()
+        }
+    return value
 
 
 def _safe_source_path(value: object, secret: str) -> str:
@@ -522,7 +636,8 @@ def _sanitize_prompt_text(text: str, secret: str) -> str:
         sanitized,
     )
     sanitized = re.sub(
-        r"(?<!\d)1[3-9]\d{9}(?!\d)",
+        r"(?<!\d)(?:(?:\+86|0086|86)[\s-]*)?"
+        r"1[3-9](?:[\s-]*\d){9}(?!\d)",
         PHONE_PLACEHOLDER,
         sanitized,
     )
@@ -569,6 +684,28 @@ def require_chinese_explanation(reason: str, suggestion: str) -> None:
         )
 
 
+def require_safe_judge_result(result: JudgeResult, secret: str) -> None:
+    for text in _iter_string_values(result.model_dump(mode="python")):
+        if _sanitize_prompt_text(text, secret) != text:
+            raise _UnsafeJudgeOutputError(
+                "裁判输出包含敏感信息，已拒绝返回"
+            )
+
+
+def _iter_string_values(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [text for item in value for text in _iter_string_values(item)]
+    if isinstance(value, dict):
+        return [
+            text
+            for item in value.values()
+            for text in _iter_string_values(item)
+        ]
+    return []
+
+
 def repair_messages(
     base_messages: list[dict[str, str]],
     invalid_output: str,
@@ -576,14 +713,14 @@ def repair_messages(
     *,
     secret: str,
 ) -> list[dict[str, str]]:
-    safe_output = _redact_secret(
-        _bounded_text(
+    safe_output = _bounded_text(
+        _sanitize_prompt_text(
             invalid_output or "（未取得有效文本输出）",
-            INVALID_OUTPUT_EXCERPT_CHARS,
+            secret,
         ),
-        secret,
+        INVALID_OUTPUT_EXCERPT_CHARS,
     )
-    error_summary = _redact_secret(_safe_error_summary(error), secret)
+    error_summary = _sanitize_prompt_text(_safe_error_summary(error), secret)
     repair_prompt = (
         "上一次输出无法通过评测结构校验，"
         "请严格按系统提示重新输出完整的"
@@ -603,7 +740,10 @@ def safe_judge_error(
         message = str(error)
     else:
         message = f"裁判输出结构校验失败：{_safe_error_summary(error)}"
-    return _bounded_text(_redact_secret(message, secret), FINAL_ERROR_CHARS)
+    return _bounded_text(
+        _sanitize_prompt_text(message, secret),
+        FINAL_ERROR_CHARS,
+    )
 
 
 def _extract_content(payload: object) -> str:
@@ -683,12 +823,6 @@ def _bounded_text(text: str, limit: int) -> str:
     tail_chars = remaining - head_chars
     tail = text[-tail_chars:] if tail_chars else ""
     return f"{text[:head_chars]}{marker}{tail}"
-
-
-def _redact_secret(text: str, secret: str) -> str:
-    if not secret:
-        return text
-    return text.replace(secret, "（已隐藏敏感信息）")
 
 
 def _redact_http_error_headers(error: httpx.HTTPError) -> None:
