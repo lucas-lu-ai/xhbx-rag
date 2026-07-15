@@ -16,10 +16,46 @@ def load_dataset(path: Path) -> list[EvaluationItem]:
     if not isinstance(rows, list) or len(rows) != 50:
         raise ValueError("评测集必须包含 50 条评测项")
 
+    excel_rows: list[int] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("评测项必须是包含中文字段的对象")
+        excel_row = row.get("Excel行号")
+        if not isinstance(excel_row, int) or isinstance(excel_row, bool):
+            raise ValueError("Excel行号缺失或不是整数")
+        excel_rows.append(excel_row)
+
+    expected_rows = set(range(2, 52))
+    actual_rows = set(excel_rows)
+    errors: list[str] = []
+    duplicate_rows = sorted(
+        value for value in actual_rows if excel_rows.count(value) > 1
+    )
+    if duplicate_rows:
+        errors.append(
+            "Excel行号重复：" + "、".join(str(value) for value in duplicate_rows)
+        )
+    if actual_rows != expected_rows:
+        missing = "、".join(str(value) for value in sorted(expected_rows - actual_rows))
+        outside = "、".join(str(value) for value in sorted(actual_rows - expected_rows))
+        errors.append(
+            "Excel行号必须恰好为 2..51；"
+            f"缺失：{missing or '无'}；越界：{outside or '无'}"
+        )
+    if errors:
+        raise ValueError("；".join(errors))
+
+    for row, excel_row in zip(rows, excel_rows, strict=True):
+        expected_id = f"row-{excel_row}"
+        actual_id = row.get("评测项ID")
+        if actual_id != expected_id:
+            raise ValueError(
+                "评测项ID与Excel行号不一致："
+                f"Excel行号 {excel_row} 应为 {expected_id}，"
+                f"实际为 {actual_id if actual_id is not None else '缺失'}"
+            )
+
     items = [EvaluationItem.model_validate(row) for row in rows]
-    excel_rows = [item.excel_row for item in items]
-    if len(excel_rows) != len(set(excel_rows)):
-        raise ValueError("Excel行号重复")
     return sorted(items, key=lambda item: item.excel_row)
 
 

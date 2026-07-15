@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import path from "node:path";
 
 import { FileBlob, SpreadsheetFile } from "@oai/artifact-tool";
 
@@ -64,10 +65,20 @@ async function extract(options) {
   const mainSheet = requiredWorksheet(workbook, "绩优案例测试-楚琦");
   const detailSheet = requiredWorksheet(workbook, "溯源明细");
   const mainRows = mainSheet.getRange("A1:E51").values;
+  const mainUsedRows = mainSheet.getUsedRange(true).values;
   const detailRows = detailSheet.getUsedRange().values;
 
   if (mainRows.length !== 51) {
     throw new Error(`主表必须包含 51 行，实际为 ${mainRows.length} 行`);
+  }
+  const extraRowOffset = mainUsedRows
+    .slice(51)
+    .findIndex((row) => row.slice(0, 5).some((value) => normalizedText(value) !== ""));
+  if (extraRowOffset !== -1) {
+    throw new Error(
+      `主表 A:E 有效数据行必须恰好为 51 行（含表头），` +
+      `检测到第 ${extraRowOffset + 52} 行仍有数据`,
+    );
   }
   if (detailRows.length < 1) {
     throw new Error("溯源明细工作表没有表头");
@@ -130,7 +141,7 @@ async function extract(options) {
     };
   });
 
-  await fs.mkdir(new URL(".", `file://${outputPath}`).pathname, { recursive: true });
+  await fs.mkdir(path.dirname(outputPath), { recursive: true });
   await fs.writeFile(
     outputPath,
     JSON.stringify({ "评测项": evaluationRows }, null, 2),

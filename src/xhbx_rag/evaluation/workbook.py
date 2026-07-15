@@ -77,19 +77,31 @@ class WorkbookAdapter:
         copied_script = adapter_dir / WORKBOOK_SCRIPT.name
         if not WORKBOOK_SCRIPT.is_file():
             raise RuntimeError(f"找不到工作簿脚本：{WORKBOOK_SCRIPT}")
-        shutil.copy2(WORKBOOK_SCRIPT, copied_script)
+        try:
+            shutil.copy2(WORKBOOK_SCRIPT, copied_script)
+        except OSError as exc:
+            raise RuntimeError(
+                "复制工作簿脚本失败："
+                f"{WORKBOOK_SCRIPT} -> {copied_script}：{exc}"
+            ) from exc
         self._ensure_node_modules_link(adapter_dir / "node_modules", node_modules)
 
         process_env = os.environ.copy()
         process_env.update(self._env)
-        completed = subprocess.run(
-            [str(node_bin), str(copied_script), *arguments],
-            cwd=adapter_dir,
-            env=process_env,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        try:
+            completed = subprocess.run(
+                [str(node_bin), str(copied_script), *arguments],
+                cwd=adapter_dir,
+                env=process_env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                "启动 Node 工作簿进程失败："
+                f"{node_bin}（工作目录：{adapter_dir}）：{exc}"
+            ) from exc
         if completed.returncode != 0:
             detail = completed.stderr.strip() or completed.stdout.strip()
             if detail:
@@ -112,8 +124,8 @@ class WorkbookAdapter:
                 "请设置 bundled node_modules 目录路径"
             )
 
-        node_bin = Path(node_value)
-        node_modules = Path(modules_value)
+        node_bin = Path(node_value).expanduser().resolve()
+        node_modules = Path(modules_value).expanduser().resolve()
         if not node_bin.is_file() or not os.access(node_bin, os.X_OK):
             raise RuntimeError(f"EVALUATION_NODE_BIN 不是可执行文件：{node_bin}")
         if not node_modules.is_dir():
@@ -131,7 +143,13 @@ class WorkbookAdapter:
             raise RuntimeError(f"node_modules 软链接指向了其他目录：{link_path}")
         if link_path.exists():
             raise RuntimeError(f"node_modules 路径已存在且不是软链接：{link_path}")
-        link_path.symlink_to(target, target_is_directory=True)
+        try:
+            link_path.symlink_to(target, target_is_directory=True)
+        except OSError as exc:
+            raise RuntimeError(
+                "创建 node_modules 软链接失败："
+                f"{link_path} -> {target}：{exc}"
+            ) from exc
 
 
 def _build_parser() -> argparse.ArgumentParser:
