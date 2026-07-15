@@ -419,6 +419,7 @@ def test_backfill_accepts_canonical_answer_and_evaluation_failures(
         ("authKey", "不得落盘"),
         ("外部地址", "file:///Users/milan/private.txt"),
         ("编码地址", "file:///%55sers/milan/private.txt"),
+        ("空白包围地址", "  file:///Users/milan/private.txt  "),
         ("凭证地址", "file://user:pass@localhost/tmp/result.json"),
         ("主目录", "/home/operator/private.txt"),
     ],

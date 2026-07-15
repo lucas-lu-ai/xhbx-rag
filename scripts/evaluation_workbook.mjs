@@ -640,13 +640,14 @@ function looksLikeCredentialKey(value) {
 
 function assertSafeMetadataValue(value, fieldName) {
   if (typeof value === "string") {
-    if (looksLikeAbsoluteUserPath(value)) {
+    const text = normalizedText(value);
+    if (looksLikeAbsoluteUserPath(text)) {
       throw new Error(`运行元数据不得包含绝对用户目录：${fieldName}`);
     }
-    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) {
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(text)) {
       let parsed;
       try {
-        parsed = new URL(value);
+        parsed = new URL(text);
       } catch {
         throw new Error(`运行元数据包含无法安全解析的地址：${fieldName}`);
       }
