@@ -308,6 +308,44 @@ class _SuccessfulAdapter:
         return output_path
 
 
+def test_safe_backfill_preserves_node_persistence_failure_category(
+    tmp_path: Path,
+) -> None:
+    import xhbx_rag.evaluation.workbook as workbook
+
+    source = tmp_path / "source.xlsx"
+    source.write_bytes(b"original")
+    run_dir = tmp_path / "run"
+    _, digest = create_input_snapshot(source, run_dir)
+
+    class FailingAdapter(_SuccessfulAdapter):
+        def backfill(
+            self,
+            input_path: Path,
+            payload_path: Path,
+            output_path: Path,
+        ) -> Path:
+            del input_path, payload_path, output_path
+            raise workbook.WorkbookAdapterPersistenceError(
+                "工作簿持久化失败：ENOSPC"
+            )
+
+    with pytest.raises(WorkbookPersistenceError) as captured:
+        safe_backfill(
+            source,
+            run_dir,
+            FailingAdapter(run_dir),
+            {"运行信息": {}, "汇总指标": {}, "逐题结果": []},
+            expected_source_sha256=digest,
+        )
+
+    assert isinstance(
+        captured.value.__cause__,
+        workbook.WorkbookAdapterPersistenceError,
+    )
+    assert source.read_bytes() == b"original"
+
+
 class _TruthyStringVerifyAdapter(_SuccessfulAdapter):
     def verify(
         self,
@@ -486,7 +524,7 @@ def test_safe_backfill_serializes_concurrent_writers_with_stable_lock(
     payload = {"运行信息": {}, "汇总指标": {}, "逐题结果": []}
     attempts: list[tuple[Path, str, bytes]] = []
     for index in (1, 2):
-        run_dir = tmp_path / f"run-{index}"
+        run_dir = tmp_path / f"output-{index}" / f"run-{index}"
         _, digest = create_input_snapshot(source, run_dir)
         attempts.append((run_dir, digest, f"candidate-{index}".encode()))
 
@@ -503,7 +541,6 @@ def test_safe_backfill_serializes_concurrent_writers_with_stable_lock(
                 ),
                 payload,
                 expected_source_sha256=digest,
-                lock_root=tmp_path / "locks",
             )
         except WorkbookValidationError:
             return "已拒绝"

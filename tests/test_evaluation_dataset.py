@@ -381,6 +381,47 @@ def test_workbook_adapter_wraps_subprocess_start_oserror_in_chinese(
         adapter.extract(tmp_path / "input.xlsx", tmp_path / "dataset.json")
 
 
+@pytest.mark.parametrize(
+    "stdout,stderr",
+    [
+        ("", "Error: ENOSPC: no space left on device"),
+        ("EDQUOT: disk quota exceeded", "工作簿处理失败"),
+        ("", "EROFS: read-only file system"),
+        ("", "EIO: input/output error"),
+    ],
+)
+def test_workbook_adapter_maps_node_persistence_failures_to_oserror(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stdout: str,
+    stderr: str,
+) -> None:
+    completed = subprocess.CompletedProcess(
+        args=["node"],
+        returncode=1,
+        stdout=stdout,
+        stderr=stderr,
+    )
+    monkeypatch.setattr(
+        workbook_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: completed,
+    )
+    adapter = WorkbookAdapter(
+        tmp_path / "run",
+        env={
+            "EVALUATION_NODE_BIN": str(FIXED_NODE_BIN),
+            "EVALUATION_ARTIFACT_NODE_MODULES": str(FIXED_NODE_MODULES),
+        },
+    )
+
+    with pytest.raises(
+        workbook_module.WorkbookAdapterPersistenceError,
+        match="工作簿持久化失败",
+    ):
+        adapter.extract(tmp_path / "input.xlsx", tmp_path / "dataset.json")
+
+
 def test_workbook_adapter_resolves_relative_runtime_paths_before_changing_cwd(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -11,6 +12,22 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 WORKBOOK_SCRIPT = REPO_ROOT / "scripts" / "evaluation_workbook.mjs"
+_PERSISTENCE_ERROR_CODE_PATTERN = re.compile(
+    r"\b(?:ENOSPC|EDQUOT|EROFS|EIO)\b",
+    re.IGNORECASE,
+)
+_PERSISTENCE_ERROR_PHRASES = (
+    "no space left",
+    "disk quota exceeded",
+    "quota exceeded",
+    "read-only file system",
+    "input/output error",
+    "i/o error",
+)
+
+
+class WorkbookAdapterPersistenceError(OSError):
+    """Node 工作簿进程报告无法继续读取或耐久写入。"""
 
 
 class WorkbookAdapter:
@@ -103,7 +120,17 @@ class WorkbookAdapter:
                 f"{node_bin}（工作目录：{adapter_dir}）：{exc}"
             ) from exc
         if completed.returncode != 0:
-            detail = completed.stderr.strip() or completed.stdout.strip()
+            stderr = completed.stderr.strip()
+            stdout = completed.stdout.strip()
+            combined_detail = "\n".join(
+                value for value in (stderr, stdout) if value
+            )
+            if _is_persistence_failure(combined_detail):
+                detail = combined_detail or f"退出码：{completed.returncode}"
+                raise WorkbookAdapterPersistenceError(
+                    f"工作簿持久化失败：{detail}"
+                )
+            detail = stderr or stdout
             if detail:
                 raise RuntimeError(f"工作簿处理失败：{detail}")
             raise RuntimeError(f"工作簿处理失败，退出码：{completed.returncode}")
@@ -173,6 +200,13 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _is_persistence_failure(detail: str) -> bool:
+    if _PERSISTENCE_ERROR_CODE_PATTERN.search(detail):
+        return True
+    normalized = detail.casefold()
+    return any(phrase in normalized for phrase in _PERSISTENCE_ERROR_PHRASES)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -189,7 +223,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.output,
                 args.preview_dir,
             )
-    except RuntimeError as exc:
+    except (RuntimeError, WorkbookAdapterPersistenceError) as exc:
         print(f"工作簿适配器错误：{exc}", file=sys.stderr)
         return 1
     return 0

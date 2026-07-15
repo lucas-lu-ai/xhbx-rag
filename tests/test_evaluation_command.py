@@ -285,9 +285,155 @@ def test_run_evaluate_command_maps_snapshot_disk_full_to_exit_three(
     def fail_snapshot(*_args: object, **_kwargs: object) -> object:
         raise WorkbookPersistenceError("模拟磁盘已满")
 
+    retrieval_config = SimpleNamespace(
+        model_name="answer-model",
+        milvus_uri="http://localhost:19530",
+    )
+    judge_config = SimpleNamespace(
+        judge_model_name="judge-model",
+        same_model_judge=False,
+    )
+    monkeypatch.setattr(
+        command.RetrievalConfig,
+        "from_env",
+        lambda: retrieval_config,
+    )
+    monkeypatch.setattr(command, "load_evaluation_config", lambda: judge_config)
+    monkeypatch.setattr(
+        command,
+        "preflight_docker_milvus",
+        lambda _config: {"案例知识库": {"存在": True, "数据量": 1}},
+    )
     monkeypatch.setattr(command, "create_input_snapshot", fail_snapshot)
 
     exit_code = run_evaluate_command(_args(tmp_path))
 
     assert exit_code == 3
     assert "评测落盘失败" in capsys.readouterr().err
+
+
+def test_configuration_failure_does_not_create_input_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import xhbx_rag.evaluation.command as command
+
+    source = tmp_path / "input.xlsx"
+    source.write_bytes(b"source")
+
+    def fail_config() -> object:
+        raise command.ConfigError("模拟配置失败")
+
+    class FakeAdapter:
+        def __init__(self, _adapter_dir: Path) -> None:
+            pass
+
+        def extract(self, _input_path: Path, output_path: Path) -> Path:
+            output_path.write_text("{}", encoding="utf-8")
+            return output_path
+
+    monkeypatch.setattr(command, "WorkbookAdapter", FakeAdapter)
+    monkeypatch.setattr(command, "load_dataset", lambda _path: [_item(2)])
+    monkeypatch.setattr(command.RetrievalConfig, "from_env", fail_config)
+    monkeypatch.setattr(command, "_resolve_run_id", lambda _resume: "run-1")
+
+    exit_code = run_evaluate_command(_args(tmp_path))
+
+    assert exit_code == 2
+    assert not (tmp_path / "out" / "run-1" / "input-backup.xlsx").exists()
+
+
+def test_milvus_preflight_failure_does_not_create_input_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import xhbx_rag.evaluation.command as command
+
+    source = tmp_path / "input.xlsx"
+    source.write_bytes(b"source")
+    retrieval_config = SimpleNamespace(
+        model_name="answer-model",
+        milvus_uri="http://localhost:19530",
+    )
+    judge_config = SimpleNamespace(
+        judge_model_name="judge-model",
+        same_model_judge=False,
+    )
+    monkeypatch.setattr(
+        command.RetrievalConfig,
+        "from_env",
+        lambda: retrieval_config,
+    )
+    monkeypatch.setattr(command, "load_evaluation_config", lambda: judge_config)
+
+    class FakeAdapter:
+        def __init__(self, _adapter_dir: Path) -> None:
+            pass
+
+        def extract(self, _input_path: Path, output_path: Path) -> Path:
+            output_path.write_text("{}", encoding="utf-8")
+            return output_path
+
+    monkeypatch.setattr(command, "WorkbookAdapter", FakeAdapter)
+    monkeypatch.setattr(command, "load_dataset", lambda _path: [_item(2)])
+
+    def fail_preflight(_config: object) -> object:
+        raise command.EvaluationPreflightError("模拟 Milvus 预检失败")
+
+    monkeypatch.setattr(command, "preflight_docker_milvus", fail_preflight)
+    monkeypatch.setattr(command, "_resolve_run_id", lambda _resume: "run-1")
+
+    exit_code = run_evaluate_command(_args(tmp_path))
+
+    assert exit_code == 2
+    assert not (tmp_path / "out" / "run-1" / "input-backup.xlsx").exists()
+
+
+def test_run_evaluate_command_maps_node_enospc_to_exit_three(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import xhbx_rag.evaluation.command as command
+    import xhbx_rag.evaluation.workbook as workbook
+
+    source = tmp_path / "input.xlsx"
+    source.write_bytes(b"source")
+    retrieval_config = SimpleNamespace(
+        model_name="answer-model",
+        milvus_uri="http://localhost:19530",
+    )
+    judge_config = SimpleNamespace(
+        judge_model_name="judge-model",
+        same_model_judge=False,
+    )
+    monkeypatch.setattr(
+        command.RetrievalConfig,
+        "from_env",
+        lambda: retrieval_config,
+    )
+    monkeypatch.setattr(command, "load_evaluation_config", lambda: judge_config)
+    monkeypatch.setattr(
+        command,
+        "preflight_docker_milvus",
+        lambda _config: {"案例知识库": {"存在": True, "数据量": 1}},
+    )
+    monkeypatch.setattr(command, "_resolve_run_id", lambda _resume: "run-1")
+
+    class FailingAdapter:
+        def __init__(self, _adapter_dir: Path) -> None:
+            pass
+
+        def extract(self, _input_path: Path, _output_path: Path) -> Path:
+            raise workbook.WorkbookAdapterPersistenceError(
+                "工作簿持久化失败：ENOSPC"
+            )
+
+    monkeypatch.setattr(command, "WorkbookAdapter", FailingAdapter)
+
+    exit_code = run_evaluate_command(_args(tmp_path))
+
+    assert exit_code == 3
+    captured = capsys.readouterr()
+    assert "评测落盘失败" in captured.err
+    assert "Traceback" not in captured.err

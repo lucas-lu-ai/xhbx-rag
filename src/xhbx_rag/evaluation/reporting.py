@@ -254,7 +254,7 @@ def create_input_snapshot(
     if not source.is_file():
         raise WorkbookValidationError(f"评测工作簿不存在：{source}")
 
-    lock_directory = lock_root or run_dir.parent / ".workbook-locks"
+    lock_directory = lock_root or _default_workbook_lock_root(source)
     try:
         _ensure_directory_durable(run_dir)
         with _workbook_source_lock(source, lock_directory):
@@ -332,7 +332,7 @@ def safe_backfill(
     candidate = run_dir / "待验证.xlsx"
     verification = run_dir / "工作簿验证.json"
     preview_dir = run_dir / "预览"
-    lock_directory = lock_root or run_dir.parent / ".workbook-locks"
+    lock_directory = lock_root or _default_workbook_lock_root(source)
 
     normalized_source_sha256 = _validate_expected_source(
         source,
@@ -457,6 +457,11 @@ def _workbook_source_lock(source: Path, lock_root: Path) -> Iterator[None]:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
         finally:
             os.close(descriptor)
+
+
+def _default_workbook_lock_root(source: Path) -> Path:
+    """返回仅由源文件规范路径决定的跨进程锁目录。"""
+    return source.resolve().parent / ".xhbx-rag-evaluation-locks"
 
 
 def _atomic_write_json(path: Path, payload: object) -> None:

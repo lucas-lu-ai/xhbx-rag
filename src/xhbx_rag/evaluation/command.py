@@ -73,11 +73,13 @@ def run_evaluate_command(args: argparse.Namespace) -> int:
         output_root = Path(args.output_dir)
         run_id = _resolve_run_id(args.resume)
         run_dir = output_root / run_id
+        retrieval_config = RetrievalConfig.from_env()
+        judge_config = load_evaluation_config()
+        collection_stats = preflight_docker_milvus(retrieval_config)
         backup, input_sha256 = create_input_snapshot(
             dataset_path,
             run_dir,
             resume=args.resume is not None,
-            lock_root=output_root / ".workbook-locks",
         )
     except (ConfigError, EvaluationPreflightError, RuntimeError, ValueError) as exc:
         print(f"评测输入失败：{exc}", file=sys.stderr)
@@ -102,9 +104,6 @@ def run_evaluate_command(args: argparse.Namespace) -> int:
                     item_ids=args.item_id,
                     limit=args.limit,
                 )
-                retrieval_config = RetrievalConfig.from_env()
-                judge_config = load_evaluation_config()
-                collection_stats = preflight_docker_milvus(retrieval_config)
                 fingerprint = compute_run_fingerprint(
                     input_sha256=input_sha256,
                     scoring_version=SCORING_VERSION,
@@ -179,7 +178,6 @@ def run_evaluate_command(args: argparse.Namespace) -> int:
                         adapter,
                         payload,
                         expected_source_sha256=input_sha256,
-                        lock_root=output_root / ".workbook-locks",
                     )
             except (ConfigError, EvaluationPreflightError, ValueError) as exc:
                 print(
