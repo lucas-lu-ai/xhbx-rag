@@ -7,10 +7,12 @@ from typing import Any
 import httpx
 import pytest
 
+import xhbx_rag.evaluation.judge as judge_module
 from xhbx_rag.evaluation.config import EvaluationConfig
 from xhbx_rag.evaluation.judge import (
     EvaluationJudgeAgent,
     JudgeEvaluationError,
+    build_judge_messages,
 )
 from xhbx_rag.evaluation.models import ERROR_TAGS, EvaluationItem, GoldEvidence
 
@@ -297,6 +299,38 @@ def test_judge_retry_attempts_are_retries_after_the_initial_attempt() -> None:
     assert [request["timeout"] for request in client.requests] == [23.5, 23.5]
 
 
+def test_final_judge_error_has_no_sensitive_original_exception_chain() -> None:
+    unbounded_output = API_KEY + "-原始无界模型输出" * 3_000
+    invalid_contract = valid_judge_payload(
+        **{
+            "事实正确性得分": 36,
+            "扣分原因": unbounded_output,
+        }
+    )
+    client = FakeClient(
+        [
+            FakeResponse(
+                json.JSONDecodeError("无效响应 JSON", unbounded_output, 0)
+            ),
+            response_with_content(
+                json.dumps(invalid_contract, ensure_ascii=False)
+            ),
+            response_with_content(unbounded_output),
+        ]
+    )
+    agent = EvaluationJudgeAgent(make_config(), http_client=client)
+
+    with pytest.raises(JudgeEvaluationError) as exc_info:
+        agent.evaluate(make_item(), make_answer())
+
+    error = exc_info.value
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    exception_text = _exception_graph_and_judge_locals(error)
+    assert API_KEY not in exception_text
+    assert unbounded_output not in exception_text
+
+
 def test_judge_rejects_english_reason_after_all_retries() -> None:
     english_response = valid_judge_response(
         **{
@@ -341,9 +375,126 @@ def test_repair_prompt_truncates_invalid_output_and_uses_safe_error_summary() ->
     assert API_KEY not in repair_prompt
 
 
+def test_build_judge_messages_projects_only_safe_scoring_context() -> None:
+    item = _sensitive_large_item()
+    answer_response = _sensitive_large_answer()
+
+    messages = build_judge_messages(
+        item,
+        answer_response,
+        secret=API_KEY,
+    )
+
+    user_prompt = messages[1]["content"]
+    context = _user_context(messages)
+    assert API_KEY not in user_prompt
+    assert "customer@example.com" not in user_prompt
+    assert "13812345678" not in user_prompt
+    assert "11010519491231002X" not in user_prompt
+    assert "邮箱已隐藏" in user_prompt
+    assert "手机号已隐藏" in user_prompt
+    assert "身份证号已隐藏" in user_prompt
+    assert "METADATA-LEAK" not in user_prompt
+    assert "INTERNAL-CITATION-LEAK" not in user_prompt
+    assert "/Users/private/customer" not in user_prompt
+
+    assert set(context) == {
+        "问题",
+        "参考答案",
+        "溯源状态",
+        "主chunk_id",
+        "黄金chunk_id列表",
+        "黄金证据",
+        "智能体回答",
+        "检索证据",
+        "引用",
+    }
+    assert all(
+        set(evidence) == {
+            "chunk_id",
+            "来源路径",
+            "来源定位",
+            "原文摘录",
+            "支撑说明",
+        }
+        for evidence in context["黄金证据"]
+        if "chunk_id" in evidence
+    )
+    assert context["黄金证据"][0]["来源路径"] == "gold-1.docx"
+    assert all(
+        set(evidence) == {"chunk_id", "chunk类型", "证据正文"}
+        for evidence in context["检索证据"]
+        if "chunk_id" in evidence
+    )
+    assert context["引用"][0]["来源路径"] == "citation-1.docx"
+    assert set(context["引用"][0]) <= {
+        "证据序号",
+        "chunk_id",
+        "来源路径",
+        "来源定位",
+        "原文摘录",
+        "引用原文",
+        "展示摘录",
+    }
+    locator = context["引用"][0]["来源定位"]
+    assert "起始行" in locator
+    assert "标题路径" in locator
+    assert "container" not in locator
+
+
+def test_evaluate_keeps_all_context_categories_within_explicit_budgets() -> None:
+    client = FakeClient([valid_judge_response()])
+    agent = EvaluationJudgeAgent(make_config(), http_client=client)
+
+    agent.evaluate(_sensitive_large_item(), _sensitive_large_answer())
+
+    messages = client.requests[0]["json"]["messages"]
+    user_prompt = messages[1]["content"]
+    context = _user_context(messages)
+    assert len(user_prompt) <= judge_module.JUDGE_CONTEXT_CHAR_BUDGET
+    assert len(context["问题"]) <= judge_module.QUESTION_CHAR_LIMIT
+    assert (
+        len(context["参考答案"])
+        <= judge_module.REFERENCE_ANSWER_CHAR_LIMIT
+    )
+    assert len(context["智能体回答"]) <= judge_module.ANSWER_CHAR_LIMIT
+    assert (
+        _compact_json_chars(context["黄金证据"])
+        <= judge_module.GOLD_EVIDENCE_CHAR_BUDGET
+    )
+    assert (
+        _compact_json_chars(context["检索证据"])
+        <= judge_module.RETRIEVAL_EVIDENCE_CHAR_BUDGET
+    )
+    assert (
+        _compact_json_chars(context["引用"])
+        <= judge_module.CITATION_CHAR_BUDGET
+    )
+    assert {row["chunk_id"] for row in context["黄金证据"]} >= {
+        "gold-1",
+        "gold-2",
+        "gold-3",
+    }
+    assert {row["chunk_id"] for row in context["检索证据"]} >= {
+        "retrieval-1",
+        "retrieval-2",
+        "retrieval-3",
+    }
+    assert {row["chunk_id"] for row in context["引用"]} >= {
+        "retrieval-1",
+        "retrieval-2",
+        "retrieval-3",
+    }
+    assert "已截断" in user_prompt or "已省略" in user_prompt
+    assert API_KEY not in json.dumps(
+        client.requests[0]["json"], ensure_ascii=False
+    )
+
+
 def test_http_status_error_is_not_converted_to_format_retry() -> None:
-    request = httpx.Request("POST", "https://judge.example.com/v1/chat/completions")
-    response = httpx.Response(503, request=request)
+    request = _sensitive_httpx_request()
+    response_request = _sensitive_httpx_request()
+    response = httpx.Response(503, request=response_request)
     status_error = httpx.HTTPStatusError(
         "Service Unavailable", request=request, response=response
     )
@@ -357,11 +508,30 @@ def test_http_status_error_is_not_converted_to_format_retry() -> None:
 
     assert exc_info.value is status_error
     assert len(client.requests) == 1
+    _assert_sensitive_headers_redacted(status_error.request)
+    _assert_sensitive_headers_redacted(status_error.response.request)
+    assert API_KEY not in str(status_error)
+    assert API_KEY not in repr(status_error)
 
 
 def test_transport_error_is_not_converted_to_format_retry() -> None:
-    request = httpx.Request("POST", "https://judge.example.com/v1/chat/completions")
+    request = _sensitive_httpx_request()
     transport_error = httpx.ReadTimeout("裁判读取超时", request=request)
+    client = FakeClient([transport_error])
+    agent = EvaluationJudgeAgent(make_config(), http_client=client)
+
+    with pytest.raises(httpx.ReadTimeout) as exc_info:
+        agent.evaluate(make_item(), make_answer())
+
+    assert exc_info.value is transport_error
+    assert len(client.requests) == 1
+    _assert_sensitive_headers_redacted(transport_error.request)
+    assert API_KEY not in str(transport_error)
+    assert API_KEY not in repr(transport_error)
+
+
+def test_transport_error_without_bound_request_is_preserved() -> None:
+    transport_error = httpx.ReadTimeout("裁判连接尚未建立")
     client = FakeClient([transport_error])
     agent = EvaluationJudgeAgent(make_config(), http_client=client)
 
@@ -398,3 +568,136 @@ def test_owned_client_is_closed_once(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert created_with == [23.5]
     assert client.close_calls == 1
+
+
+def _exception_graph_and_judge_locals(error: BaseException) -> str:
+    parts: list[str] = []
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        parts.extend((str(current), repr(current)))
+        traceback = current.__traceback__
+        while traceback is not None:
+            frame = traceback.tb_frame
+            if frame.f_globals.get("__name__") == "xhbx_rag.evaluation.judge":
+                parts.extend(
+                    f"{name}={value!r}"
+                    for name, value in frame.f_locals.items()
+                )
+            traceback = traceback.tb_next
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return "\n".join(parts)
+
+
+def _sensitive_httpx_request() -> httpx.Request:
+    return httpx.Request(
+        "POST",
+        "https://judge.example.com/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {API_KEY}",
+            "Cookie": f"session={API_KEY}",
+            "X-Api-Key": API_KEY,
+        },
+    )
+
+
+def _assert_sensitive_headers_redacted(request: httpx.Request) -> None:
+    assert request.headers["Authorization"] == "[REDACTED]"
+    assert request.headers["Cookie"] == "[REDACTED]"
+    assert request.headers["X-Api-Key"] == "[REDACTED]"
+    assert API_KEY not in repr(request.headers)
+
+
+def _sensitive_large_item() -> EvaluationItem:
+    pii = (
+        f"{API_KEY} 联系人customer@example.com，电话13812345678，"
+        "证件11010519491231002X"
+    )
+    return EvaluationItem(
+        item_id="row-sensitive",
+        excel_row=2,
+        question=pii + " 超长问题" * 2_000,
+        reference_answer=pii + " 超长参考答案" * 2_000,
+        trace_status="完整支持",
+        primary_chunk_id=f"primary-{API_KEY}",
+        gold_chunk_ids=[f"gold-{index}-{pii}" for index in range(1, 4)],
+        gold_evidences=[
+            GoldEvidence(
+                chunk_id=f"gold-{index}",
+                source_path=f"/Users/private/customer/gold-{index}.docx",
+                locator=pii + " 第三段" * 1_000,
+                excerpt=pii + f" 黄金证据{index}" * 3_000,
+                support_note=pii + f" 支撑说明{index}" * 2_000,
+            )
+            for index in range(1, 4)
+        ],
+    )
+
+
+def _sensitive_large_answer() -> dict[str, object]:
+    pii = (
+        f"{API_KEY} 联系人customer@example.com，电话13812345678，"
+        "证件11010519491231002X"
+    )
+    return {
+        "answer": pii + " 超长智能体回答" * 3_000,
+        "metadata": {"secret": f"METADATA-LEAK-{pii}"},
+        "retrieval_evidences": [
+            {
+                "chunk_id": f"retrieval-{index}",
+                "chunk_type": "script",
+                "text": pii + f" 检索证据{index}" * 5_000,
+                "score": 0.99,
+                "rerank_score": 0.98,
+                "tag_boost_factor": 2,
+                "metadata": {"secret": f"METADATA-LEAK-{pii}"},
+                "citations": [
+                    {"quote": f"INTERNAL-CITATION-LEAK-{pii}"}
+                ],
+            }
+            for index in range(1, 4)
+        ],
+        "citations": [
+            {
+                "evidence_index": index,
+                "chunk_id": f"retrieval-{index}",
+                "source_path": (
+                    f"/Users/private/customer/citation-{index}.docx"
+                ),
+                "locator": {
+                    "line_start": index,
+                    "line_end": index + 1,
+                    "heading_path": [pii, f"标题{index}"],
+                    "container": f"/private/{API_KEY}/slide.xml",
+                    "internal": f"METADATA-LEAK-{pii}",
+                },
+                "source_excerpt": pii + f" 原文摘录{index}" * 2_000,
+                "quote": pii + f" 引用原文{index}" * 2_000,
+                "display_excerpt": pii + f" 展示摘录{index}" * 2_000,
+                "metadata": {"secret": f"METADATA-LEAK-{pii}"},
+            }
+            for index in range(1, 4)
+        ],
+    }
+
+
+def _user_context(messages: list[dict[str, str]]) -> dict[str, object]:
+    user_prompt = messages[1]["content"]
+    return json.loads(user_prompt.split("评测上下文：\n", 1)[1])
+
+
+def _compact_json_chars(value: object) -> int:
+    return len(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    )

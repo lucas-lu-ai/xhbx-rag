@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from types import TracebackType
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 import httpx
 from pydantic import ValidationError
@@ -15,6 +17,34 @@ from xhbx_rag.evaluation.models import ERROR_TAGS, EvaluationItem, JudgeResult
 INVALID_OUTPUT_EXCERPT_CHARS = 2_000
 ERROR_SUMMARY_CHARS = 600
 FINAL_ERROR_CHARS = 800
+QUESTION_CHAR_LIMIT = 2_000
+REFERENCE_ANSWER_CHAR_LIMIT = 3_000
+ANSWER_CHAR_LIMIT = 4_000
+TECHNICAL_ID_CHAR_LIMIT = 300
+SOURCE_PATH_CHAR_LIMIT = 512
+GOLD_CHUNK_IDS_CHAR_BUDGET = 1_000
+GOLD_EVIDENCE_CHAR_BUDGET = 10_000
+RETRIEVAL_EVIDENCE_CHAR_BUDGET = 20_000
+CITATION_CHAR_BUDGET = 6_000
+JUDGE_CONTEXT_CHAR_BUDGET = 50_000
+MIN_PROJECTED_ITEM_CHARS = 256
+SECRET_PLACEHOLDER = "【API密钥已隐藏】"
+EMAIL_PLACEHOLDER = "【邮箱已隐藏】"
+PHONE_PLACEHOLDER = "【手机号已隐藏】"
+IDENTITY_PLACEHOLDER = "【身份证号已隐藏】"
+SENSITIVE_HTTP_HEADERS = frozenset(
+    {
+        "authorization",
+        "proxy-authorization",
+        "cookie",
+        "set-cookie",
+        "x-api-key",
+        "api-key",
+        "x-auth-token",
+        "x-access-token",
+    }
+)
+REDACTED_HEADER_VALUE = "[REDACTED]"
 
 
 class JudgeEvaluationError(RuntimeError):
@@ -68,26 +98,38 @@ class EvaluationJudgeAgent:
         item: EvaluationItem,
         answer_response: dict[str, Any],
     ) -> JudgeResult:
-        base_messages = build_judge_messages(item, answer_response)
+        base_messages = build_judge_messages(
+            item,
+            answer_response,
+            secret=self.config.judge_api_key,
+        )
+        del item, answer_response
         messages = base_messages
         last_error: ValueError | RecursionError | None = None
 
         for _attempt in range(self.config.judge_retry_attempts + 1):
-            response = self.http_client.post(
-                self.config.judge_base_url.rstrip("/") + "/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.config.judge_api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": self.config.judge_model_name,
-                    "messages": messages,
-                    "temperature": 0,
-                    "response_format": {"type": "json_object"},
-                },
-                timeout=self.config.judge_timeout,
-            )
-            response.raise_for_status()
+            try:
+                response = self.http_client.post(
+                    self.config.judge_base_url.rstrip("/")
+                    + "/chat/completions",
+                    headers={
+                        "Authorization": (
+                            f"Bearer {self.config.judge_api_key}"
+                        ),
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": self.config.judge_model_name,
+                        "messages": messages,
+                        "temperature": 0,
+                        "response_format": {"type": "json_object"},
+                    },
+                    timeout=self.config.judge_timeout,
+                )
+                response.raise_for_status()
+            except httpx.HTTPError as exc:
+                _redact_http_error_headers(exc)
+                raise
 
             invalid_output = ""
             try:
@@ -116,7 +158,12 @@ class EvaluationJudgeAgent:
             last_error,
             secret=self.config.judge_api_key,
         )
-        raise JudgeEvaluationError(final_message) from last_error
+        last_error = None
+        response = None
+        payload = None
+        content = ""
+        invalid_output = ""
+        raise JudgeEvaluationError(final_message)
 
     def close(self) -> None:
         if self._closed:
@@ -140,35 +187,368 @@ class EvaluationJudgeAgent:
 def build_judge_messages(
     item: EvaluationItem,
     answer_response: dict[str, Any],
+    *,
+    secret: str = "",
 ) -> list[dict[str, str]]:
-    answer = answer_response.get("answer", "")
-    retrieval_evidences = answer_response.get("retrieval_evidences", [])
-    citations = answer_response.get("citations", [])
+    answer = _safe_input_text(answer_response.get("answer", ""), secret)
+    raw_retrieval_evidences = answer_response.get("retrieval_evidences", [])
+    raw_citations = answer_response.get("citations", [])
     context = {
-        "问题": item.question,
-        "参考答案": item.reference_answer,
+        "问题": _bounded_text(
+            _sanitize_prompt_text(item.question, secret),
+            QUESTION_CHAR_LIMIT,
+        ),
+        "参考答案": _bounded_text(
+            _sanitize_prompt_text(item.reference_answer, secret),
+            REFERENCE_ANSWER_CHAR_LIMIT,
+        ),
         "溯源状态": item.trace_status,
-        "主chunk_id": item.primary_chunk_id,
-        "黄金chunk_id列表": item.gold_chunk_ids,
-        "黄金证据": [
-            evidence.model_dump(mode="json", by_alias=True)
-            for evidence in item.gold_evidences
-        ],
-        "智能体回答": answer,
-        "检索证据": retrieval_evidences,
-        "引用": citations,
+        "主chunk_id": _bounded_text(
+            _sanitize_prompt_text(item.primary_chunk_id, secret),
+            TECHNICAL_ID_CHAR_LIMIT,
+        ),
+        "黄金chunk_id列表": _project_string_list(
+            item.gold_chunk_ids,
+            secret=secret,
+            budget=GOLD_CHUNK_IDS_CHAR_BUDGET,
+        ),
+        "黄金证据": _project_collection(
+            item.gold_evidences,
+            secret=secret,
+            budget=GOLD_EVIDENCE_CHAR_BUDGET,
+            projector=_project_gold_evidence,
+        ),
+        "智能体回答": _bounded_text(answer, ANSWER_CHAR_LIMIT),
+        "检索证据": _project_collection(
+            _dict_rows(raw_retrieval_evidences),
+            secret=secret,
+            budget=RETRIEVAL_EVIDENCE_CHAR_BUDGET,
+            projector=_project_retrieval_evidence,
+        ),
+        "引用": _project_collection(
+            _dict_rows(raw_citations),
+            secret=secret,
+            budget=CITATION_CHAR_BUDGET,
+            projector=_project_citation,
+        ),
     }
-    user_prompt = (
+    prompt_prefix = (
         "请评测下面这一条问答。参考答案用于提取关键点和比较回答，"
         "但其中的未溯源扩写不应被视为自动真理；"
         "语义等价的不同措辞不应扣减事实正确性得分。\n"
         "评测上下文：\n"
-        + json.dumps(context, ensure_ascii=False, indent=2, default=_json_default)
     )
+    context_json = _fit_context_json(
+        context,
+        JUDGE_CONTEXT_CHAR_BUDGET - len(prompt_prefix),
+    )
+    user_prompt = prompt_prefix + context_json
     return [
         {"role": "system", "content": _SYSTEM_PROMPT},
         {"role": "user", "content": user_prompt},
     ]
+
+
+def _project_gold_evidence(
+    evidence: object,
+    secret: str,
+    item_budget: int,
+) -> dict[str, object]:
+    projected = {
+        "chunk_id": _sanitize_prompt_text(evidence.chunk_id, secret),
+        "来源路径": _safe_source_path(evidence.source_path, secret),
+        "来源定位": _sanitize_prompt_text(evidence.locator, secret),
+        "原文摘录": _sanitize_prompt_text(evidence.excerpt, secret),
+        "支撑说明": _sanitize_prompt_text(evidence.support_note, secret),
+    }
+    return _fit_json_value(projected, item_budget)
+
+
+def _project_retrieval_evidence(
+    evidence: object,
+    secret: str,
+    item_budget: int,
+) -> dict[str, object]:
+    row = evidence if isinstance(evidence, dict) else {}
+    projected = {
+        "chunk_id": _safe_input_text(row.get("chunk_id", ""), secret),
+        "chunk类型": _safe_input_text(row.get("chunk_type", ""), secret),
+        "证据正文": _safe_input_text(row.get("text", ""), secret),
+    }
+    return _fit_json_value(projected, item_budget)
+
+
+def _project_citation(
+    citation: object,
+    secret: str,
+    item_budget: int,
+) -> dict[str, object]:
+    row = citation if isinstance(citation, dict) else {}
+    projected: dict[str, object] = {}
+    if "evidence_index" in row:
+        projected["证据序号"] = _safe_scalar(
+            row.get("evidence_index"),
+            secret,
+        )
+    if "chunk_id" in row:
+        projected["chunk_id"] = _safe_input_text(
+            row.get("chunk_id", ""),
+            secret,
+        )
+    if "source_path" in row:
+        projected["来源路径"] = _safe_source_path(
+            row.get("source_path"),
+            secret,
+        )
+    if "locator" in row:
+        projected["来源定位"] = _project_locator(row.get("locator"), secret)
+    for source_key, output_key in (
+        ("source_excerpt", "原文摘录"),
+        ("quote", "引用原文"),
+        ("display_excerpt", "展示摘录"),
+    ):
+        if source_key in row:
+            projected[output_key] = _safe_input_text(
+                row.get(source_key, ""),
+                secret,
+            )
+    return _fit_json_value(projected, item_budget)
+
+
+def _project_locator(value: object, secret: str) -> dict[str, object]:
+    if isinstance(value, str):
+        return {"定位说明": _sanitize_prompt_text(value, secret)}
+    if not isinstance(value, dict):
+        return {}
+    mappings = (
+        ("line_start", "起始行"),
+        ("line_end", "结束行"),
+        ("char_start", "起始字符"),
+        ("char_end", "结束字符"),
+        ("heading_path", "标题路径"),
+        ("page", "页码"),
+        ("page_start", "起始页"),
+        ("page_end", "结束页"),
+        ("slide", "幻灯片页码"),
+        ("slide_start", "起始幻灯片"),
+        ("slide_end", "结束幻灯片"),
+        ("heading", "标题"),
+    )
+    projected: dict[str, object] = {}
+    for source_key, output_key in mappings:
+        if source_key not in value:
+            continue
+        raw = value[source_key]
+        if isinstance(raw, list):
+            projected[output_key] = [
+                _safe_input_text(item, secret)
+                for item in raw
+                if isinstance(item, (str, int, float))
+                and not isinstance(item, bool)
+            ]
+        else:
+            projected[output_key] = _safe_scalar(raw, secret)
+    return projected
+
+
+def _project_collection(
+    rows: list[object],
+    *,
+    secret: str,
+    budget: int,
+    projector: Callable[[object, str, int], dict[str, object]],
+) -> list[dict[str, object]]:
+    if not rows:
+        return []
+    max_items = max(1, (budget - 256) // MIN_PROJECTED_ITEM_CHARS)
+    selected = rows[:max_items]
+    omitted = len(rows) - len(selected)
+    marker = (
+        {"省略说明": f"另有 {omitted} 项因上下文预算已省略"}
+        if omitted
+        else None
+    )
+    marker_chars = _compact_json_chars(marker) if marker is not None else 0
+    separators = max(0, len(selected) - 1) + (1 if marker else 0)
+    available = budget - marker_chars - separators - 2
+    item_budget = max(
+        MIN_PROJECTED_ITEM_CHARS,
+        available // len(selected),
+    )
+    projected = [
+        projector(row, secret, item_budget)
+        for row in selected
+    ]
+    if marker is not None:
+        projected.append(marker)
+    while _compact_json_chars(projected) > budget and len(projected) > 1:
+        projected.pop(-2 if marker is not None else -1)
+        omitted += 1
+        marker = {"省略说明": f"另有 {omitted} 项因上下文预算已省略"}
+        if projected and "省略说明" in projected[-1]:
+            projected[-1] = marker
+        else:
+            projected.append(marker)
+    return projected
+
+
+def _project_string_list(
+    values: list[str],
+    *,
+    secret: str,
+    budget: int,
+) -> list[str]:
+    sanitized = [_sanitize_prompt_text(value, secret) for value in values]
+    if not sanitized:
+        return []
+    max_items = max(1, budget // 64)
+    selected = sanitized[:max_items]
+    omitted = len(sanitized) - len(selected)
+    suffix = f"...（另有 {omitted} 项已省略）..." if omitted else None
+    suffix_chars = _compact_json_chars(suffix) + 1 if suffix else 0
+    available = budget - suffix_chars - 2 - max(0, len(selected) - 1)
+    item_limit = max(16, available // len(selected) - 2)
+    projected = [_bounded_text(value, item_limit) for value in selected]
+    if suffix:
+        projected.append(suffix)
+    while _compact_json_chars(projected) > budget and len(projected) > 1:
+        projected.pop(-2 if suffix else -1)
+    return projected
+
+
+def _fit_json_value(
+    value: dict[str, object],
+    budget: int,
+) -> dict[str, object]:
+    if _compact_json_chars(value) <= budget:
+        return value
+    max_length = max(_string_lengths(value), default=32)
+    limit = max_length
+    candidate = value
+    while _compact_json_chars(candidate) > budget and limit > 16:
+        limit = max(16, int(limit * 0.6))
+        candidate = _truncate_strings(value, limit)
+    return candidate
+
+
+def _fit_context_json(context: dict[str, object], budget: int) -> str:
+    encoded = _compact_json(context)
+    if len(encoded) <= budget:
+        return encoded
+    candidate: dict[str, object] = context
+    for limit in (2_048, 1_024, 512, 256, 128, 64):
+        candidate = _truncate_strings(context, limit)
+        encoded = _compact_json(candidate)
+        if len(encoded) <= budget:
+            return encoded
+    minimal = {
+        key: (
+            [{"省略说明": "该类别内容因整体上下文预算已省略"}]
+            if isinstance(value, list)
+            else _bounded_text(str(value), 64)
+        )
+        for key, value in context.items()
+    }
+    return _compact_json(minimal)
+
+
+def _truncate_strings(value: Any, limit: int) -> Any:
+    if isinstance(value, str):
+        return _bounded_text(value, limit)
+    if isinstance(value, list):
+        return [_truncate_strings(item, limit) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _truncate_strings(item, limit)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _string_lengths(value: object) -> list[int]:
+    if isinstance(value, str):
+        return [len(value)]
+    if isinstance(value, list):
+        return [length for item in value for length in _string_lengths(item)]
+    if isinstance(value, dict):
+        return [
+            length
+            for item in value.values()
+            for length in _string_lengths(item)
+        ]
+    return []
+
+
+def _safe_source_path(value: object, secret: str) -> str:
+    raw = _safe_input_text(value, secret)
+    normalized = raw.replace("\\", "/").strip()
+    if "://" in normalized:
+        normalized = urlsplit(normalized).path
+    parts = [part for part in normalized.split("/") if part not in {"", "."}]
+    is_absolute = normalized.startswith("/") or bool(
+        re.match(r"^[A-Za-z]:/", normalized)
+    )
+    if is_absolute or ".." in parts:
+        display = parts[-1] if parts else "（来源文件已隐藏）"
+    else:
+        display = "/".join(parts)
+    return _bounded_text(
+        _sanitize_prompt_text(display, secret),
+        SOURCE_PATH_CHAR_LIMIT,
+    )
+
+
+def _safe_scalar(value: object, secret: str) -> int | float | str:
+    if isinstance(value, bool) or value is None:
+        return ""
+    if isinstance(value, (int, float)):
+        return value
+    return _safe_input_text(value, secret)
+
+
+def _safe_input_text(value: object, secret: str) -> str:
+    if isinstance(value, str):
+        return _sanitize_prompt_text(value, secret)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    return ""
+
+
+def _sanitize_prompt_text(text: str, secret: str) -> str:
+    sanitized = text.replace(secret, SECRET_PLACEHOLDER) if secret else text
+    sanitized = re.sub(
+        r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+        EMAIL_PLACEHOLDER,
+        sanitized,
+    )
+    sanitized = re.sub(
+        r"(?<!\d)1[3-9]\d{9}(?!\d)",
+        PHONE_PLACEHOLDER,
+        sanitized,
+    )
+    return re.sub(
+        r"(?<!\d)\d{17}[\dXx](?!\d)",
+        IDENTITY_PLACEHOLDER,
+        sanitized,
+    )
+
+
+def _dict_rows(value: object) -> list[object]:
+    if not isinstance(value, list):
+        return []
+    return [row for row in value if isinstance(row, dict)]
+
+
+def _compact_json(value: object) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _compact_json_chars(value: object) -> int:
+    return len(_compact_json(value))
 
 
 def strip_json_fences(text: str) -> str:
@@ -309,6 +689,30 @@ def _redact_secret(text: str, secret: str) -> str:
     if not secret:
         return text
     return text.replace(secret, "（已隐藏敏感信息）")
+
+
+def _redact_http_error_headers(error: httpx.HTTPError) -> None:
+    _redact_request_headers(_bound_request(error))
+    response = getattr(error, "response", None)
+    _redact_request_headers(_bound_request(response))
+
+
+def _bound_request(value: object) -> httpx.Request | None:
+    if value is None:
+        return None
+    try:
+        request = value.request  # type: ignore[attr-defined]
+    except (AttributeError, RuntimeError):
+        return None
+    return request if isinstance(request, httpx.Request) else None
+
+
+def _redact_request_headers(request: httpx.Request | None) -> None:
+    if request is None:
+        return
+    for name in list(request.headers.keys()):
+        if name.lower() in SENSITIVE_HTTP_HEADERS:
+            request.headers[name] = REDACTED_HEADER_VALUE
 
 
 _SYSTEM_PROMPT = f"""你是独立的保险销售问答评测裁判。
