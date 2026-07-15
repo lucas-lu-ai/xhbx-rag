@@ -2,6 +2,8 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from xhbx_rag.evaluation.models import EvaluationResult
+
 _ANSWER_KEY_ALIASES = {
     # answer_question() 顶层字段
     "original_query": "原始问题",
@@ -99,6 +101,9 @@ _ANSWER_KEY_ALIASES = {
     "heading_path": "标题路径",
 }
 _TECHNICAL_KEY_ALLOWLIST = frozenset({"chunk_id"})
+_ANSWER_KEY_REVERSE_ALIASES = {
+    alias: key for key, alias in _ANSWER_KEY_ALIASES.items()
+}
 
 
 def _map_keys(value: Any) -> Any:
@@ -134,3 +139,38 @@ def dump_chinese(model: BaseModel) -> dict[str, Any]:
     if _contains_english_business_key(payload):
         raise ValueError("对外结果包含英文业务字段")
     return payload
+
+
+def restore_answer_response(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("问答原始结果必须是对象")
+    if _contains_english_business_key(value):
+        raise ValueError("对外结果包含英文业务字段")
+    restored = _restore_keys(value)
+    if not isinstance(restored, dict):
+        raise ValueError("问答原始结果必须是对象")
+    return restored
+
+
+def load_chinese_result(value: object) -> EvaluationResult:
+    if not isinstance(value, dict):
+        raise ValueError("中文评测结果必须是对象")
+    if _contains_english_business_key(value):
+        raise ValueError("对外结果包含英文业务字段")
+    payload = dict(value)
+    if "问答原始结果" in payload:
+        payload["问答原始结果"] = restore_answer_response(
+            payload["问答原始结果"]
+        )
+    return EvaluationResult.model_validate(payload)
+
+
+def _restore_keys(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            _ANSWER_KEY_REVERSE_ALIASES.get(key, key): _restore_keys(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_restore_keys(item) for item in value]
+    return value
