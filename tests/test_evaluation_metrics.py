@@ -449,6 +449,17 @@ def test_evidence_rates_use_only_traced_rows_but_rule_average_uses_all_rows() ->
     }
 
 
+def test_summary_average_uses_business_half_up_rounding() -> None:
+    summary = summarize_results(
+        [
+            _result(0, total_score=71.56, grade="不合格"),
+            _result(1, total_score=71.57, grade="不合格"),
+        ]
+    )
+
+    assert summary["平均分"] == 71.57
+
+
 def test_average_gold_chunk_recall_preserves_exact_two_thirds_ratio() -> None:
     summary = summarize_results(
         [

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from collections import Counter
+from decimal import Decimal, ROUND_HALF_UP
 from numbers import Real
 from typing import Any
 
@@ -272,7 +273,11 @@ def _mean_ratio(values: list[float]) -> float:
 
 
 def _average(values: list[float]) -> float:
-    return round(sum(values) / len(values), 2) if values else 0.0
+    if not values:
+        return 0.0
+    total = sum((Decimal(str(value)) for value in values), start=Decimal(0))
+    average = total / Decimal(len(values))
+    return float(average.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
 def _percentile(values: list[float], percentile: float) -> float:

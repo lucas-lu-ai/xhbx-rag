@@ -733,6 +733,9 @@ function writeMetadataSheet(sheet, payload) {
       : safeCellValue(runInfo[key]);
     rows.push([key, value]);
   }
+  if (rows.length > 1) {
+    sheet.getRange(`B2:B${rows.length}`).setNumberFormat("@");
+  }
   sheet.getRangeByIndexes(0, 0, rows.length, 2).values = rows;
   sheet.showGridLines = false;
   sheet.freezePanes.freezeRows(1);
@@ -898,12 +901,21 @@ async function renderSheets(workbook, sheetNames, previewDir) {
   let rendered = 0;
   for (const [index, sheetName] of sheetNames.entries()) {
     try {
-      const preview = await workbook.render({
-        sheetName,
-        autoCrop: "all",
-        scale: 1,
-        format: "png",
-      });
+      const preview = await workbook.render(
+        index === 0
+          ? {
+              sheetName,
+              range: "A1:U6",
+              scale: 0.75,
+              format: "png",
+            }
+          : {
+              sheetName,
+              autoCrop: "all",
+              scale: 1,
+              format: "png",
+            },
+      );
       await fs.writeFile(
         path.join(previewDir, safePreviewName(index, sheetName)),
         new Uint8Array(await preview.arrayBuffer()),
@@ -973,6 +985,34 @@ async function verify(options) {
   const overviewSheet = requiredWorksheet(workbook, "评测总览");
   const actualPrimaryRate = overviewSheet.getRange("H5").values[0][0];
   const actualRecallRate = overviewSheet.getRange("H6").values[0][0];
+  const metadataSheet = requiredWorksheet(workbook, "运行元数据");
+  const metadataRows = metadataSheet.getUsedRange(true)?.values ?? [];
+  const gitCommitRowIndex = metadataRows.findIndex(
+    (row) => normalizedText(row[0]) === "Git提交",
+  );
+  const gitCommitRow = gitCommitRowIndex >= 0
+    ? metadataRows[gitCommitRowIndex]
+    : undefined;
+  const expectedRunInfo = requirePayloadObject(expectedPayload["运行信息"], "运行信息");
+  const actualGitCommit = normalizedText(gitCommitRow?.[1]);
+  const expectedGitCommit = normalizedText(expectedRunInfo["Git提交"]);
+  const metadataGitStyleInspection = await workbook.inspect({
+    kind: "computedStyle",
+    sheetId: "运行元数据",
+    range: gitCommitRowIndex >= 0 ? `B${gitCommitRowIndex + 1}` : "B1",
+    maxChars: 2500,
+  });
+  let metadataGitNumberFormat = "";
+  try {
+    const firstStyleLine = String(metadataGitStyleInspection.ndjson ?? "")
+      .trim()
+      .split("\n")[0];
+    metadataGitNumberFormat = normalizedText(
+      JSON.parse(firstStyleLine)?.style?.numberFormat,
+    );
+  } catch {
+    metadataGitNumberFormat = "";
+  }
   const lowScoreSheet = requiredWorksheet(workbook, "低分与错误案例");
   const lowScoreUsedRange = lowScoreSheet.getUsedRange(true);
   const actualLowScoreRows = lowScoreUsedRange
@@ -1009,6 +1049,11 @@ async function verify(options) {
     "总览证据指标取自汇总": (
       actualPrimaryRate === expectedEvidenceMetrics.primaryRate
       && actualRecallRate === expectedEvidenceMetrics.recallRate
+    ),
+    "运行元数据Git提交保持文本": (
+      expectedGitCommit !== ""
+      && actualGitCommit === expectedGitCommit
+      && metadataGitNumberFormat === "@"
     ),
     "低分与错误案例完整": deepEqual(actualLowScoreRows, expectedLowScoreRows),
     "公式错误为零": formulaErrorCount === 0,
