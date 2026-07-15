@@ -460,9 +460,11 @@ function writeOverviewSheet(sheet, payload, mainSheetName) {
     ["优秀率", null],
   ];
   const escapedSheetName = mainSheetName.replaceAll("'", "''");
-  sheet.getRange("B4:B7").formulas = [
+  sheet.getRange("B4").formulas = [
     [`=COUNTA('${escapedSheetName}'!$U$2:$U$51)`],
-    [`=IFERROR(AVERAGE('${escapedSheetName}'!$L$2:$L$51),0)`],
+  ];
+  sheet.getRange("B5").values = [[safeCellValue(summary["平均分"])]];
+  sheet.getRange("B6:B7").formulas = [
     [`=COUNTIF('${escapedSheetName}'!$M$2:$M$51,"优秀")/B4+COUNTIF('${escapedSheetName}'!$M$2:$M$51,"合格")/B4`],
     [`=COUNTIF('${escapedSheetName}'!$M$2:$M$51,"优秀")/B4`],
   ];
@@ -485,14 +487,14 @@ function writeOverviewSheet(sheet, payload, mainSheetName) {
     ["相关性与表达", null],
     ["总分", null],
   ];
-  sheet.getRange("E4:E9").formulas = [
+  sheet.getRange("E4:E8").formulas = [
     [`=IFERROR(AVERAGE('${escapedSheetName}'!$G$2:$G$51),0)`],
     [`=IFERROR(AVERAGE('${escapedSheetName}'!$H$2:$H$51),0)`],
     [`=IFERROR(AVERAGE('${escapedSheetName}'!$I$2:$I$51),0)`],
     [`=IFERROR(AVERAGE('${escapedSheetName}'!$J$2:$J$51),0)`],
     [`=IFERROR(AVERAGE('${escapedSheetName}'!$K$2:$K$51),0)`],
-    [`=IFERROR(AVERAGE('${escapedSheetName}'!$L$2:$L$51),0)`],
   ];
+  sheet.getRange("E9").values = [[safeCellValue(summary["平均分"])]];
 
   sheet.getRange("G3:H7").values = [
     ["运行质量", "结果"],
@@ -733,8 +735,9 @@ function writeMetadataSheet(sheet, payload) {
       : safeCellValue(runInfo[key]);
     rows.push([key, value]);
   }
-  if (rows.length > 1) {
-    sheet.getRange(`B2:B${rows.length}`).setNumberFormat("@");
+  const gitCommitRowIndex = rows.findIndex((row) => row[0] === "Git提交");
+  if (gitCommitRowIndex >= 0) {
+    sheet.getRange(`B${gitCommitRowIndex + 1}`).setNumberFormat("@");
   }
   sheet.getRangeByIndexes(0, 0, rows.length, 2).values = rows;
   sheet.showGridLines = false;
@@ -899,14 +902,19 @@ async function renderSheets(workbook, sheetNames, previewDir) {
   await fs.mkdir(previewDir, { recursive: true });
   const errors = [];
   let rendered = 0;
+  const previewRanges = new Map([
+    [sheetNames[0], "A1:U4"],
+    ["低分与错误案例", "A1:Q6"],
+  ]);
   for (const [index, sheetName] of sheetNames.entries()) {
     try {
+      const previewRange = previewRanges.get(sheetName);
       const preview = await workbook.render(
-        index === 0
+        previewRange
           ? {
               sheetName,
-              range: "A1:U6",
-              scale: 0.75,
+              range: previewRange,
+              scale: 0.5,
               format: "png",
             }
           : {
@@ -985,6 +993,9 @@ async function verify(options) {
   const overviewSheet = requiredWorksheet(workbook, "评测总览");
   const actualPrimaryRate = overviewSheet.getRange("H5").values[0][0];
   const actualRecallRate = overviewSheet.getRange("H6").values[0][0];
+  const actualOverviewAverage = overviewSheet.getRange("B5").values[0][0];
+  const actualDimensionTotalAverage = overviewSheet.getRange("E9").values[0][0];
+  const expectedAverage = safeCellValue(expectedSummary["平均分"]);
   const metadataSheet = requiredWorksheet(workbook, "运行元数据");
   const metadataRows = metadataSheet.getUsedRange(true)?.values ?? [];
   const gitCommitRowIndex = metadataRows.findIndex(
@@ -1050,8 +1061,13 @@ async function verify(options) {
       actualPrimaryRate === expectedEvidenceMetrics.primaryRate
       && actualRecallRate === expectedEvidenceMetrics.recallRate
     ),
+    "总览平均分取自汇总": (
+      actualOverviewAverage === expectedAverage
+      && actualDimensionTotalAverage === expectedAverage
+    ),
     "运行元数据Git提交保持文本": (
       expectedGitCommit !== ""
+      && typeof gitCommitRow?.[1] === "string"
       && actualGitCommit === expectedGitCommit
       && metadataGitNumberFormat === "@"
     ),

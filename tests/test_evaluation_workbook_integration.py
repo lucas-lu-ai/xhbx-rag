@@ -66,7 +66,7 @@ def _payload() -> dict:
         "运行信息": {
             "运行ID": "integration-run",
             "输入SHA256": "a" * 64,
-            "Git提交": "abcdef1",
+            "Git提交": "1e23456",
             "问答模型名": "answer-model",
             "裁判模型名": "judge-model",
             "同模型裁判": True,
@@ -164,6 +164,7 @@ def test_real_workbook_backfill_verifies_preservation_and_renders_five_sheets(
             "溯源明细保持不变": True,
             "五十条评测结果逐格匹配": True,
             "总览证据指标取自汇总": True,
+            "总览平均分取自汇总": True,
             "运行元数据Git提交保持文本": True,
             "低分与错误案例完整": True,
             "公式错误为零": True,
@@ -259,16 +260,6 @@ def test_safe_backfill_renders_main_preview_with_long_evaluation_answers(
     long_answer = "较长的中文评测回答，用于验证主表预览不会渲染整张超高工作表。" * 120
     for row in payload["逐题结果"]:
         row["智能体回答"] = long_answer
-        row["事实正确性得分"] = 32
-        row["关键点覆盖得分"] = 18
-        row["证据忠实性得分"] = 18
-        row["引用及黄金来源命中得分"] = 13
-        row["相关性与表达得分"] = 9
-        row["总分"] = 90
-        row["评测等级"] = "优秀"
-        row["评测状态"] = "已完成"
-        row["错误标签"] = ""
-        row["检索chunk_id"] = "chunk-1"
 
     _, input_sha256 = create_input_snapshot(
         source,
@@ -288,7 +279,9 @@ def test_safe_backfill_renders_main_preview_with_long_evaluation_answers(
     verification = json.loads(verification_path.read_text(encoding="utf-8"))
     assert verification["验证通过"] is True
     assert verification["检查项"]["五张预览图全部生成"] is True
-    assert (run_dir / "预览" / "01-绩优案例测试.png").stat().st_size > 0
+    for preview_name in ("01-绩优案例测试.png", "04-低分与错误案例.png"):
+        preview_size = (run_dir / "预览" / preview_name).stat().st_size
+        assert 0 < preview_size < 4_000_000
 
 
 @pytest.mark.skipif(
