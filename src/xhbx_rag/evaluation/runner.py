@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -387,8 +388,16 @@ class _CheckpointWriter:
         self._stream: Any | None = None
 
     def __enter__(self) -> _CheckpointWriter:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._stream = self.path.open("a", encoding="utf-8")
+        _ensure_directory(self.path.parent)
+        existed = self.path.exists()
+        stream = self.path.open("a", encoding="utf-8")
+        try:
+            if not existed:
+                _fsync_directory(self.path.parent)
+        except Exception:
+            stream.close()
+            raise
+        self._stream = stream
         return self
 
     def __exit__(self, *args: object) -> None:
@@ -485,24 +494,113 @@ def compute_run_fingerprint(
     milvus_uri: str,
     collection_stats: Mapping[str, Mapping[str, object]],
 ) -> str:
+    normalized_input_sha256 = _fingerprint_sha256(input_sha256)
+    normalized_scoring_version = _fingerprint_text(scoring_version)
+    normalized_answer_model_name = _fingerprint_text(answer_model_name)
+    normalized_judge_model_name = _fingerprint_text(judge_model_name)
+    normalized_top_n = _fingerprint_limit(top_n, maximum=100)
+    normalized_top_k = _fingerprint_limit(top_k, maximum=20)
+    if normalized_top_k > normalized_top_n:
+        raise ValueError("运行指纹配置无效：top_k 不能大于 top_n")
+    if not isinstance(same_model_judge, bool):
+        raise ValueError("运行指纹配置无效：同模型裁判必须是布尔值")
+    normalized_milvus_uri = _fingerprint_milvus_uri(milvus_uri)
+    normalized_collection_stats = _fingerprint_collection_stats(
+        collection_stats
+    )
     payload = {
-        "输入SHA256": input_sha256,
-        "评分版本": scoring_version,
-        "初检候选数": top_n,
-        "最终证据数": top_k,
-        "问答模型名": answer_model_name,
-        "裁判模型名": judge_model_name,
+        "输入SHA256": normalized_input_sha256,
+        "评分版本": normalized_scoring_version,
+        "初检候选数": normalized_top_n,
+        "最终证据数": normalized_top_k,
+        "问答模型名": normalized_answer_model_name,
+        "裁判模型名": normalized_judge_model_name,
         "同模型裁判": same_model_judge,
-        "Milvus地址": milvus_uri,
-        "知识集合统计": collection_stats,
+        "Milvus地址": normalized_milvus_uri,
+        "知识集合统计": normalized_collection_stats,
     }
     encoded = json.dumps(
         payload,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
+        allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _fingerprint_sha256(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"[0-9a-fA-F]{64}", value) is None
+    ):
+        raise ValueError("运行指纹配置无效：输入SHA256必须是64位十六进制")
+    return value.lower()
+
+
+def _fingerprint_text(value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("运行指纹配置无效：文本字段不能为空")
+    return value.strip()
+
+
+def _fingerprint_limit(value: object, *, maximum: int) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 1 <= value <= maximum
+    ):
+        raise ValueError(
+            "运行指纹配置无效："
+            f"检索数量必须是1到{maximum}之间的整数"
+        )
+    return value
+
+
+def _fingerprint_milvus_uri(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("运行指纹配置无效：Milvus地址必须是字符串")
+    normalized = value.strip().rstrip("/")
+    if normalized != LOCAL_DOCKER_MILVUS_URI:
+        raise ValueError(
+            "运行指纹配置无效：Milvus地址必须是本机Docker地址"
+        )
+    return normalized
+
+
+def _fingerprint_collection_stats(
+    value: object,
+) -> dict[str, dict[str, bool | int]]:
+    if not isinstance(value, Mapping) or not value:
+        raise ValueError("运行指纹配置无效：collection统计不能为空")
+    normalized: dict[str, dict[str, bool | int]] = {}
+    for raw_name, raw_stats in value.items():
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            raise ValueError("运行指纹配置无效：collection名称不能为空")
+        collection_name = raw_name.strip()
+        if collection_name in normalized:
+            raise ValueError("运行指纹配置无效：collection名称重复")
+        if not isinstance(raw_stats, Mapping) or set(raw_stats) != {
+            "存在",
+            "数据量",
+        }:
+            raise ValueError("运行指纹配置无效：collection统计结构非法")
+        exists = raw_stats["存在"]
+        row_count = raw_stats["数据量"]
+        if not isinstance(exists, bool):
+            raise ValueError(
+                "运行指纹配置无效：collection存在必须是布尔值"
+            )
+        if (
+            isinstance(row_count, bool)
+            or not isinstance(row_count, int)
+            or row_count < 0
+        ):
+            raise ValueError(
+                "运行指纹配置无效：collection数据量必须是非负整数"
+            )
+        normalized[collection_name] = {"存在": exists, "数据量": row_count}
+    return normalized
 
 
 def write_run_metadata(
@@ -519,7 +617,7 @@ def write_run_metadata(
     if _contains_english_metadata_key(payload):
         raise ValueError("运行元数据包含英文业务字段")
 
-    run_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_directory(run_dir)
     target = run_dir / "run.json"
     temporary = run_dir / "run.json.tmp"
     try:
@@ -529,9 +627,32 @@ def write_run_metadata(
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, target)
+        _fsync_directory(target.parent)
     finally:
         temporary.unlink(missing_ok=True)
     return target
+
+
+def _ensure_directory(path: Path) -> None:
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+    path.mkdir(parents=True, exist_ok=True)
+    for created in reversed(missing):
+        _fsync_directory(created.parent)
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_fd = os.open(os.fspath(path), flags)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def validate_resume(run_dir: Path, expected_fingerprint: str) -> dict[str, Any]:
@@ -615,15 +736,7 @@ def _is_valid_terminal_result(result: EvaluationResult) -> bool:
 def _contains_secret_field(value: object) -> bool:
     if isinstance(value, Mapping):
         for key, item in value.items():
-            normalized = str(key).strip().lower().replace("-", "_")
-            words = set(normalized.replace(" ", "_").split("_"))
-            if (
-                words & {"key", "token", "secret", "password"}
-                or any(
-                    marker in normalized
-                    for marker in ("密钥", "令牌", "密码")
-                )
-            ):
+            if _is_secret_key(key):
                 return True
             if _contains_secret_field(item):
                 return True
@@ -636,6 +749,26 @@ def _contains_secret_field(value: object) -> bool:
     elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
         return any(_contains_secret_field(item) for item in value)
     return False
+
+
+def _is_secret_key(value: object) -> bool:
+    text = str(value).strip()
+    lowered = text.lower()
+    if any(marker in lowered for marker in ("密钥", "令牌", "密码")):
+        return True
+    separated = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", text)
+    separated = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", separated)
+    tokens = set(re.findall(r"[a-z0-9]+", separated.lower()))
+    if tokens & {"key", "token", "secret", "password"}:
+        return True
+    compact_secret_names = {
+        "apikey",
+        "accesstoken",
+        "refreshtoken",
+        "authtoken",
+        "clientsecret",
+    }
+    return bool(tokens & compact_secret_names)
 
 
 def _contains_english_metadata_key(

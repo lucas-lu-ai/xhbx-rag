@@ -598,7 +598,6 @@ def test_fingerprint_is_order_stable_and_each_fixed_field_changes_it() -> None:
         {"answer_model_name": "answer-model-2"},
         {"judge_model_name": "judge-model-2"},
         {"same_model_judge": True},
-        {"milvus_uri": "http://localhost:19531"},
         {
             "collection_stats": {
                 "case": {"存在": True, "数据量": 4},
@@ -619,6 +618,85 @@ def test_fingerprint_is_order_stable_and_each_fixed_field_changes_it() -> None:
         },
     ]
     assert all(_fingerprint(**variant) != expected for variant in variants)
+
+
+def test_fingerprint_normalizes_sha_text_fields_collection_names_and_uri() -> None:
+    normalized = _fingerprint()
+
+    variant = _fingerprint(
+        input_sha256="A" * 64,
+        scoring_version="  v1  ",
+        answer_model_name="  answer-model  ",
+        judge_model_name="  judge-model  ",
+        milvus_uri="  http://localhost:19530/  ",
+        collection_stats={
+            " case ": {"存在": True, "数据量": 3},
+            " course ": {"存在": True, "数据量": 5},
+        },
+    )
+
+    assert variant == normalized
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"input_sha256": "a" * 63},
+        {"input_sha256": "g" * 64},
+        {"input_sha256": 123},
+        {"scoring_version": "  "},
+        {"scoring_version": 1},
+        {"answer_model_name": ""},
+        {"answer_model_name": None},
+        {"judge_model_name": "\t"},
+        {"judge_model_name": False},
+        {"top_n": True},
+        {"top_n": 0},
+        {"top_n": 101},
+        {"top_n": 20.0},
+        {"top_k": False},
+        {"top_k": 0},
+        {"top_k": 21},
+        {"top_k": 5.0},
+        {"top_n": 4, "top_k": 5},
+        {"same_model_judge": 1},
+        {"same_model_judge": "否"},
+        {"milvus_uri": "http://milvus.example:19530"},
+        {"milvus_uri": 19530},
+    ],
+)
+def test_fingerprint_rejects_invalid_scalar_fields(
+    overrides: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="运行指纹配置无效"):
+        _fingerprint(**overrides)
+
+
+@pytest.mark.parametrize(
+    "collection_stats",
+    [
+        {},
+        [],
+        {"": {"存在": True, "数据量": 1}},
+        {"   ": {"存在": True, "数据量": 1}},
+        {1: {"存在": True, "数据量": 1}},
+        {"case": []},
+        {"case": {"存在": True}},
+        {"case": {"数据量": 1}},
+        {"case": {"存在": True, "数据量": 1, "额外字段": "非法"}},
+        {"case": {"exists": True, "数据量": 1}},
+        {"case": {"存在": 1, "数据量": 1}},
+        {"case": {"存在": True, "数据量": True}},
+        {"case": {"存在": True, "数据量": -1}},
+        {"case": {"存在": True, "数据量": 1.0}},
+        {"case": {"存在": True, "数据量": float("nan")}},
+    ],
+)
+def test_fingerprint_rejects_invalid_collection_stats(
+    collection_stats: object,
+) -> None:
+    with pytest.raises(ValueError, match="运行指纹配置无效"):
+        _fingerprint(collection_stats=collection_stats)
 
 
 def test_run_metadata_is_atomic_chinese_and_contains_no_secret(tmp_path: Path) -> None:
@@ -644,6 +722,77 @@ def test_run_metadata_is_atomic_chinese_and_contains_no_secret(tmp_path: Path) -
     assert not (tmp_path / "run.json.tmp").exists()
     assert "key" not in json.dumps(payload, ensure_ascii=False).lower()
     assert "token" not in json.dumps(payload, ensure_ascii=False).lower()
+
+
+def test_run_metadata_fsyncs_new_directory_parent_and_replace_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[Path] = []
+    monkeypatch.setattr(
+        runner_module,
+        "_fsync_directory",
+        lambda path: calls.append(Path(path)),
+        raising=False,
+    )
+    run_dir = tmp_path / "outputs" / "run-1"
+
+    write_run_metadata(run_dir, fingerprint="fingerprint", config_payload={})
+
+    assert calls == [tmp_path, run_dir.parent, run_dir]
+
+
+def test_run_metadata_propagates_new_directory_parent_fsync_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "outputs" / "run-1"
+
+    def fail_directory_fsync(_path: Path) -> None:
+        raise OSError("目录 fsync 失败")
+
+    monkeypatch.setattr(
+        runner_module,
+        "_fsync_directory",
+        fail_directory_fsync,
+        raising=False,
+    )
+
+    with pytest.raises(OSError, match="目录 fsync 失败"):
+        write_run_metadata(
+            run_dir,
+            fingerprint="fingerprint",
+            config_payload={},
+        )
+
+    assert not (run_dir / "run.json").exists()
+
+
+def test_run_metadata_propagates_post_replace_directory_fsync_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run-1"
+    run_dir.mkdir()
+
+    def fail_directory_fsync(_path: Path) -> None:
+        raise OSError("目录 fsync 失败")
+
+    monkeypatch.setattr(
+        runner_module,
+        "_fsync_directory",
+        fail_directory_fsync,
+        raising=False,
+    )
+
+    with pytest.raises(OSError, match="目录 fsync 失败"):
+        write_run_metadata(
+            run_dir,
+            fingerprint="fingerprint",
+            config_payload={},
+        )
+
+    assert (run_dir / "run.json").exists()
 
 
 def test_run_metadata_rejects_secret_fields_before_writing(tmp_path: Path) -> None:
@@ -676,6 +825,47 @@ def test_run_metadata_rejects_url_userinfo_and_tuple_secrets(
         )
 
     assert not (tmp_path / "run.json").exists()
+
+
+@pytest.mark.parametrize(
+    "config_payload",
+    [
+        {"访问token值": "secret"},
+        {"apiKey": "secret"},
+        {"accessToken": "secret"},
+        {"嵌套配置": ({"clientSecret": "secret"},)},
+    ],
+)
+def test_run_metadata_rejects_mixed_and_camel_case_secret_keys(
+    tmp_path: Path,
+    config_payload: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="不得包含密钥"):
+        write_run_metadata(
+            tmp_path,
+            fingerprint="fingerprint",
+            config_payload=config_payload,
+        )
+
+    assert not (tmp_path / "run.json").exists()
+
+
+@pytest.mark.parametrize(
+    "safe_key",
+    ["monkey备注", "hockey得分", "tokenization方式"],
+)
+def test_run_metadata_secret_scan_avoids_substring_false_positives(
+    tmp_path: Path,
+    safe_key: str,
+) -> None:
+    write_run_metadata(
+        tmp_path,
+        fingerprint="fingerprint",
+        config_payload={safe_key: "普通值"},
+    )
+
+    payload = json.loads((tmp_path / "run.json").read_text(encoding="utf-8"))
+    assert payload["运行配置"][safe_key] == "普通值"
 
 
 @pytest.mark.parametrize(
@@ -797,6 +987,67 @@ class _InlineExecutor:
         except BaseException as exc:
             future.set_exception(exc)
         return future
+
+
+def test_checkpoint_writer_fsyncs_parent_when_results_file_is_created(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[Path] = []
+    monkeypatch.setattr(
+        runner_module,
+        "_fsync_directory",
+        lambda path: calls.append(Path(path)),
+        raising=False,
+    )
+    results_path = tmp_path / "run" / "results.jsonl"
+    results_path.parent.mkdir()
+
+    with runner_module._CheckpointWriter(results_path):
+        pass
+
+    assert calls == [results_path.parent]
+
+
+def test_checkpoint_writer_propagates_results_parent_fsync_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    results_path = tmp_path / "run" / "results.jsonl"
+    results_path.parent.mkdir()
+
+    def fail_directory_fsync(_path: Path) -> None:
+        raise OSError("目录 fsync 失败")
+
+    monkeypatch.setattr(
+        runner_module,
+        "_fsync_directory",
+        fail_directory_fsync,
+        raising=False,
+    )
+
+    with pytest.raises(OSError, match="目录 fsync 失败"):
+        with runner_module._CheckpointWriter(results_path):
+            pass
+
+
+def test_directory_fsync_closes_fd_and_propagates_os_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    closed: list[int] = []
+    monkeypatch.setattr(runner_module.os, "open", lambda *_args: 123)
+    monkeypatch.setattr(
+        runner_module.os,
+        "fsync",
+        lambda _fd: (_ for _ in ()).throw(OSError("目录 fsync 失败")),
+    )
+    monkeypatch.setattr(runner_module.os, "close", closed.append)
+
+    with pytest.raises(OSError, match="目录 fsync 失败"):
+        runner_module._fsync_directory(tmp_path)
+
+    assert closed == [123]
 
 
 def _assert_no_unknown_english_keys(value: object) -> None:
