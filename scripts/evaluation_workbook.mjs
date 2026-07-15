@@ -25,6 +25,31 @@ const RESULT_HEADERS = [
 
 const RESULT_KEYS = ["Excel行号", ...RESULT_HEADERS];
 const REPORT_SHEET_NAMES = ["评测总览", "低分与错误案例", "运行元数据"];
+const SCORE_LIMITS = new Map([
+  ["事实正确性得分", 35],
+  ["关键点覆盖得分", 20],
+  ["证据忠实性得分", 20],
+  ["引用及黄金来源命中得分", 15],
+  ["相关性与表达得分", 10],
+]);
+const JUDGE_SCORE_FIELDS = [
+  "事实正确性得分",
+  "关键点覆盖得分",
+  "证据忠实性得分",
+  "相关性与表达得分",
+];
+const RESULT_TEXT_FIELDS = [
+  "智能体回答",
+  "检索chunk_id",
+  "扣分原因",
+  "错误标签",
+  "改进建议",
+];
+const VALID_GRADES = new Set([
+  "优秀", "合格", "不合格", "问答失败", "评测失败",
+]);
+const VALID_STATUSES = new Set(["已完成", "问答失败", "评测失败"]);
+const LOW_SCORE_ERROR_TAGS = ["无依据扩写", "引用缺失", "检索未命中"];
 const SAFE_METADATA_KEYS = [
   "运行ID",
   "输入文件名",
@@ -116,27 +141,178 @@ function requirePayloadObject(value, name) {
 }
 
 
+function requireFiniteNumber(
+  value,
+  fieldName,
+  excelRow,
+  minimum,
+  maximum = null,
+) {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new Error(`逐题结果第 ${excelRow} 行的${fieldName}必须是有限数值`);
+  }
+  if (value < minimum || (maximum !== null && value > maximum)) {
+    const range = maximum === null
+      ? `大于等于 ${minimum}`
+      : `在 ${minimum} 到 ${maximum}`;
+    throw new Error(`逐题结果第 ${excelRow} 行的${fieldName}必须${range}`);
+  }
+  return value;
+}
+
+
+function requireNullableScore(row, fieldName, excelRow) {
+  const value = row[fieldName];
+  if (value === null) {
+    return null;
+  }
+  return requireFiniteNumber(
+    value,
+    fieldName,
+    excelRow,
+    0,
+    SCORE_LIMITS.get(fieldName),
+  );
+}
+
+
+function gradeForTotal(total) {
+  if (total >= 85) {
+    return "优秀";
+  }
+  if (total >= 75) {
+    return "合格";
+  }
+  return "不合格";
+}
+
+
+function requireCanonicalResultRow(rawRow) {
+  const row = requirePayloadObject(rawRow, "逐题结果记录");
+  const excelRow = row["Excel行号"];
+  if (!Number.isInteger(excelRow) || excelRow < 2 || excelRow > 51) {
+    throw new Error(`逐题结果的Excel行号无效：${excelRow ?? ""}`);
+  }
+  for (const key of RESULT_KEYS) {
+    if (!Object.hasOwn(row, key)) {
+      throw new Error(`逐题结果第 ${excelRow} 行缺少字段：${key}`);
+    }
+  }
+  for (const fieldName of RESULT_TEXT_FIELDS) {
+    if (typeof row[fieldName] !== "string") {
+      throw new Error(`逐题结果第 ${excelRow} 行的${fieldName}必须是字符串`);
+    }
+  }
+
+  const grade = normalizedText(row["评测等级"]);
+  const status = normalizedText(row["评测状态"]);
+  if (!VALID_GRADES.has(grade)) {
+    throw new Error(`逐题结果第 ${excelRow} 行的评测等级无效：${grade}`);
+  }
+  if (!VALID_STATUSES.has(status)) {
+    throw new Error(`逐题结果第 ${excelRow} 行的评测状态无效：${status}`);
+  }
+  requireFiniteNumber(row["耗时（秒）"], "耗时（秒）", excelRow, 0);
+
+  const primaryHit = row["主chunk命中"];
+  if (
+    primaryHit !== null
+    && !["是", "否"].includes(normalizedText(primaryHit))
+  ) {
+    throw new Error(`逐题结果第 ${excelRow} 行的主chunk命中无效`);
+  }
+  const recall = row["黄金chunk召回率"];
+  if (recall !== null) {
+    requireFiniteNumber(recall, "黄金chunk召回率", excelRow, 0, 1);
+  }
+  if ((primaryHit === null) !== (recall === null)) {
+    throw new Error(
+      `逐题结果第 ${excelRow} 行的` +
+      "主chunk命中与黄金chunk召回率必须同时为空或同时有值",
+    );
+  }
+
+  const normalizedRow = {
+    ...row,
+    "评测等级": grade,
+    "评测状态": status,
+    "主chunk命中": primaryHit === null ? null : normalizedText(primaryHit),
+  };
+  if (status === "已完成") {
+    const scores = [...SCORE_LIMITS.keys()].map(
+      (fieldName) => requireFiniteNumber(
+        row[fieldName],
+        fieldName,
+        excelRow,
+        0,
+        SCORE_LIMITS.get(fieldName),
+      ),
+    );
+    const total = requireFiniteNumber(row["总分"], "总分", excelRow, 0, 100);
+    const scoreSum = scores.reduce((sum, value) => sum + value, 0);
+    const expectedTotal = Math.round(scoreSum * 100) / 100;
+    if (Math.abs(total - expectedTotal) > 1e-9) {
+      throw new Error(`逐题结果第 ${excelRow} 行的总分必须等于五维得分之和`);
+    }
+    if (grade !== gradeForTotal(total)) {
+      throw new Error(`逐题结果第 ${excelRow} 行的评测等级与总分不一致`);
+    }
+    return normalizedRow;
+  }
+
+  if (grade !== status) {
+    throw new Error(`逐题结果第 ${excelRow} 行的失败等级必须与评测状态一致`);
+  }
+  for (const fieldName of JUDGE_SCORE_FIELDS) {
+    if (row[fieldName] !== null) {
+      throw new Error(`逐题结果第 ${excelRow} 行的${status}不得包含语义或证据分数`);
+    }
+  }
+  if (status === "问答失败") {
+    if (
+      row["引用及黄金来源命中得分"] !== null
+      || row["总分"] !== 0
+      || primaryHit !== null
+      || recall !== null
+      || normalizedText(row["检索chunk_id"]) !== ""
+    ) {
+      throw new Error(`逐题结果第 ${excelRow} 行的问答失败不得包含语义或证据分数`);
+    }
+    return normalizedRow;
+  }
+
+  const deterministicScore = requireNullableScore(
+    row,
+    "引用及黄金来源命中得分",
+    excelRow,
+  );
+  if (row["总分"] !== null) {
+    throw new Error(`逐题结果第 ${excelRow} 行的评测失败总分必须为空`);
+  }
+  if (
+    deterministicScore === null
+    && (
+      primaryHit !== null
+      || recall !== null
+      || normalizedText(row["检索chunk_id"]) !== ""
+    )
+  ) {
+    throw new Error(`逐题结果第 ${excelRow} 行不得伪造未测量的证据指标`);
+  }
+  return normalizedRow;
+}
+
+
 function requirePayloadRows(payload) {
   if (!Array.isArray(payload["逐题结果"]) || payload["逐题结果"].length !== 50) {
     throw new Error("逐题结果必须包含 50 条记录");
   }
   const rowsByNumber = new Map();
   for (const rawRow of payload["逐题结果"]) {
-    const row = requirePayloadObject(rawRow, "逐题结果记录");
+    const row = requireCanonicalResultRow(rawRow);
     const excelRow = row["Excel行号"];
-    if (!Number.isInteger(excelRow) || excelRow < 2 || excelRow > 51) {
-      throw new Error(`逐题结果的Excel行号无效：${excelRow ?? ""}`);
-    }
     if (rowsByNumber.has(excelRow)) {
       throw new Error(`逐题结果的Excel行号重复：${excelRow}`);
-    }
-    for (const key of RESULT_KEYS) {
-      if (!Object.hasOwn(row, key)) {
-        throw new Error(`逐题结果第 ${excelRow} 行缺少字段：${key}`);
-      }
-    }
-    if (!normalizedText(row["评测状态"])) {
-      throw new Error(`逐题结果第 ${excelRow} 行的评测状态不能为空`);
     }
     rowsByNumber.set(excelRow, row);
   }
@@ -146,6 +322,33 @@ function requirePayloadRows(payload) {
     }
   }
   return rowsByNumber;
+}
+
+
+function requireEvidenceMetrics(summary) {
+  const metrics = requirePayloadObject(summary["证据指标"], "汇总指标.证据指标");
+  const primaryRate = requireFiniteNumber(
+    metrics["主chunk命中率"],
+    "汇总指标.证据指标.主chunk命中率",
+    "汇总",
+    0,
+    1,
+  );
+  const recallRate = requireFiniteNumber(
+    metrics["平均黄金chunk召回率"],
+    "汇总指标.证据指标.平均黄金chunk召回率",
+    "汇总",
+    0,
+    1,
+  );
+  requireFiniteNumber(
+    metrics["平均引用及黄金来源命中得分"],
+    "汇总指标.证据指标.平均引用及黄金来源命中得分",
+    "汇总",
+    0,
+    15,
+  );
+  return { primaryRate, recallRate };
 }
 
 
@@ -205,6 +408,7 @@ function setColumnWidth(sheet, column, lastRow, width) {
 
 function writeOverviewSheet(sheet, payload, mainSheetName) {
   const summary = requirePayloadObject(payload["汇总指标"], "汇总指标");
+  const evidenceMetrics = requireEvidenceMetrics(summary);
   sheet.getRange("A1:H1").merge();
   sheet.getRange("A1").values = [["问答智能体评测总览"]];
   sheet.getRange("A3:B7").values = [
@@ -252,14 +456,14 @@ function writeOverviewSheet(sheet, payload, mainSheetName) {
   sheet.getRange("G3:H7").values = [
     ["运行质量", "结果"],
     ["平均耗时（秒）", null],
-    ["主chunk命中率", null],
-    ["平均黄金chunk召回率", null],
+    ["主chunk命中率", evidenceMetrics.primaryRate],
+    ["平均黄金chunk召回率", evidenceMetrics.recallRate],
     ["已完成题数", null],
   ];
-  sheet.getRange("H4:H7").formulas = [
+  sheet.getRange("H4").formulas = [
     [`=IFERROR(AVERAGE('${escapedSheetName}'!$N$2:$N$51),0)`],
-    [`=COUNTIF('${escapedSheetName}'!$O$2:$O$51,"是")/B4`],
-    [`=IFERROR(AVERAGE('${escapedSheetName}'!$P$2:$P$51),0)`],
+  ];
+  sheet.getRange("H7").formulas = [
     [`=COUNTIF('${escapedSheetName}'!$U$2:$U$51,"已完成")`],
   ];
 
@@ -326,13 +530,24 @@ function writeOverviewSheet(sheet, payload, mainSheetName) {
 }
 
 
+function shouldIncludeLowScore(row) {
+  const errorTags = normalizedText(row["错误标签"]);
+  return (
+    !["优秀", "合格"].includes(normalizedText(row["评测等级"]))
+    || normalizedText(row["评测状态"]) !== "已完成"
+    || LOW_SCORE_ERROR_TAGS.some((tag) => errorTags.includes(tag))
+    || (
+      normalizedText(row["评测状态"]) === "已完成"
+      && normalizedText(row["检索chunk_id"]) === ""
+    )
+  );
+}
+
+
 function writeLowScoreSheet(sheet, rowsByNumber) {
   const headers = ["Excel行号", ...RESULT_HEADERS];
   const rows = [...rowsByNumber.values()]
-    .filter((row) => (
-      !["优秀", "合格"].includes(normalizedText(row["评测等级"]))
-      || normalizedText(row["评测状态"]) !== "已完成"
-    ))
+    .filter(shouldIncludeLowScore)
     .map((row) => headers.map((header) => safeCellValue(row[header])));
   sheet.getRangeByIndexes(0, 0, 1, headers.length).values = [headers];
   if (rows.length > 0) {
@@ -360,11 +575,66 @@ function writeLowScoreSheet(sheet, rowsByNumber) {
 
 
 function looksLikeAbsoluteUserPath(value) {
-  const text = normalizedText(value);
+  const text = normalizedText(value).replaceAll("\\", "/");
   return (
-    /^\/(?:Users|home)\//i.test(text)
-    || /^[A-Za-z]:\\Users\\/i.test(text)
+    /^\/+(?:Users|home)\//i.test(text)
+    || /^\/?[A-Za-z]:\/Users\//i.test(text)
   );
+}
+
+
+function decodedUriPath(value) {
+  let decoded = value;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const next = decodeURIComponent(decoded);
+      if (next === decoded) {
+        return decoded;
+      }
+      decoded = next;
+    } catch {
+      return decoded;
+    }
+  }
+  return decoded;
+}
+
+
+function credentialKeyTokens(value) {
+  return String(value)
+    .replaceAll(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .replaceAll(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
+    .toLowerCase()
+    .match(/[a-z0-9]+/g) ?? [];
+}
+
+
+function looksLikeCredentialKey(value) {
+  const text = String(value);
+  if (/(?:密钥|令牌|密码|口令|凭证)/.test(text)) {
+    return true;
+  }
+  if (
+    /(?:^|[^a-z0-9])(?:token|secret|password|passwd|credential|authorization)(?:$|[^a-z0-9])/i
+      .test(text)
+  ) {
+    return true;
+  }
+  const tokens = credentialKeyTokens(text);
+  const directSecrets = new Set(["key", "token", "secret", "password"]);
+  if (tokens.some((token) => directSecrets.has(token))) {
+    return true;
+  }
+  const credentialKeyPrefixes = [
+    "private", "api", "client", "access", "auth", "signing",
+    "encryption", "milvus",
+  ];
+  return tokens.some((token) => (
+    token.endsWith("token")
+    || token.endsWith("secret")
+    || token.endsWith("password")
+    || credentialKeyPrefixes.some((prefix) => token.includes(`${prefix}key`))
+  ));
 }
 
 
@@ -373,8 +643,22 @@ function assertSafeMetadataValue(value, fieldName) {
     if (looksLikeAbsoluteUserPath(value)) {
       throw new Error(`运行元数据不得包含绝对用户目录：${fieldName}`);
     }
-    if (/^[a-z][a-z0-9+.-]*:\/\/[^\s/@]+:[^\s/@]+@/i.test(value)) {
-      throw new Error(`运行元数据不得包含带凭证的地址：${fieldName}`);
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) {
+      let parsed;
+      try {
+        parsed = new URL(value);
+      } catch {
+        throw new Error(`运行元数据包含无法安全解析的地址：${fieldName}`);
+      }
+      if (parsed.username || parsed.password) {
+        throw new Error(`运行元数据不得包含带凭证的地址：${fieldName}`);
+      }
+      if (
+        parsed.protocol === "file:"
+        && looksLikeAbsoluteUserPath(decodedUriPath(parsed.pathname))
+      ) {
+        throw new Error(`运行元数据不得包含绝对用户目录：${fieldName}`);
+      }
     }
     return;
   }
@@ -386,11 +670,7 @@ function assertSafeMetadataValue(value, fieldName) {
     return;
   }
   for (const [key, nested] of Object.entries(value)) {
-    const normalizedKey = normalizedText(key).toLowerCase();
-    if (
-      /(?:api[_-]?key|token|secret|password|passwd|credential|authorization)/i.test(normalizedKey)
-      || /(?:密钥|令牌|密码|口令|凭证)/.test(normalizedKey)
-    ) {
+    if (looksLikeCredentialKey(key)) {
       throw new Error(`运行元数据不得包含凭证字段：${fieldName}`);
     }
     assertSafeMetadataValue(nested, fieldName);
@@ -400,12 +680,12 @@ function assertSafeMetadataValue(value, fieldName) {
 
 function writeMetadataSheet(sheet, payload) {
   const runInfo = requirePayloadObject(payload["运行信息"], "运行信息");
+  assertSafeMetadataValue(runInfo, "运行信息");
   const rows = [["字段", "值"]];
   for (const key of SAFE_METADATA_KEYS) {
     if (!Object.hasOwn(runInfo, key)) {
       continue;
     }
-    assertSafeMetadataValue(runInfo[key], key);
     const value = typeof runInfo[key] === "boolean"
       ? (runInfo[key] ? "是" : "否")
       : safeCellValue(runInfo[key]);
@@ -514,6 +794,34 @@ function deepEqual(left, right) {
 }
 
 
+function firstMatrixDifference(actual, expected) {
+  for (let rowIndex = 0; rowIndex < expected.length; rowIndex += 1) {
+    for (
+      let columnIndex = 0;
+      columnIndex < expected[rowIndex].length;
+      columnIndex += 1
+    ) {
+      const actualValue = normalizedComparableCell(actual[rowIndex]?.[columnIndex]);
+      const expectedValue = normalizedComparableCell(expected[rowIndex][columnIndex]);
+      if (!deepEqual(actualValue, expectedValue)) {
+        return {
+          "Excel行号": rowIndex + 2,
+          "字段": RESULT_HEADERS[columnIndex],
+          "实际值": actualValue,
+          "期望值": expectedValue,
+        };
+      }
+    }
+  }
+  return null;
+}
+
+
+function normalizedComparableCell(value) {
+  return value === null || value === undefined || value === "" ? null : value;
+}
+
+
 function countFormulaErrors(workbook, sheetNames) {
   const pattern = /#(?:REF!|DIV\/0!|VALUE!|NAME\?|N\/A)/g;
   let count = 0;
@@ -581,6 +889,13 @@ async function verify(options) {
     "工作簿快照文件",
   );
   const snapshot = requirePayloadObject(snapshotPayload["工作簿快照"], "工作簿快照");
+  const expectedPayload = requirePayloadObject(
+    snapshotPayload["回填载荷"],
+    "工作簿快照.回填载荷",
+  );
+  const expectedRowsByNumber = requirePayloadRows(expectedPayload);
+  const expectedSummary = requirePayloadObject(expectedPayload["汇总指标"], "汇总指标");
+  const expectedEvidenceMetrics = requireEvidenceMetrics(expectedSummary);
   const originalMainRows = snapshot["主表A:E"];
   const originalDetailRows = snapshot["溯源明细"];
   if (!Array.isArray(originalMainRows) || !Array.isArray(originalDetailRows)) {
@@ -596,11 +911,37 @@ async function verify(options) {
   const mainRows = mainSheet.getRange("A1:E51").values;
   const detailRows = detailSheet.getUsedRange().values;
   const headers = mainSheet.getRange("F1:U1").values[0].map(normalizedText);
+  const actualResultMatrix = mainSheet.getRange("F2:U51").values;
+  const expectedResultMatrix = [];
+  for (let excelRow = 2; excelRow <= 51; excelRow += 1) {
+    const expectedRow = expectedRowsByNumber.get(excelRow);
+    expectedResultMatrix.push(
+      RESULT_HEADERS.map((header) => safeCellValue(expectedRow[header])),
+    );
+  }
+  const resultDifference = firstMatrixDifference(
+    actualResultMatrix,
+    expectedResultMatrix,
+  );
   const statuses = mainSheet.getRange("U2:U51").values
     .flat()
     .map(normalizedText)
     .filter(Boolean);
   const mainUsedRows = mainSheet.getUsedRange(true).values.length;
+  const overviewSheet = requiredWorksheet(workbook, "评测总览");
+  const actualPrimaryRate = overviewSheet.getRange("H5").values[0][0];
+  const actualRecallRate = overviewSheet.getRange("H6").values[0][0];
+  const lowScoreSheet = requiredWorksheet(workbook, "低分与错误案例");
+  const lowScoreUsedRange = lowScoreSheet.getUsedRange(true);
+  const actualLowScoreRows = lowScoreUsedRange
+    ? lowScoreUsedRange.values
+      .slice(1)
+      .map((row) => row[0])
+      .filter((value) => value !== null && value !== undefined && value !== "")
+    : [];
+  const expectedLowScoreRows = [...expectedRowsByNumber.values()]
+    .filter(shouldIncludeLowScore)
+    .map((row) => row["Excel行号"]);
 
   await workbook.inspect({
     kind: "match",
@@ -622,6 +963,12 @@ async function verify(options) {
     "五十条评测状态完整": statuses.length === 50,
     "原始主表保持不变": deepEqual(mainRows, originalMainRows),
     "溯源明细保持不变": deepEqual(detailRows, originalDetailRows),
+    "五十条评测结果逐格匹配": resultDifference === null,
+    "总览证据指标取自汇总": (
+      actualPrimaryRate === expectedEvidenceMetrics.primaryRate
+      && actualRecallRate === expectedEvidenceMetrics.recallRate
+    ),
+    "低分与错误案例完整": deepEqual(actualLowScoreRows, expectedLowScoreRows),
     "公式错误为零": formulaErrorCount === 0,
     "五张预览图全部生成": (
       previewResult.rendered === 5 && previewResult.errors.length === 0
@@ -636,6 +983,10 @@ async function verify(options) {
     "工作表名称": actualSheetNames,
     "主表行数": mainUsedRows,
     "评测状态数量": statuses.length,
+    "主chunk命中率": actualPrimaryRate,
+    "平均黄金chunk召回率": actualRecallRate,
+    "低分与错误案例行号": actualLowScoreRows,
+    "首个评测结果差异": resultDifference,
     "原始主表保持不变": checks["原始主表保持不变"],
     "溯源明细保持不变": checks["溯源明细保持不变"],
     "公式错误数量": formulaErrorCount,
