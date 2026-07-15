@@ -314,6 +314,104 @@ def test_backfill_rejects_noncanonical_completed_result_cells(
     or not FIXED_NODE_MODULES.is_dir(),
     reason="缺少真实工作簿或 bundled artifact-tool 运行时",
 )
+def test_backfill_accepts_empty_and_normalizes_valid_error_tags(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / REAL_WORKBOOK.name
+    shutil.copy2(REAL_WORKBOOK, source)
+    payload = _payload()
+    payload["逐题结果"][0]["错误标签"] = ""
+    payload["逐题结果"][1]["错误标签"] = (
+        "事实错误 ; 关键点缺失；无依据扩写 ; 答非所问；"
+        "引用缺失 ; 检索未命中；问答执行失败 ; 裁判执行失败"
+    )
+    canonical_tags = (
+        "事实错误；关键点缺失；无依据扩写；答非所问；"
+        "引用缺失；检索未命中；问答执行失败；裁判执行失败"
+    )
+    run_dir = tmp_path / "run"
+    lock_root = tmp_path / "locks"
+    _, input_sha256 = create_input_snapshot(
+        source,
+        run_dir,
+        lock_root=lock_root,
+    )
+
+    verification_path = safe_backfill(
+        source,
+        run_dir,
+        _adapter(run_dir),
+        payload,
+        expected_source_sha256=input_sha256,
+        lock_root=lock_root,
+    )
+
+    verification = json.loads(verification_path.read_text(encoding="utf-8"))
+    assert verification["验证通过"] is True
+    assert verification["检查项"]["五十条评测结果逐格匹配"] is True
+
+    snapshot_path = run_dir / "工作簿快照.json"
+    snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    snapshot["回填载荷"]["逐题结果"][1]["错误标签"] = canonical_tags
+    _write_payload(snapshot_path, snapshot)
+    normalized_verification_path = run_dir / "规范化验证.json"
+    _adapter(run_dir).verify(
+        source,
+        snapshot_path,
+        normalized_verification_path,
+        run_dir / "规范化预览",
+    )
+    normalized_verification = json.loads(
+        normalized_verification_path.read_text(encoding="utf-8")
+    )
+    assert normalized_verification["验证通过"] is True
+    assert normalized_verification["首个评测结果差异"] is None
+
+
+@pytest.mark.skipif(
+    not REAL_WORKBOOK.is_file()
+    or not FIXED_NODE_BIN.is_file()
+    or not FIXED_NODE_MODULES.is_dir(),
+    reason="缺少真实工作簿或 bundled artifact-tool 运行时",
+)
+@pytest.mark.parametrize(
+    ("error_tags", "expected_message"),
+    [
+        ("未知标签", "错误标签包含未知标签"),
+        ("事实错误；事实错误", "错误标签不得重复"),
+        ("事实错误；；关键点缺失", "错误标签不得包含空片段"),
+        ("；事实错误", "错误标签不得包含空片段"),
+        ("事实错误；", "错误标签不得包含空片段"),
+        ("事实错误，关键点缺失", "错误标签必须使用分号分隔"),
+        ("事实错误,关键点缺失", "错误标签必须使用分号分隔"),
+    ],
+)
+def test_backfill_rejects_noncanonical_error_tags(
+    tmp_path: Path,
+    error_tags: str,
+    expected_message: str,
+) -> None:
+    source = tmp_path / REAL_WORKBOOK.name
+    shutil.copy2(REAL_WORKBOOK, source)
+    payload = _payload()
+    payload["逐题结果"][0]["错误标签"] = error_tags
+    payload_path = tmp_path / "无效错误标签.json"
+    _write_payload(payload_path, payload)
+
+    with pytest.raises(RuntimeError, match=expected_message):
+        _adapter(tmp_path / "adapter").backfill(
+            source,
+            payload_path,
+            tmp_path / "不应生成.xlsx",
+        )
+
+
+@pytest.mark.skipif(
+    not REAL_WORKBOOK.is_file()
+    or not FIXED_NODE_BIN.is_file()
+    or not FIXED_NODE_MODULES.is_dir(),
+    reason="缺少真实工作簿或 bundled artifact-tool 运行时",
+)
 def test_backfill_rejects_fabricated_failure_scores(tmp_path: Path) -> None:
     payload = _payload()
     row = payload["逐题结果"][0]

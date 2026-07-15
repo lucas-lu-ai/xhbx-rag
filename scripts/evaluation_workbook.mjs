@@ -49,6 +49,16 @@ const VALID_GRADES = new Set([
   "优秀", "合格", "不合格", "问答失败", "评测失败",
 ]);
 const VALID_STATUSES = new Set(["已完成", "问答失败", "评测失败"]);
+const VALID_ERROR_TAGS = new Set([
+  "事实错误",
+  "关键点缺失",
+  "无依据扩写",
+  "答非所问",
+  "引用缺失",
+  "检索未命中",
+  "问答执行失败",
+  "裁判执行失败",
+]);
 const LOW_SCORE_ERROR_TAGS = ["无依据扩写", "引用缺失", "检索未命中"];
 const SAFE_METADATA_KEYS = [
   "运行ID",
@@ -187,6 +197,36 @@ function gradeForTotal(total) {
 }
 
 
+function requireCanonicalErrorTags(value, excelRow) {
+  const normalized = normalizedText(value);
+  if (normalized === "") {
+    return "";
+  }
+  if (normalized.includes(",") || normalized.includes("，")) {
+    throw new Error(
+      `逐题结果第 ${excelRow} 行的错误标签必须使用分号分隔`,
+    );
+  }
+  const tags = normalized.split(/[；;]/).map((tag) => tag.trim());
+  if (tags.some((tag) => tag === "")) {
+    throw new Error(`逐题结果第 ${excelRow} 行的错误标签不得包含空片段`);
+  }
+  const seen = new Set();
+  for (const tag of tags) {
+    if (!VALID_ERROR_TAGS.has(tag)) {
+      throw new Error(
+        `逐题结果第 ${excelRow} 行的错误标签包含未知标签：${tag}`,
+      );
+    }
+    if (seen.has(tag)) {
+      throw new Error(`逐题结果第 ${excelRow} 行的错误标签不得重复：${tag}`);
+    }
+    seen.add(tag);
+  }
+  return tags.join("；");
+}
+
+
 function requireCanonicalResultRow(rawRow) {
   const row = requirePayloadObject(rawRow, "逐题结果记录");
   const excelRow = row["Excel行号"];
@@ -237,6 +277,7 @@ function requireCanonicalResultRow(rawRow) {
     "评测等级": grade,
     "评测状态": status,
     "主chunk命中": primaryHit === null ? null : normalizedText(primaryHit),
+    "错误标签": requireCanonicalErrorTags(row["错误标签"], excelRow),
   };
   if (status === "已完成") {
     const scores = [...SCORE_LIMITS.keys()].map(
