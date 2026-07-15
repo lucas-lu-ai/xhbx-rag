@@ -1,0 +1,365 @@
+# 问答智能体评测智能体设计
+
+日期：2026-07-15
+
+## 1. 背景
+
+`xhbx-rag` 已具备完整的保险知识问答链路：问题理解、查询改写、向量与关键词混合召回、RRF 融合、标签加权、rerank、证据约束回答和引用输出。项目中已有一份包含 50 条问答的评测集，并已补充到 `parsed/**/chunks.jsonl` 的完整溯源信息。
+
+本设计新增一个可重复执行的评测智能体。它直接调用本地 Python 问答代码，使用 Docker 中的 Milvus standalone 服务完成检索，再结合独立裁判模型和确定性指标，对全部 50 条问答给出逐题评分、总体效果和优化建议。
+
+## 2. 目标
+
+- 提供可通过 CLI 重复执行的问答效果评测流程。
+- 直接调用 `xhbx_rag.web.services.answer_question()`，不启动 Web API 或 A2A 服务。
+- 只使用 Docker Milvus，不打开 Milvus Lite 数据库文件。
+- 全部 50 条题目均纳入主效果指标，同时按评测集的 `完整支持`、`部分支持`、`未定位` 状态分层展示。
+- 使用混合评测：独立大模型裁判负责语义质量，确定性规则负责运行、检索和引用质量。
+- 保留完整原始回答、检索证据、评分依据、错误和运行元数据，支持审计与断点续跑。
+- 输出逐题明细 Excel、管理层可读 Markdown 报告和机器可处理 JSON/JSONL。
+
+## 3. 非目标
+
+- 不新增评测 Web 页面、后台任务 API、A2A endpoint 或数据库表。
+- 不修改现有问答智能体的检索、生成提示词和回答行为。
+- 不自动清空、重建或迁移现有 Docker Milvus 索引。
+- 不把评测结果写回原始评测集文件。
+- 第一版不做多轮对话评测、对抗测试、在线流量采样或人工评分平台。
+- 第一版默认每题运行一次；保留后续扩展重复采样和稳定性评测的接口，但不纳入本次实现。
+
+## 4. 输入与输出
+
+### 4.1 输入
+
+评测输入为：
+
+`outputs/019f5f79-943c-7611-b046-f9725e18b5bd/新华保险AI教练问答一批绩优案例测试集-含完整溯源.xlsx`
+
+读取内容包括：
+
+- 问题；
+- 参考答案；
+- 溯源状态；
+- 主 `chunk_id`；
+- 全部有效黄金 `chunk_id`；
+- 黄金原文摘录、来源路径、定位和支撑说明。
+
+工作簿先通过独立的数据抽取层转换为规范化 JSON。Python 评测核心只依赖该稳定 JSON 契约，不把 XLSX 解析细节耦合进评测逻辑。
+
+### 4.2 输出目录
+
+每次运行创建独立目录：
+
+`outputs/evaluations/<run_id>/`
+
+目录内包含：
+
+- `run.json`：运行配置、输入指纹、环境与汇总指标；
+- `results.jsonl`：逐题原始回答、证据、指标、裁判结果和错误；
+- `report.md`：总体结论、问题分布和改进建议；
+- `新华保险问答智能体效果评估.xlsx`：总览、逐题结果、低分案例和运行元数据。
+
+评测中间检查点写入同一运行目录。重新执行时必须显式传入已有 `run_id` 或 `--resume` 才会续跑，不会误用其他运行的数据。
+
+## 5. 总体架构
+
+```text
+含完整溯源的评测集 XLSX
+        ↓
+DatasetExtractor / DatasetLoader
+        ↓
+EvaluationRunner ───────────────→ JSONL 检查点
+        ↓
+本地 services.answer_question(...)
+        ↓
+Docker Milvus + Query Understanding + Rerank + AnswerAgent
+        ↓
+┌─────────────────────────┬──────────────────────────┐
+│ DeterministicMetrics    │ EvaluationJudgeAgent     │
+│ 运行、检索、引用 15 分   │ 语义质量 85 分            │
+└─────────────────────────┴──────────────────────────┘
+        ↓
+ScoreAggregator
+        ↓
+JSON / JSONL / Markdown / Excel
+```
+
+## 6. 模块设计
+
+### 6.1 DatasetExtractor 与 DatasetLoader
+
+职责：
+
+- 从两个工作表读取 50 条问答及溯源明细；
+- 按评测行号聚合黄金 chunk、原文证据和来源信息；
+- 校验题号唯一、问题和参考答案非空、状态值合法、黄金明细引用一致；
+- 输出规范化 JSON，并计算输入文件 SHA-256。
+
+每题规范化记录至少包含：
+
+```json
+{
+  "item_id": "row-2",
+  "excel_row": 2,
+  "question": "...",
+  "reference_answer": "...",
+  "trace_status": "完整支持",
+  "primary_chunk_id": "...",
+  "gold_chunk_ids": ["..."],
+  "gold_evidences": [
+    {
+      "chunk_id": "...",
+      "source_path": "...",
+      "locator": "...",
+      "excerpt": "...",
+      "support_note": "..."
+    }
+  ]
+}
+```
+
+### 6.2 LocalAnswerRunner
+
+职责：
+
+- 使用 `ThreadPoolExecutor(max_workers=2)` 执行题目；
+- 每题直接调用 `xhbx_rag.web.services.answer_question(query=..., top_n=20, top_k=5)`；
+- 使用项目 `.env` 加载模型、embedding、rerank 和 Milvus 配置；
+- 要求 `MILVUS_MODE=docker`，并连接宿主机 `MILVUS_URI=http://localhost:19530`；
+- 记录墙钟耗时、开始/结束时间、回答、改写问题、filters、citations、retrieval_evidences、reasoning 和异常；
+- 每题使用独立运行上下文，不共享对话记忆。
+
+评测耗时覆盖完整问答核心链路，但不包含 HTTP 或 A2A 传输开销。
+
+### 6.3 EvaluationJudgeAgent
+
+裁判模型使用独立配置：
+
+- `EVAL_BASE_URL`
+- `EVAL_API_KEY`
+- `EVAL_MODEL_NAME`
+- `EVAL_TIMEOUT`，默认 180 秒
+- `EVAL_RETRY_ATTEMPTS`，默认 2 次重试
+
+若前三项未配置，则回退到现有 `BASE_URL`、`API_KEY`、`MODEL_NAME`，并在 `run.json`、Markdown 和 Excel 中明确标记 `same_model_judge=true`，说明存在同模型自评偏差。
+
+裁判输入包括：问题、参考答案、黄金证据、问答智能体回答、检索证据和最终引用。裁判温度固定为 0，要求输出结构化 JSON，并经过 Pydantic 校验。裁判不得以表达风格不同为由扣除事实分，也不得把参考答案中缺少来源的扩写自动当作事实真理。
+
+裁判输出包括：
+
+- `correctness_score`：0–35；
+- `keypoint_coverage_score`：0–20；
+- `groundedness_score`：0–20；
+- `relevance_clarity_score`：0–10；
+- `reference_keypoints`；
+- `covered_keypoints`；
+- `missing_keypoints`；
+- `unsupported_claims`；
+- `error_tags`；
+- `reason`；
+- `improvement_suggestion`。
+
+### 6.4 DeterministicMetrics
+
+确定性指标共 15 分：
+
+1. 黄金检索命中，10 分：
+   - 主 `chunk_id` 出现在 `retrieval_evidences` 中：5 分；
+   - 全部黄金 `chunk_id` 的召回覆盖率：5 分，按覆盖比例线性计算。
+2. 有效引用映射，5 分：
+   - 将 `citations[].evidence_index` 映射回 `retrieval_evidences`；
+   - 统计可定位引用比例，以及引用证据与黄金 chunk/source 的交集；
+   - 无引用或引用无法映射时为 0 分。
+
+对于 `未定位` 题，没有合法黄金 chunk 可用于命中计算。该题的 10 分改为可重复计算的检索证据有效性：检索结果非空得 5 分；返回的 `chunk_id` 均能在当前 `parsed/**/chunks.jsonl` 语料目录中找到得 5 分，部分有效时按比例计算。该替代规则必须在逐题结果中标记，不能伪装成黄金命中。证据是否真正支撑回答仍由 20 分的证据忠实性维度判断，不混入确定性指标。
+
+同时记录但不直接计入总分的运行指标：
+
+- 问答成功率；
+- 平均耗时、P50、P95；
+- 平均检索证据数和引用数；
+- 无证据回答率；
+- 主 chunk 命中率、任一黄金 chunk 命中率、黄金 chunk 召回率；
+- 按溯源状态分组的均分和通过率。
+
+### 6.5 ScoreAggregator
+
+总分 100 分：
+
+| 维度 | 分值 |
+| --- | ---: |
+| 事实正确性 | 35 |
+| 关键点覆盖 | 20 |
+| 证据忠实性 | 20 |
+| 引用及黄金来源命中 | 15 |
+| 相关性与表达 | 10 |
+
+等级规则：
+
+- `优秀`：总分 ≥ 85；
+- `合格`：75 ≤ 总分 < 85；
+- `不合格`：总分 < 75；
+- `评测失败`：问答成功但裁判基础设施在重试后仍失败，无法得到合法语义评分。
+
+全部 50 条均进入主结果。总体通过率的分母为 50：问答执行失败按 0 分和不合格计入；裁判基础设施失败单独报告数量，并同时提供“按全部 50 条计的保守通过率”和“排除评测基础设施失败后的有效通过率”，避免掩盖评测系统故障。
+
+### 6.6 EvaluationRunner 与断点续跑
+
+运行顺序：
+
+1. 校验输入文件和规范化数据；
+2. 校验 Docker Milvus 连接、目标 collection 存在且非空；
+3. 固化运行配置、Git commit、输入 SHA-256、模型名和 collection 统计；
+4. 并发执行本地问答；
+5. 计算确定性指标；
+6. 调用裁判模型；
+7. 聚合评分并立即追加一条 JSONL；
+8. 全部题目完成后生成汇总和报告。
+
+检查点以 `item_id` 为键。续跑时只有输入 SHA-256、评分版本、top_n/top_k、问答模型、裁判模型和 collection 配置指纹完全一致，才复用已完成题目；不一致则拒绝续跑并提示创建新 run。
+
+### 6.7 ReportWriter 与工作簿边界
+
+Python 核心先生成 `run.json`、`results.jsonl` 和 `report.md`。XLSX 抽取与最终 Excel 报告由单独的 JavaScript 工作簿适配层完成，统一使用 `@oai/artifact-tool`：
+
+- 抽取器把输入工作簿转换为规范化 JSON；
+- 报告构建器只读取规范化 JSON，不重复计算业务指标；
+- CLI 编排器负责调用抽取器和报告构建器，并把失败映射为稳定退出码；
+- `--no-xlsx` 只跳过最终 Excel 构建，不跳过输入抽取和核心评测；
+- 工作簿适配层与 Python 评测核心通过版本化 JSON schema 解耦，便于分别测试。
+
+## 7. CLI 设计
+
+新增命令：
+
+```bash
+uv run xhbx-rag evaluate \
+  --dataset "outputs/019f5f79-943c-7611-b046-f9725e18b5bd/新华保险AI教练问答一批绩优案例测试集-含完整溯源.xlsx" \
+  --output-dir outputs/evaluations \
+  --concurrency 2 \
+  --top-n 20 \
+  --top-k 5
+```
+
+可选参数：
+
+- `--resume <run_id>`：继续相同配置的未完成运行；
+- `--limit N`：只跑前 N 条，供冒烟测试；
+- `--item-id ...`：只跑指定题目，供问题复现；
+- `--no-xlsx`：只输出结构化数据和 Markdown；
+- `--judge-concurrency N`：裁判并发数，默认 2。
+
+命令退出码：
+
+- 0：流程执行完成，即使存在不合格题；
+- 2：输入、配置、Docker Milvus 或 collection 预检失败；
+- 3：运行级异常导致结果无法完整落盘。
+
+## 8. Docker Milvus 运行约束
+
+本次不启动 `api`、`web` 或 A2A 服务。运行前执行：
+
+```bash
+docker compose up -d standalone
+```
+
+Compose 会连带启动 `etcd` 和 `minio`。宿主机评测进程通过 `localhost:19530` 访问 Milvus。
+
+预检必须验证：
+
+- `MILVUS_MODE` 为 `docker`；
+- URI 可连接；
+- 问答模型路由可能使用到的 collection 均能查询；
+- 至少一个目标 collection 非空；
+- collection 统计写入运行元数据。
+
+如果索引不存在或为空，评测停止并报告，不自动 rebuild 或增量写入，避免在未确认时改变当前向量库状态。
+
+## 9. 错误处理
+
+### 9.1 问答失败
+
+- 单题最多执行 3 次：首次调用加 2 次重试；
+- 仅对超时、网络、模型服务 5xx 和临时 Milvus 错误重试；
+- 配置错误、输入错误和稳定的结构校验错误不做盲目重试；
+- 最终失败保留安全错误类型和摘要，答案总分记 0，并计入总体失败率。
+
+### 9.2 裁判失败
+
+- 裁判输出解析或校验失败时，将错误摘要和上次输出加入修复提示后重试；
+- 重试后仍失败，标记 `评测失败`，不伪造分数；
+- 原问答结果和确定性指标仍保留，可在续跑时只补裁判步骤。
+
+### 9.3 报告失败
+
+- JSONL 是最先写入的事实记录；Markdown 或 Excel 生成失败不丢失已经完成的逐题结果；
+- 报告可从 `run.json + results.jsonl` 幂等重建；
+- Excel 不包含 API key、token、绝对个人目录或客户敏感信息。
+
+## 10. 报告设计
+
+### 10.1 Excel
+
+工作表：
+
+1. `评测总览`：总分、通过率、优秀率、成功率、延迟、证据指标、分层结果和主要问题；
+2. `逐题结果`：50 条问题、参考答案、智能体答案、五维分数、总分、等级、耗时、黄金命中、引用、裁判理由和改进建议；
+3. `低分与错误案例`：不合格、问答失败、评测失败、无证据和高风险 unsupported claims；
+4. `运行元数据`：输入指纹、Git commit、模型名、top_n/top_k、并发、collection 统计、评分版本和同模型评测标记。
+
+Excel 的事实来源为规范化结果文件。工作簿生成后必须检查关键区域、公式错误和所有工作表的可读性。
+
+### 10.2 Markdown
+
+报告按结论优先组织：
+
+- 一句话总体结论；
+- 总体分数与通过率；
+- 完整支持、部分支持、未定位三组对比；
+- 最常见错误类型；
+- 代表性低分案例；
+- 检索、生成、评测集三个层面的优化建议；
+- 同模型裁判、基础设施失败等限制说明。
+
+## 11. 测试与验收
+
+### 11.1 单元测试
+
+- 数据集聚合和字段校验；
+- 黄金 chunk 命中、引用映射和未定位替代规则；
+- 分数边界、等级和总体分母；
+- 问答重试与不可重试错误；
+- 裁判 JSON 校验、修复重试和失败状态；
+- JSONL 检查点、配置指纹和断点续跑；
+- Markdown 与 Excel 所需的规范化报告数据契约。
+
+测试使用 fake answer runner、fake judge 和小型固定数据，不调用真实模型或 Milvus。
+
+### 11.2 集成验证
+
+1. 启动 Docker `standalone` 及依赖并等待健康；
+2. 对 2 条题目执行真实链路冒烟测试；
+3. 核对问答结果包含 `answer`、`retrieval_evidences` 和可解析引用；
+4. 冒烟通过后运行全部 50 条；
+5. 由独立子代理复核评分契约、代表性高低分题和报告汇总；
+6. 运行项目相关测试、完整测试、格式检查和工作簿视觉检查。
+
+### 11.3 验收标准
+
+- 50 条题目均有终态记录，不静默遗漏；
+- 主汇总分母为 50，并提供按溯源状态分层结果；
+- 问答失败明确按 0 分计入，裁判基础设施失败不伪造分数；
+- 每个分数可回查到原回答、检索证据、黄金证据或裁判理由；
+- Docker Milvus 预检、collection 统计和运行配置可审计；
+- 断点续跑不会跨输入或跨配置错误复用结果；
+- JSON/JSONL、Markdown 和 Excel 汇总一致；
+- 原评测集、原始 chunks 和现有 Milvus 索引未被修改。
+
+## 12. 后续扩展
+
+- 多次采样计算稳定性、方差和最差分位数；
+- 对检索层和生成层分别做消融评测；
+- 增加合规性、安全性和敏感信息专项裁判；
+- 接入 Web 批量任务和历史趋势看板；
+- 引入人工复核工作流校准裁判模型；
+- 支持多模型横向对比和回归基线。
