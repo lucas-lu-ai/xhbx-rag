@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import re
 import subprocess
@@ -9,6 +8,7 @@ import sys
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from uuid import uuid4
 
 from xhbx_rag.config import ConfigError, RetrievalConfig
@@ -18,7 +18,10 @@ from xhbx_rag.evaluation.judge import EvaluationJudgeAgent
 from xhbx_rag.evaluation.metrics import summarize_results
 from xhbx_rag.evaluation.models import EvaluationItem
 from xhbx_rag.evaluation.reporting import (
+    WorkbookPersistenceError,
     build_backfill_payload,
+    create_input_snapshot,
+    install_dataset_snapshot,
     safe_backfill,
     write_markdown_report,
 )
@@ -27,6 +30,7 @@ from xhbx_rag.evaluation.runner import (
     compute_run_fingerprint,
     preflight_docker_milvus,
     run_items,
+    validate_resume,
     write_run_metadata,
 )
 from xhbx_rag.evaluation.workbook import WorkbookAdapter
@@ -69,97 +73,146 @@ def run_evaluate_command(args: argparse.Namespace) -> int:
         output_root = Path(args.output_dir)
         run_id = _resolve_run_id(args.resume)
         run_dir = output_root / run_id
-        run_dir.mkdir(parents=True, exist_ok=True)
-        adapter = WorkbookAdapter(run_dir)
-        dataset_json = run_dir / "dataset.json"
-        adapter.extract(dataset_path, dataset_json)
-        all_items = load_dataset(dataset_json)
-        items = select_items(
-            all_items,
-            item_ids=args.item_id,
-            limit=args.limit,
-        )
-        retrieval_config = RetrievalConfig.from_env()
-        judge_config = load_evaluation_config()
-        collection_stats = preflight_docker_milvus(retrieval_config)
-        input_sha256 = hashlib.sha256(dataset_path.read_bytes()).hexdigest()
-        fingerprint = compute_run_fingerprint(
-            input_sha256=input_sha256,
-            scoring_version=SCORING_VERSION,
-            top_n=args.top_n,
-            top_k=args.top_k,
-            answer_model_name=retrieval_config.model_name,
-            judge_model_name=judge_config.judge_model_name,
-            same_model_judge=judge_config.same_model_judge,
-            milvus_uri=retrieval_config.milvus_uri,
-            collection_stats=collection_stats,
-        )
-        collections = configured_collection_names(retrieval_config)
-        run_info = _run_info(
-            run_id=run_id,
-            dataset_path=dataset_path,
-            input_sha256=input_sha256,
-            retrieval_config=retrieval_config,
-            judge_model_name=judge_config.judge_model_name,
-            same_model_judge=judge_config.same_model_judge,
-            args=args,
-            collection_stats=collection_stats,
+        backup, input_sha256 = create_input_snapshot(
+            dataset_path,
+            run_dir,
+            resume=args.resume is not None,
+            lock_root=output_root / ".workbook-locks",
         )
     except (ConfigError, EvaluationPreflightError, RuntimeError, ValueError) as exc:
         print(f"评测输入失败：{exc}", file=sys.stderr)
         return 2
-    except OSError as exc:
-        print(f"评测落盘失败：{exc}", file=sys.stderr)
+    except (WorkbookPersistenceError, OSError) as exc:
+        print(f"评测落盘失败：{_safe_error(exc)}", file=sys.stderr)
         return 3
 
     try:
-        with EvaluationJudgeAgent(judge_config) as judge:
-            results = run_items(
-                items,
-                judge=judge,
-                run_dir=run_dir,
-                fingerprint=fingerprint,
-                resume=args.resume is not None,
-                top_n=args.top_n,
-                top_k=args.top_k,
-                collections=collections,
-                project_root=Path.cwd(),
-                chunk_catalog=load_chunk_catalog(),
-                concurrency=args.concurrency,
-                judge_concurrency=args.judge_concurrency,
-                config_payload=run_info,
-            )
-        summary = summarize_results(results)
-        metadata = {**run_info, "汇总指标": summary}
-        write_run_metadata(
-            run_dir,
-            fingerprint=fingerprint,
-            config_payload=metadata,
-        )
-        write_markdown_report(run_dir, run_info, summary, results)
-        if not args.no_xlsx:
-            payload = build_backfill_payload(run_info, summary, results)
-            safe_backfill(dataset_path, run_dir, adapter, payload)
-    except (ConfigError, EvaluationPreflightError, ValueError) as exc:
-        print(f"评测输入或工作簿验证失败：{exc}", file=sys.stderr)
-        return 2
-    except Exception as exc:
-        print(f"评测运行或落盘失败：{_safe_error(exc)}", file=sys.stderr)
-        return 3
+        with TemporaryDirectory(
+            prefix=f".{run_id}-staging-",
+            dir=output_root,
+        ) as staging_value:
+            staging_dir = Path(staging_value)
+            adapter = WorkbookAdapter(staging_dir)
+            staged_dataset = staging_dir / "dataset.json"
+            try:
+                adapter.extract(backup, staged_dataset)
+                all_items = load_dataset(staged_dataset)
+                items = select_items(
+                    all_items,
+                    item_ids=args.item_id,
+                    limit=args.limit,
+                )
+                retrieval_config = RetrievalConfig.from_env()
+                judge_config = load_evaluation_config()
+                collection_stats = preflight_docker_milvus(retrieval_config)
+                fingerprint = compute_run_fingerprint(
+                    input_sha256=input_sha256,
+                    scoring_version=SCORING_VERSION,
+                    top_n=args.top_n,
+                    top_k=args.top_k,
+                    answer_model_name=retrieval_config.model_name,
+                    judge_model_name=judge_config.judge_model_name,
+                    same_model_judge=judge_config.same_model_judge,
+                    milvus_uri=retrieval_config.milvus_uri,
+                    collection_stats=collection_stats,
+                )
+                if args.resume is not None:
+                    validate_resume(run_dir, expected_fingerprint=fingerprint)
+                install_dataset_snapshot(
+                    staged_dataset,
+                    run_dir / "dataset.json",
+                    resume=args.resume is not None,
+                )
+                collections = configured_collection_names(retrieval_config)
+                run_info = _run_info(
+                    run_id=run_id,
+                    dataset_path=dataset_path,
+                    input_sha256=input_sha256,
+                    retrieval_config=retrieval_config,
+                    judge_model_name=judge_config.judge_model_name,
+                    same_model_judge=judge_config.same_model_judge,
+                    args=args,
+                    collection_stats=collection_stats,
+                )
+            except (
+                ConfigError,
+                EvaluationPreflightError,
+                RuntimeError,
+                ValueError,
+            ) as exc:
+                print(f"评测输入失败：{exc}", file=sys.stderr)
+                return 2
+            except (WorkbookPersistenceError, OSError) as exc:
+                print(f"评测落盘失败：{_safe_error(exc)}", file=sys.stderr)
+                return 3
 
-    print(
-        json.dumps(
-            {
+            try:
+                with EvaluationJudgeAgent(judge_config) as judge:
+                    results = run_items(
+                        items,
+                        judge=judge,
+                        run_dir=run_dir,
+                        fingerprint=fingerprint,
+                        resume=args.resume is not None,
+                        top_n=args.top_n,
+                        top_k=args.top_k,
+                        collections=collections,
+                        project_root=Path.cwd(),
+                        chunk_catalog=load_chunk_catalog(),
+                        concurrency=args.concurrency,
+                        judge_concurrency=args.judge_concurrency,
+                        config_payload=run_info,
+                    )
+                summary = summarize_results(results)
+                metadata = {**run_info, "汇总指标": summary}
+                write_run_metadata(
+                    run_dir,
+                    fingerprint=fingerprint,
+                    config_payload=metadata,
+                )
+                write_markdown_report(run_dir, run_info, summary, results)
+                if not args.no_xlsx:
+                    payload = build_backfill_payload(run_info, summary, results)
+                    safe_backfill(
+                        dataset_path,
+                        run_dir,
+                        adapter,
+                        payload,
+                        expected_source_sha256=input_sha256,
+                        lock_root=output_root / ".workbook-locks",
+                    )
+            except (ConfigError, EvaluationPreflightError, ValueError) as exc:
+                print(
+                    f"评测输入或工作簿验证失败：{exc}",
+                    file=sys.stderr,
+                )
+                return 2
+            except (WorkbookPersistenceError, OSError) as exc:
+                print(
+                    f"评测运行或落盘失败：{_safe_error(exc)}",
+                    file=sys.stderr,
+                )
+                return 3
+            except Exception as exc:
+                print(
+                    f"评测运行或落盘失败：{_safe_error(exc)}",
+                    file=sys.stderr,
+                )
+                return 3
+
+            output_payload = {
                 "运行ID": run_id,
                 "运行目录": str(run_dir),
                 "总题数": summary.get("总题数", len(results)),
                 "平均分": summary.get("平均分", 0),
                 "保守通过率": summary.get("保守通过率", 0),
                 "工作簿已回填": not args.no_xlsx,
-            },
-            ensure_ascii=False,
-        )
-    )
+            }
+    except (WorkbookPersistenceError, OSError) as exc:
+        print(f"评测落盘失败：{_safe_error(exc)}", file=sys.stderr)
+        return 3
+
+    print(json.dumps(output_payload, ensure_ascii=False))
     return 0
 
 
@@ -235,6 +288,9 @@ def _git_commit() -> str:
 
 
 def _safe_error(exc: Exception) -> str:
+    if isinstance(exc, WorkbookPersistenceError):
+        text = str(exc).strip()
+        return text[:300] if text else "评测持久化失败"
     if isinstance(exc, OSError):
         return type(exc).__name__
     text = str(exc).strip()
