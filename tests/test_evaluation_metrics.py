@@ -189,6 +189,21 @@ def test_deterministic_score_tolerates_malformed_collections_and_indexes(
     assert score.retrieved_chunk_ids == []
 
 
+def test_bool_evidence_index_is_not_treated_as_index_one() -> None:
+    score = score_deterministic(
+        _item(),
+        {
+            "retrieval_evidences": [{"chunk_id": "c1"}],
+            "citations": [{"evidence_index": True}],
+        },
+        {"c1", "c2"},
+    )
+
+    assert score.retrieval_score == 7.5
+    assert score.citation_score == 0.0
+    assert score.total == 7.5
+
+
 @pytest.mark.parametrize(
     ("total", "grade"),
     [(85, "优秀"), (84.99, "合格"), (75, "合格"), (74.99, "不合格")],
@@ -367,22 +382,114 @@ def test_summarize_fifty_results_keeps_failures_in_conservative_denominator() ->
         "平均黄金chunk召回率": 0.5,
         "平均引用及黄金来源命中得分": 10.0,
     }
-    assert summary["溯源状态分层"]["完整支持"]["数量"] == 38
-    assert summary["溯源状态分层"]["部分支持"]["数量"] == 11
-    assert summary["溯源状态分层"]["未定位"]["数量"] == 1
+    assert summary["溯源状态分层"] == {
+        "完整支持": {
+            "数量": 38,
+            "通过数": 30,
+            "通过率": 30 / 38,
+            "平均分": 75.0,
+        },
+        "部分支持": {
+            "数量": 11,
+            "通过数": 0,
+            "通过率": 0.0,
+            "平均分": 50.0,
+        },
+        "未定位": {
+            "数量": 1,
+            "通过数": 0,
+            "通过率": 0.0,
+            "平均分": 50.0,
+        },
+    }
     assert summary["错误标签频次"] == {"裁判执行失败": 2, "问答执行失败": 1}
 
 
-def test_summarize_uses_linear_interpolation_for_percentiles() -> None:
+def test_evidence_rates_use_only_traced_rows_but_rule_average_uses_all_rows() -> None:
     summary = summarize_results(
         [
-            _result(0, total_score=0, grade="不合格"),
-            _result(1, total_score=100, grade="优秀"),
+            _result(
+                0,
+                trace_status="完整支持",
+                deterministic_scores=_scores(
+                    total=2,
+                    primary_chunk_hit=True,
+                    gold_chunk_recall=0,
+                ),
+            ),
+            _result(
+                1,
+                trace_status="部分支持",
+                total_score=None,
+                grade="评测失败",
+                status="评测失败",
+                error_tags=["裁判执行失败"],
+                deterministic_scores=_scores(
+                    total=7,
+                    primary_chunk_hit=False,
+                    gold_chunk_recall=1,
+                ),
+            ),
+            _result(
+                2,
+                trace_status="未定位",
+                deterministic_scores=_scores(
+                    total=15,
+                    primary_chunk_hit=True,
+                    gold_chunk_recall=1,
+                ),
+            ),
         ]
     )
 
-    assert summary["分数P50"] == 50.0
-    assert summary["分数P95"] == 95.0
+    assert summary["证据指标"] == {
+        "主chunk命中率": 0.5,
+        "平均黄金chunk召回率": 0.5,
+        "平均引用及黄金来源命中得分": 8.0,
+    }
+
+
+def test_average_gold_chunk_recall_preserves_exact_two_thirds_ratio() -> None:
+    summary = summarize_results(
+        [
+            _result(
+                0,
+                deterministic_scores=_scores(gold_chunk_recall=0),
+            ),
+            _result(
+                1,
+                trace_status="部分支持",
+                deterministic_scores=_scores(gold_chunk_recall=1),
+            ),
+            _result(
+                2,
+                deterministic_scores=_scores(gold_chunk_recall=1),
+            ),
+        ]
+    )
+
+    assert summary["证据指标"]["平均黄金chunk召回率"] == 2 / 3
+
+
+def test_answer_failure_zero_changes_linear_interpolated_percentiles() -> None:
+    summary = summarize_results(
+        [
+            _result(
+                0,
+                total_score=0,
+                grade="问答失败",
+                status="问答失败",
+                error_tags=["问答执行失败"],
+            ),
+            _result(1, total_score=80, grade="合格"),
+            _result(2, total_score=90, grade="优秀"),
+            _result(3, total_score=100, grade="优秀"),
+        ]
+    )
+
+    assert summary["有效评分题数"] == 4
+    assert summary["分数P50"] == 85.0
+    assert summary["分数P95"] == 98.5
 
 
 def test_summarize_empty_results_has_zero_values_and_all_trace_layers() -> None:
@@ -397,16 +504,54 @@ def test_summarize_empty_results_has_zero_values_and_all_trace_layers() -> None:
         assert layer == {"数量": 0, "通过数": 0, "通过率": 0, "平均分": 0}
 
 
-def test_summary_uses_chinese_business_keys_recursively() -> None:
+def test_summary_has_exact_chinese_business_key_sets() -> None:
     summary = summarize_results([])
 
-    def assert_chinese_keys(value: object) -> None:
+    assert set(summary) == {
+        "总题数",
+        "评测失败数",
+        "问答失败数",
+        "有效评分题数",
+        "保守通过率",
+        "有效通过率",
+        "优秀率",
+        "问答成功率",
+        "平均分",
+        "分数P50",
+        "分数P95",
+        "证据指标",
+        "溯源状态分层",
+        "错误标签频次",
+    }
+    assert set(summary["证据指标"]) == {
+        "主chunk命中率",
+        "平均黄金chunk召回率",
+        "平均引用及黄金来源命中得分",
+    }
+    assert set(summary["溯源状态分层"]) == {
+        "完整支持",
+        "部分支持",
+        "未定位",
+    }
+    for layer in summary["溯源状态分层"].values():
+        assert set(layer) == {"数量", "通过数", "通过率", "平均分"}
+
+    allowed_technical_keys = {
+        "分数P50",
+        "分数P95",
+        "主chunk命中率",
+        "平均黄金chunk召回率",
+    }
+
+    def assert_no_unapproved_english(value: object) -> None:
         if isinstance(value, dict):
             for key, child in value.items():
                 assert re.search(r"[\u4e00-\u9fff]", key), key
-                assert_chinese_keys(child)
+                if key not in allowed_technical_keys:
+                    assert not re.search(r"[A-Za-z]", key), key
+                assert_no_unapproved_english(child)
         elif isinstance(value, list):
             for child in value:
-                assert_chinese_keys(child)
+                assert_no_unapproved_english(child)
 
-    assert_chinese_keys(summary)
+    assert_no_unapproved_english(summary)

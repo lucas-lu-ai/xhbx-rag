@@ -196,6 +196,12 @@ def summarize_results(results: list[EvaluationResult]) -> dict[str, Any]:
         for result in results
         if result.deterministic_scores is not None
     ]
+    traced_deterministic_rows = [
+        result.deterministic_scores
+        for result in results
+        if result.trace_status != "未定位"
+        and result.deterministic_scores is not None
+    ]
 
     trace_layers: dict[str, dict[str, int | float]] = {}
     for trace_status in TRACE_STATUSES:
@@ -236,11 +242,17 @@ def summarize_results(results: list[EvaluationResult]) -> dict[str, Any]:
         "分数P95": _percentile(valid_scores, 0.95),
         "证据指标": {
             "主chunk命中率": _ratio(
-                sum(score.primary_chunk_hit for score in deterministic_rows),
-                len(deterministic_rows),
+                sum(
+                    score.primary_chunk_hit
+                    for score in traced_deterministic_rows
+                ),
+                len(traced_deterministic_rows),
             ),
-            "平均黄金chunk召回率": _average(
-                [score.gold_chunk_recall for score in deterministic_rows]
+            "平均黄金chunk召回率": _mean_ratio(
+                [
+                    score.gold_chunk_recall
+                    for score in traced_deterministic_rows
+                ]
             ),
             "平均引用及黄金来源命中得分": _average(
                 [score.total for score in deterministic_rows]
@@ -253,6 +265,10 @@ def summarize_results(results: list[EvaluationResult]) -> dict[str, Any]:
 
 def _ratio(numerator: int | float, denominator: int) -> float:
     return numerator / denominator if denominator else 0.0
+
+
+def _mean_ratio(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
 
 
 def _average(values: list[float]) -> float:
