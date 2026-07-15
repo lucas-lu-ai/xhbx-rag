@@ -500,3 +500,39 @@ MILVUS_TOKEN=
 如果 Docker Milvus 启用了鉴权，把 `MILVUS_TOKEN` 设置为对应 token；未启用鉴权时留空。本项目只根据配置选择连接方式，不负责启动 Docker 服务。
 
 `MILVUS_VECTOR_DIM` 可以留空。首次入库时会根据 embedding 返回向量长度自动创建 collection。
+
+## 问答智能体评测
+
+评测命令直接调用本地问答代码，只使用宿主机上的 Docker Milvus，不需要启动 API、Web 或 A2A 服务。先启动 `standalone`；Compose 会同时拉起它依赖的 etcd 和 MinIO：
+
+```bash
+docker compose up -d standalone
+```
+
+`.env` 必须使用以下 Milvus 配置，评测命令不会清空、重建或写入 Milvus；目标 collection 不存在或为空时会以退出码 `2` 停止：
+
+```env
+MILVUS_MODE=docker
+MILVUS_URI=http://localhost:19530
+```
+
+工作簿的抽取、回填和验证只使用 bundled `@oai/artifact-tool`。运行前设置 bundled Node 环境：
+
+```bash
+export EVALUATION_NODE_BIN=/Users/milan/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node
+export EVALUATION_ARTIFACT_NODE_MODULES=/Users/milan/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules
+```
+
+运行完整 50 条评测并将全中文结果安全回填到原工作簿：
+
+```bash
+uv run xhbx-rag evaluate \
+  --dataset 'docs/新华保险AI教练问答一批绩优案例测试集-含完整溯源.xlsx' \
+  --output-dir outputs/evaluations \
+  --concurrency 2 \
+  --judge-concurrency 2
+```
+
+每次运行会生成中文 `run.json`、`results.jsonl` 和 `report.md`。50 条结果全部进入总体指标，保守通过率分母固定为 50。未同时配置 `EVAL_BASE_URL`、`EVAL_API_KEY`、`EVAL_MODEL_NAME` 时，裁判回退到问答模型，并在报告和工作簿中明确标记“同模型裁判：是”。
+
+回填前，源文件会逐字节备份为 `outputs/evaluations/<运行ID>/input-backup.xlsx`；候选工作簿只有在结构、原始内容、公式和五张工作表预览全部验证通过后，才会原子替换源文件。用 `--no-xlsx` 可只生成报告和检查点；小规模冒烟评测应同时使用 `--limit` 与 `--no-xlsx`。`--resume <运行ID>` 可在运行指纹一致时断点续跑。

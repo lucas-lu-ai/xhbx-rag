@@ -13,6 +13,7 @@ from .config import RetrievalConfig
 from .course_enrichment import CourseEnrichmentAgentScopeAgent
 from .course_parser import parse_course_dir
 from .embedding import EmbeddingClient
+from .evaluation.command import run_evaluate_command
 from .indexer import index_chunks
 from .milvus_store import (
     MilvusStore,
@@ -130,6 +131,24 @@ def _build_parser() -> argparse.ArgumentParser:
         description="解析销售洞察文件并生成 RAG 入库前产物",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+    evaluate_parser = subparsers.add_parser(
+        "evaluate",
+        help="使用 Docker Milvus 运行问答智能体评测并生成中文报告",
+    )
+    evaluate_parser.add_argument("--dataset", required=True, type=Path)
+    evaluate_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("outputs/evaluations"),
+    )
+    evaluate_parser.add_argument("--concurrency", type=int, default=2)
+    evaluate_parser.add_argument("--judge-concurrency", type=int, default=2)
+    evaluate_parser.add_argument("--top-n", type=int, default=20)
+    evaluate_parser.add_argument("--top-k", type=int, default=5)
+    evaluate_parser.add_argument("--limit", type=int, default=None)
+    evaluate_parser.add_argument("--item-id", action="append", default=None)
+    evaluate_parser.add_argument("--resume", default=None)
+    evaluate_parser.add_argument("--no-xlsx", action="store_true")
     parse_parser = subparsers.add_parser("parse", help="解析 case.sales_insights.json")
     parse_parser.add_argument("--insights", required=True, type=Path)
     parse_parser.add_argument("--playbook", type=Path, default=None)
@@ -620,6 +639,8 @@ def _generation_result_payload(result) -> dict:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if args.command == "evaluate":
+        return run_evaluate_command(args)
     if args.command == "parse":
         return _cmd_parse(args)
     if args.command == "generate-insights":

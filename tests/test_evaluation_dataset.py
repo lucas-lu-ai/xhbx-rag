@@ -83,7 +83,16 @@ def _workbook_with_extra_main_row(tmp_path: Path) -> Path:
 import { FileBlob, SpreadsheetFile } from "@oai/artifact-tool";
 const input = await FileBlob.load(process.env.EVALUATION_TEST_INPUT);
 const workbook = await SpreadsheetFile.importXlsx(input);
-const sheet = workbook.worksheets.getItem("绩优案例测试-楚琦");
+const candidates = ["绩优案例测试", "绩优案例测试-楚琦"]
+  .map((name) => {
+    try { return workbook.worksheets.getItem(name); }
+    catch { return null; }
+  })
+  .filter((sheet) => sheet !== null);
+if (candidates.length !== 1) {
+  throw new Error(`主表候选数量必须为 1，实际为 ${candidates.length}`);
+}
+const sheet = candidates[0];
 sheet.getRange("A52:E52").values = [[
   "不应被忽略的额外问题",
   "不应被忽略的额外参考答案",
@@ -99,6 +108,55 @@ await output.save(process.env.EVALUATION_TEST_OUTPUT);
         {
             "EVALUATION_TEST_INPUT": str(REAL_WORKBOOK),
             "EVALUATION_TEST_OUTPUT": str(output_path),
+        }
+    )
+    subprocess.run(
+        [str(FIXED_NODE_BIN), "--input-type=module", "--eval", script],
+        cwd=runtime_dir,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return output_path
+
+
+def _workbook_with_main_sheet_names(
+    tmp_path: Path,
+    names: list[str],
+) -> Path:
+    runtime_dir = tmp_path / ("fixture-names-" + str(len(names)))
+    runtime_dir.mkdir()
+    (runtime_dir / "node_modules").symlink_to(
+        FIXED_NODE_MODULES,
+        target_is_directory=True,
+    )
+    output_path = tmp_path / ("候选主表-" + "-".join(names) + ".xlsx")
+    script = """
+import { FileBlob, SpreadsheetFile, Workbook } from "@oai/artifact-tool";
+const source = await SpreadsheetFile.importXlsx(
+  await FileBlob.load(process.env.EVALUATION_TEST_INPUT),
+);
+let main;
+try { main = source.worksheets.getItem("绩优案例测试"); }
+catch { main = source.worksheets.getItem("绩优案例测试-楚琦"); }
+const mainValues = main.getRange("A1:E51").values;
+const detailValues = source.worksheets.getItem("溯源明细").getUsedRange().values;
+const workbook = Workbook.create();
+for (const name of JSON.parse(process.env.EVALUATION_TEST_NAMES)) {
+  workbook.worksheets.add(name).getRange("A1:E51").values = mainValues;
+}
+const detail = workbook.worksheets.add("溯源明细");
+detail.getRangeByIndexes(0, 0, detailValues.length, detailValues[0].length).values = detailValues;
+const output = await SpreadsheetFile.exportXlsx(workbook);
+await output.save(process.env.EVALUATION_TEST_OUTPUT);
+"""
+    env = os.environ.copy()
+    env.update(
+        {
+            "EVALUATION_TEST_INPUT": str(REAL_WORKBOOK),
+            "EVALUATION_TEST_OUTPUT": str(output_path),
+            "EVALUATION_TEST_NAMES": json.dumps(names, ensure_ascii=False),
         }
     )
     subprocess.run(
@@ -482,7 +540,13 @@ def test_workbook_adapter_extracts_real_workbook_without_modifying_source(
         "部分支持": 11,
         "未定位": 1,
     }
-    assert set(payload) == {"评测项"}
+    assert set(payload) == {"评测项", "工作簿快照"}
+    assert payload["工作簿快照"]["主表名称"] in {
+        "绩优案例测试-楚琦",
+        "绩优案例测试",
+    }
+    assert len(payload["工作簿快照"]["主表A:E"]) == 51
+    assert payload["工作簿快照"]["溯源明细"][0][0] == "评测行号"
     assert set(payload["评测项"][0]) == {
         "评测项ID",
         "Excel行号",
@@ -615,6 +679,46 @@ def test_workbook_adapter_extracts_to_missing_unicode_output_directory(
 
     payload = json.loads(output_path.read_text(encoding="utf-8"))
     assert len(payload["评测项"]) == 50
+
+
+def test_workbook_adapter_extracts_legacy_main_sheet_name(tmp_path: Path) -> None:
+    input_path = _workbook_with_main_sheet_names(
+        tmp_path,
+        ["绩优案例测试-楚琦"],
+    )
+    output_path = tmp_path / "legacy.json"
+    adapter = WorkbookAdapter(
+        tmp_path / "run",
+        env={
+            "EVALUATION_NODE_BIN": str(FIXED_NODE_BIN),
+            "EVALUATION_ARTIFACT_NODE_MODULES": str(FIXED_NODE_MODULES),
+        },
+    )
+
+    adapter.extract(input_path, output_path)
+
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload["工作簿快照"]["主表名称"] == "绩优案例测试-楚琦"
+    assert len(load_dataset(output_path)) == 50
+
+
+def test_workbook_adapter_rejects_ambiguous_main_sheet_names(
+    tmp_path: Path,
+) -> None:
+    input_path = _workbook_with_main_sheet_names(
+        tmp_path,
+        ["绩优案例测试", "绩优案例测试-楚琦"],
+    )
+    adapter = WorkbookAdapter(
+        tmp_path / "run",
+        env={
+            "EVALUATION_NODE_BIN": str(FIXED_NODE_BIN),
+            "EVALUATION_ARTIFACT_NODE_MODULES": str(FIXED_NODE_MODULES),
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="主表名称存在歧义"):
+        adapter.extract(input_path, tmp_path / "ambiguous.json")
 
 
 def test_workbook_adapter_rejects_nonempty_main_row_52(tmp_path: Path) -> None:
