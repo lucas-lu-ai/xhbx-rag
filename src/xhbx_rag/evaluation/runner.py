@@ -17,7 +17,7 @@ from urllib.parse import urlsplit
 
 import httpx
 from pymilvus import MilvusClient
-from pymilvus.client.types import Status
+from pymilvus.client.types import LoadState, Status
 from pymilvus.exceptions import (
     ConnectError,
     ConnectionNotExistException,
@@ -45,6 +45,7 @@ from xhbx_rag.web.services import answer_question
 ANSWER_FAILURE_SUMMARY = "问答执行失败，请稍后重试"
 JUDGE_FAILURE_SUMMARY = "裁判执行失败，请稍后重试"
 LOCAL_DOCKER_MILVUS_URI = "http://localhost:19530"
+PREFLIGHT_LOAD_TIMEOUT_SECONDS = 30.0
 
 
 class EvaluationPreflightError(RuntimeError):
@@ -87,7 +88,10 @@ def preflight_docker_milvus(
 
     client: Any | None = None
     stats: dict[str, dict[str, bool | int]] = {}
-    client_kwargs: dict[str, str] = {"uri": config.milvus_uri}
+    client_kwargs: dict[str, object] = {
+        "uri": config.milvus_uri,
+        "timeout": PREFLIGHT_LOAD_TIMEOUT_SECONDS,
+    }
     if config.milvus_token:
         client_kwargs["token"] = config.milvus_token
 
@@ -95,12 +99,16 @@ def preflight_docker_milvus(
         client = client_factory(**client_kwargs)
         for collection_name in configured_collection_names(config):
             exists = bool(
-                client.has_collection(collection_name=collection_name)
+                client.has_collection(
+                    collection_name=collection_name,
+                    timeout=PREFLIGHT_LOAD_TIMEOUT_SECONDS,
+                )
             )
             row_count = 0
             if exists:
                 raw_stats = client.get_collection_stats(
-                    collection_name=collection_name
+                    collection_name=collection_name,
+                    timeout=PREFLIGHT_LOAD_TIMEOUT_SECONDS,
                 )
                 raw_count = (
                     raw_stats.get("row_count")
@@ -108,6 +116,8 @@ def preflight_docker_milvus(
                     else None
                 )
                 row_count = _row_count(raw_count)
+                if row_count > 0:
+                    _require_collection_loadable(client, collection_name)
             stats[collection_name] = {"存在": exists, "数据量": row_count}
     except EvaluationPreflightError:
         raise
@@ -125,6 +135,28 @@ def preflight_docker_milvus(
     if not any(int(row["数据量"]) > 0 for row in stats.values()):
         raise EvaluationPreflightError("Docker Milvus 目标 collection 均为空")
     return stats
+
+
+def _require_collection_loadable(client: Any, collection_name: str) -> None:
+    try:
+        client.load_collection(
+            collection_name=collection_name,
+            timeout=PREFLIGHT_LOAD_TIMEOUT_SECONDS,
+        )
+        raw_state = client.get_load_state(
+            collection_name=collection_name,
+            timeout=PREFLIGHT_LOAD_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        raise EvaluationPreflightError(
+            f"Docker Milvus collection 无法加载：{collection_name}"
+        ) from None
+
+    state = raw_state.get("state") if isinstance(raw_state, Mapping) else None
+    if state != LoadState.Loaded:
+        raise EvaluationPreflightError(
+            f"Docker Milvus collection 无法加载：{collection_name}"
+        )
 
 
 def _row_count(value: object) -> int:

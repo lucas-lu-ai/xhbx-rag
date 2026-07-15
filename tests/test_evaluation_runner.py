@@ -11,7 +11,7 @@ from typing import Any, Callable
 
 import httpx
 import pytest
-from pymilvus.client.types import Status
+from pymilvus.client.types import LoadState, Status
 from pymilvus.exceptions import ConnectError, MilvusException, ParamError
 
 from xhbx_rag.config import ConfigError, RetrievalConfig
@@ -147,17 +147,49 @@ class _Answer:
 
 
 class _ReadOnlyMilvusClient:
-    def __init__(self, counts: dict[str, object]) -> None:
+    def __init__(
+        self,
+        counts: dict[str, object],
+        *,
+        load_states: dict[str, LoadState] | None = None,
+    ) -> None:
         self.counts = counts
+        self.load_states = load_states or {}
         self.calls: list[tuple[str, str | None]] = []
 
-    def has_collection(self, *, collection_name: str) -> bool:
-        self.calls.append(("has_collection", collection_name))
+    def has_collection(self, *, collection_name: str, timeout: float) -> bool:
+        self.calls.append((f"has_collection:{timeout:g}", collection_name))
         return collection_name in self.counts
 
-    def get_collection_stats(self, *, collection_name: str) -> dict[str, object]:
-        self.calls.append(("get_collection_stats", collection_name))
+    def get_collection_stats(
+        self,
+        *,
+        collection_name: str,
+        timeout: float,
+    ) -> dict[str, object]:
+        self.calls.append(
+            (f"get_collection_stats:{timeout:g}", collection_name)
+        )
         return {"row_count": self.counts[collection_name]}
+
+    def load_collection(
+        self,
+        *,
+        collection_name: str,
+        timeout: float,
+    ) -> None:
+        self.calls.append((f"load_collection:{timeout:g}", collection_name))
+
+    def get_load_state(
+        self,
+        *,
+        collection_name: str,
+        timeout: float,
+    ) -> dict[str, LoadState]:
+        self.calls.append((f"get_load_state:{timeout:g}", collection_name))
+        return {
+            "state": self.load_states.get(collection_name, LoadState.Loaded)
+        }
 
     def close(self) -> None:
         self.calls.append(("close", None))
@@ -210,7 +242,7 @@ def test_preflight_rejects_non_local_docker_uri_without_constructing_client() ->
     assert constructed is False
 
 
-def test_preflight_is_read_only_omits_empty_token_and_returns_chinese_stats() -> None:
+def test_preflight_loads_nonempty_collections_with_bounded_rpc_timeouts() -> None:
     client = _ReadOnlyMilvusClient({"case": 3, "course": 5})
     received_kwargs: dict[str, object] = {}
 
@@ -223,16 +255,23 @@ def test_preflight_is_read_only_omits_empty_token_and_returns_chinese_stats() ->
         client_factory=factory,
     )
 
-    assert received_kwargs == {"uri": "http://localhost:19530"}
+    assert received_kwargs == {
+        "uri": "http://localhost:19530",
+        "timeout": 30.0,
+    }
     assert stats == {
         "case": {"存在": True, "数据量": 3},
         "course": {"存在": True, "数据量": 5},
     }
     assert client.calls == [
-        ("has_collection", "case"),
-        ("get_collection_stats", "case"),
-        ("has_collection", "course"),
-        ("get_collection_stats", "course"),
+        ("has_collection:30", "case"),
+        ("get_collection_stats:30", "case"),
+        ("load_collection:30", "case"),
+        ("get_load_state:30", "case"),
+        ("has_collection:30", "course"),
+        ("get_collection_stats:30", "course"),
+        ("load_collection:30", "course"),
+        ("get_load_state:30", "course"),
         ("close", None),
     ]
 
@@ -252,6 +291,7 @@ def test_preflight_passes_non_empty_token() -> None:
     assert received_kwargs == {
         "uri": "http://localhost:19530",
         "token": "milvus-secret",
+        "timeout": 30.0,
     }
 
 
@@ -264,6 +304,26 @@ def test_preflight_rejects_all_missing_or_empty_collections() -> None:
             client_factory=lambda **_kwargs: client,
         )
 
+    assert client.calls[-1] == ("close", None)
+
+
+def test_preflight_rejects_nonempty_collection_stuck_loading() -> None:
+    client = _ReadOnlyMilvusClient(
+        {"case": 3, "course": 0},
+        load_states={"case": LoadState.Loading},
+    )
+
+    with pytest.raises(
+        EvaluationPreflightError,
+        match="collection 无法加载：case",
+    ):
+        preflight_docker_milvus(
+            _retrieval_config(),
+            client_factory=lambda **_kwargs: client,
+        )
+
+    assert ("load_collection:30", "case") in client.calls
+    assert ("get_load_state:30", "case") in client.calls
     assert client.calls[-1] == ("close", None)
 
 
