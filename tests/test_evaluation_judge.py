@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from collections.abc import Iterable
 from typing import Any
 
@@ -777,6 +778,140 @@ def test_http_error_after_format_retry_clears_prior_sensitive_locals(
     assert prior_output not in sensitive_text
 
 
+def test_success_return_clears_all_sensitive_evaluate_locals() -> None:
+    client = FakeClient([valid_judge_response()])
+    agent = EvaluationJudgeAgent(make_config(), http_client=client)
+    item = make_item().model_copy(
+        update={"question": f"成功路径敏感问题-{API_KEY}"}
+    )
+    answer_response = {
+        **make_answer(),
+        "answer": f"成功路径敏感回答-{API_KEY}",
+    }
+    return_locals: list[dict[str, object]] = []
+
+    def capture_evaluate_return(frame: Any, event: str, arg: object) -> None:
+        if (
+            event == "return"
+            and frame.f_code is EvaluationJudgeAgent.evaluate.__code__
+        ):
+            return_locals.append(dict(frame.f_locals))
+
+    sys.setprofile(capture_evaluate_return)
+    try:
+        result = agent.evaluate(item, answer_response)
+    finally:
+        sys.setprofile(None)
+
+    assert result.correctness_score == 30
+    assert return_locals
+    _assert_no_sensitive_runtime_state(
+        return_locals,
+        API_KEY,
+        item.question,
+        answer_response["answer"],
+    )
+
+
+def test_closed_owned_client_runtime_error_becomes_safe_judge_error() -> None:
+    agent = EvaluationJudgeAgent(make_config(judge_retry_attempts=0))
+    item = make_item().model_copy(
+        update={"question": f"关闭客户端敏感问题-{API_KEY}"}
+    )
+    answer_response = {
+        **make_answer(),
+        "answer": f"关闭客户端敏感回答-{API_KEY}",
+    }
+    agent.close()
+
+    with pytest.raises(
+        JudgeEvaluationError,
+        match="裁判执行失败，请稍后重试",
+    ) as exc_info:
+        agent.evaluate(item, answer_response)
+
+    _assert_safe_unexpected_failure(
+        exc_info.value,
+        API_KEY,
+        item.question,
+        answer_response["answer"],
+        "Cannot send a request",
+    )
+
+
+def test_build_runtime_error_becomes_safe_judge_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item = make_item().model_copy(
+        update={"question": f"构建阶段敏感问题-{API_KEY}"}
+    )
+    answer_response = {
+        **make_answer(),
+        "answer": f"构建阶段敏感回答-{API_KEY}",
+    }
+    monkeypatch.setattr(
+        judge_module,
+        "build_judge_messages",
+        _raise_sensitive_build_error,
+    )
+    agent = EvaluationJudgeAgent(
+        make_config(judge_retry_attempts=0),
+        http_client=FakeClient([]),
+    )
+
+    with pytest.raises(
+        JudgeEvaluationError,
+        match="裁判执行失败，请稍后重试",
+    ) as exc_info:
+        agent.evaluate(item, answer_response)
+
+    _assert_safe_unexpected_failure(
+        exc_info.value,
+        API_KEY,
+        item.question,
+        answer_response["answer"],
+        "构建 helper 原始异常",
+    )
+
+
+def test_parser_runtime_error_becomes_safe_judge_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sensitive_output = f"解析阶段模型原文-{API_KEY}"
+    monkeypatch.setattr(
+        judge_module,
+        "strip_json_fences",
+        _raise_sensitive_parse_error,
+    )
+    client = FakeClient([response_with_content(sensitive_output)])
+    agent = EvaluationJudgeAgent(
+        make_config(judge_retry_attempts=0),
+        http_client=client,
+    )
+    item = make_item().model_copy(
+        update={"question": f"解析阶段敏感问题-{API_KEY}"}
+    )
+    answer_response = {
+        **make_answer(),
+        "answer": f"解析阶段敏感回答-{API_KEY}",
+    }
+
+    with pytest.raises(
+        JudgeEvaluationError,
+        match="裁判执行失败，请稍后重试",
+    ) as exc_info:
+        agent.evaluate(item, answer_response)
+
+    _assert_safe_unexpected_failure(
+        exc_info.value,
+        API_KEY,
+        item.question,
+        answer_response["answer"],
+        sensitive_output,
+        "解析 helper 原始异常",
+    )
+
+
 def test_injected_client_is_not_closed_by_agent_context_manager() -> None:
     client = FakeClient([valid_judge_response()])
 
@@ -825,6 +960,87 @@ def _judge_traceback_locals(error: BaseException) -> list[dict[str, object]]:
         if current.__context__ is not None:
             pending.append(current.__context__)
     return rows
+
+
+def _exception_runtime_locals(error: BaseException) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        traceback = current.__traceback__
+        while traceback is not None:
+            frame = traceback.tb_frame
+            if not frame.f_code.co_name.startswith("test_"):
+                rows.append(dict(frame.f_locals))
+            traceback = traceback.tb_next
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return rows
+
+
+def _assert_safe_unexpected_failure(
+    error: JudgeEvaluationError,
+    *sensitive_values: str,
+) -> None:
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    runtime_locals = _exception_runtime_locals(error)
+    assert runtime_locals
+    _assert_no_sensitive_runtime_state(
+        {"异常": error, "全部运行帧局部": runtime_locals},
+        *sensitive_values,
+    )
+
+
+def _assert_no_sensitive_runtime_state(
+    value: object,
+    *sensitive_values: str,
+) -> None:
+    sensitive_text = _deep_sensitive_text(value)
+    assert all(text not in sensitive_text for text in sensitive_values)
+    assert not _deep_contains_instance(
+        value,
+        (EvaluationJudgeAgent, EvaluationConfig, JudgeResult),
+    )
+
+
+def _deep_contains_instance(
+    value: object,
+    expected_types: tuple[type[object], ...],
+    seen: set[int] | None = None,
+) -> bool:
+    visited = seen if seen is not None else set()
+    if isinstance(value, expected_types):
+        return True
+    if value is None or isinstance(value, (str, bytes, bool, int, float)):
+        return False
+    if id(value) in visited:
+        return False
+    visited.add(id(value))
+    if isinstance(value, dict):
+        return any(
+            _deep_contains_instance(key, expected_types, visited)
+            or _deep_contains_instance(item, expected_types, visited)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple, set)):
+        return any(
+            _deep_contains_instance(item, expected_types, visited)
+            for item in value
+        )
+    if isinstance(value, BaseException):
+        return _deep_contains_instance(
+            [vars(value), value.__cause__, value.__context__],
+            expected_types,
+            visited,
+        )
+    return False
 
 
 def _deep_sensitive_text(value: object, seen: set[int] | None = None) -> str:
@@ -1013,3 +1229,19 @@ def _unsafe_pii_values() -> list[str]:
         "分隔138-1234-5678",
         "证件11010519491231002X",
     ]
+
+
+def _raise_sensitive_build_error(
+    item: EvaluationItem,
+    answer_response: dict[str, Any],
+    *,
+    secret: str,
+) -> list[dict[str, str]]:
+    raise RuntimeError(
+        "构建 helper 原始异常："
+        f"{secret}；{item.question}；{answer_response['answer']}"
+    )
+
+
+def _raise_sensitive_parse_error(content: str) -> str:
+    raise RuntimeError(f"解析 helper 原始异常：{content}")

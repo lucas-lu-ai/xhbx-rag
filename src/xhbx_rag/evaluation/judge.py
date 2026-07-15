@@ -17,6 +17,7 @@ from xhbx_rag.evaluation.models import ERROR_TAGS, EvaluationItem, JudgeResult
 INVALID_OUTPUT_EXCERPT_CHARS = 2_000
 ERROR_SUMMARY_CHARS = 600
 FINAL_ERROR_CHARS = 800
+UNEXPECTED_JUDGE_ERROR_MESSAGE = "裁判执行失败，请稍后重试"
 QUESTION_CHAR_LIMIT = 2_000
 REFERENCE_ANSWER_CHAR_LIMIT = 3_000
 ANSWER_CHAR_LIMIT = 4_000
@@ -104,109 +105,115 @@ class EvaluationJudgeAgent:
         item: EvaluationItem,
         answer_response: dict[str, Any],
     ) -> JudgeResult:
-        http_client = self.http_client
-        endpoint = (
-            self.config.judge_base_url.rstrip("/") + "/chat/completions"
-        )
-        model_name = self.config.judge_model_name
-        timeout = self.config.judge_timeout
-        retry_attempts = self.config.judge_retry_attempts
-        api_key = self.config.judge_api_key
-        base_messages = build_judge_messages(
-            item,
-            answer_response,
-            secret=api_key,
-        )
-        del item, answer_response
-        messages = base_messages
-        last_error_message = "裁判输出未通过校验"
+        http_client: _JudgeHttpClient | None = None
+        endpoint = ""
+        model_name = ""
+        timeout = 0.0
+        retry_attempts = 0
+        api_key = ""
+        base_messages: list[dict[str, str]] = []
+        messages: list[dict[str, str]] = []
+        last_error_message = ""
+        final_error_message = UNEXPECTED_JUDGE_ERROR_MESSAGE
         response: _JudgeResponse | None = None
         payload: object = None
         content = ""
         invalid_output = ""
         result: JudgeResult | None = None
+        try:
+            http_client = self.http_client
+            endpoint = (
+                self.config.judge_base_url.rstrip("/") + "/chat/completions"
+            )
+            model_name = self.config.judge_model_name
+            timeout = self.config.judge_timeout
+            retry_attempts = self.config.judge_retry_attempts
+            api_key = self.config.judge_api_key
+            base_messages = build_judge_messages(
+                item,
+                answer_response,
+                secret=api_key,
+            )
+            messages = base_messages
+            last_error_message = "裁判输出未通过校验"
 
-        for _attempt in range(retry_attempts + 1):
+            for _attempt in range(retry_attempts + 1):
+                response = None
+                payload = None
+                content = ""
+                invalid_output = ""
+                result = None
+                try:
+                    response = http_client.post(
+                        endpoint,
+                        headers={
+                            "Authorization": f"Bearer {api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "model": model_name,
+                            "messages": messages,
+                            "temperature": 0,
+                            "response_format": {"type": "json_object"},
+                        },
+                        timeout=timeout,
+                    )
+                    response.raise_for_status()
+                except httpx.HTTPError as exc:
+                    _redact_http_error_headers(exc)
+                    raise
+
+                try:
+                    payload = response.json()
+                    invalid_output = _safe_payload_text(payload)
+                    content = _extract_content(payload)
+                    invalid_output = content
+                    result = JudgeResult.model_validate_json(
+                        strip_json_fences(content)
+                    )
+                    require_chinese_explanation(
+                        result.reason,
+                        result.improvement_suggestion,
+                    )
+                    require_safe_judge_result(result, api_key)
+                    return result
+                except (ValidationError, ValueError, RecursionError) as exc:
+                    last_error_message = safe_judge_error(
+                        exc,
+                        secret=api_key,
+                    )
+                    messages = repair_messages(
+                        base_messages,
+                        invalid_output,
+                        exc,
+                        secret=api_key,
+                    )
+
+            final_error_message = last_error_message
+        except httpx.HTTPError:
+            raise
+        except Exception:
+            final_error_message = UNEXPECTED_JUDGE_ERROR_MESSAGE
+        finally:
+            item = None  # type: ignore[assignment]
+            answer_response = {}
+            api_key = ""
+            http_client = None
+            base_messages = []
+            messages = []
             response = None
             payload = None
             content = ""
             invalid_output = ""
             result = None
-            try:
-                response = http_client.post(
-                    endpoint,
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": model_name,
-                        "messages": messages,
-                        "temperature": 0,
-                        "response_format": {"type": "json_object"},
-                    },
-                    timeout=timeout,
-                )
-                response.raise_for_status()
-            except httpx.HTTPError as exc:
-                _redact_http_error_headers(exc)
-                response = None
-                payload = None
-                content = ""
-                invalid_output = ""
-                result = None
-                last_error_message = ""
-                base_messages = []
-                messages = []
-                api_key = ""
-                http_client = None  # type: ignore[assignment]
-                del self
-                raise
+            endpoint = ""
+            model_name = ""
+            timeout = 0.0
+            retry_attempts = 0
+            last_error_message = ""
+            del self
 
-            try:
-                payload = response.json()
-                invalid_output = _safe_payload_text(payload)
-                content = _extract_content(payload)
-                invalid_output = content
-                result = JudgeResult.model_validate_json(
-                    strip_json_fences(content)
-                )
-                require_chinese_explanation(
-                    result.reason,
-                    result.improvement_suggestion,
-                )
-                require_safe_judge_result(result, api_key)
-                return result
-            except (ValidationError, ValueError, RecursionError) as exc:
-                last_error_message = safe_judge_error(
-                    exc,
-                    secret=api_key,
-                )
-                messages = repair_messages(
-                    base_messages,
-                    invalid_output,
-                    exc,
-                    secret=api_key,
-                )
-                response = None
-                payload = None
-                content = ""
-                invalid_output = ""
-                result = None
-
-        final_message = last_error_message
-        last_error_message = ""
-        response = None
-        payload = None
-        content = ""
-        invalid_output = ""
-        result = None
-        base_messages = []
-        messages = []
-        api_key = ""
-        http_client = None  # type: ignore[assignment]
-        del self
-        raise JudgeEvaluationError(final_message)
+        raise JudgeEvaluationError(final_error_message) from None
 
     def close(self) -> None:
         if self._closed:
