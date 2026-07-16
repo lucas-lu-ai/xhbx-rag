@@ -47,6 +47,7 @@ import {
 } from "./sessionSelection";
 import type {
   BatchRunSummary,
+  ChatSession,
   ChatTurn,
   IngestionJobDetail,
   IngestionJobProgress,
@@ -131,6 +132,7 @@ export function App({
   const [status, setStatus] = useState<StatusResponse>(emptyStatus);
   const [statusError, setStatusError] = useState("");
   const [sessionStore, setSessionStore] = useState(loadChatSessions);
+  const [draftSession, setDraftSession] = useState<ChatSession | null>(null);
   const [batchRuns, setBatchRuns] = useState<BatchRunSummary[]>([]);
   const [batchRunsLoaded, setBatchRunsLoaded] = useState(false);
   const [batchRunsError, setBatchRunsError] = useState("");
@@ -500,6 +502,9 @@ export function App({
 
   // 选中态归一：批量按原样保留，聊天校验会话存在性后回退。
   const effectiveSelection = useMemo<SessionSelection>(() => {
+    if (draftSession) {
+      return { kind: "chat", id: draftSession.id };
+    }
     if (selection?.kind === "batch") {
       return selection;
     }
@@ -512,9 +517,16 @@ export function App({
       kind: "chat",
       id: exists ? candidateId : findActiveSession(sessionStore).id
     };
-  }, [selection, sessionStore]);
+  }, [draftSession, selection, sessionStore]);
 
   const activeChatSession = useMemo(() => {
+    if (
+      draftSession &&
+      effectiveSelection.kind === "chat" &&
+      effectiveSelection.id === draftSession.id
+    ) {
+      return draftSession;
+    }
     if (effectiveSelection.kind !== "chat") {
       return findActiveSession(sessionStore);
     }
@@ -523,15 +535,17 @@ export function App({
         (session) => session.id === effectiveSelection.id
       ) ?? findActiveSession(sessionStore)
     );
-  }, [effectiveSelection, sessionStore]);
+  }, [draftSession, effectiveSelection, sessionStore]);
 
   useEffect(() => {
     persistChatSessions(sessionStore);
   }, [sessionStore]);
 
   useEffect(() => {
-    persistSessionSelection(effectiveSelection);
-  }, [effectiveSelection]);
+    if (!draftSession) {
+      persistSessionSelection(effectiveSelection);
+    }
+  }, [draftSession, effectiveSelection]);
 
   useEffect(() => {
     let active = true;
@@ -640,6 +654,7 @@ export function App({
   );
 
   function selectSession(nextSelection: SessionSelection) {
+    setDraftSession(null);
     setSelection(nextSelection);
     setCreatingBatch(false);
     setDeleteError("");
@@ -653,16 +668,14 @@ export function App({
   }
 
   function createSession() {
-    const session = createEmptySession();
-    setSessionStore((current) => ({
-      ...current,
-      active_session_id: session.id,
-      sessions: [session, ...current.sessions]
-    }));
-    selectSession({ kind: "chat", id: session.id });
+    setDraftSession(createEmptySession());
+    setCreatingBatch(false);
+    setDeleteError("");
+    resetEvidenceSelection();
   }
 
   function startBatchCreate() {
+    setDraftSession(null);
     setCreatingBatch(true);
     setDeleteError("");
     resetEvidenceSelection();
@@ -706,6 +719,43 @@ export function App({
         mergeSessionEntries(sessionStore.sessions, remainingRuns)
       );
       selectSession(fallback ?? { kind: "chat", id: activeChatSession.id });
+    }
+  }
+
+  function startSessionTurn(
+    sessionId: string,
+    turn: ChatTurn,
+    title?: string
+  ) {
+    const now = new Date().toISOString();
+    setSessionStore((current) => {
+      const updated = updateSession(current, sessionId, (session) => ({
+        ...session,
+        title: title ?? session.title,
+        turns: [...session.turns, turn],
+        updated_at: now
+      }));
+      if (updated !== current) {
+        return updated;
+      }
+      if (!draftSession || draftSession.id !== sessionId) {
+        return current;
+      }
+      const session: ChatSession = {
+        ...draftSession,
+        title: title ?? draftSession.title,
+        turns: [turn],
+        updated_at: now
+      };
+      return {
+        ...current,
+        active_session_id: session.id,
+        sessions: [session, ...current.sessions]
+      };
+    });
+    if (draftSession?.id === sessionId) {
+      setDraftSession(null);
+      setSelection({ kind: "chat", id: sessionId });
     }
   }
 
@@ -1121,6 +1171,7 @@ export function App({
           <ChatView
             key={activeChatSession.id}
             session={activeChatSession}
+            onStartTurn={startSessionTurn}
             onUpdateSession={updateSessionTurns}
             topN={status.web_retrieval_top_n}
             topK={status.web_retrieval_top_k}

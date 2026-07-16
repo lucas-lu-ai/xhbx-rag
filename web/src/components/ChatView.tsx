@@ -27,6 +27,11 @@ import { ThinkingProcess } from "./ThinkingProcess";
 
 type ChatViewProps = {
   session: ChatSession;
+  onStartTurn: (
+    sessionId: string,
+    turn: ChatTurn,
+    title?: string
+  ) => void;
   onUpdateSession: (
     sessionId: string,
     updater: (turns: ChatTurn[]) => ChatTurn[],
@@ -38,6 +43,7 @@ type ChatViewProps = {
 
 export function ChatView({
   session,
+  onStartTurn,
   onUpdateSession,
   topN,
   topK
@@ -70,9 +76,9 @@ export function ChatView({
     setFormError("");
     const id = makeTurnId();
     const submittedSessionId = session.id;
-    onUpdateSession(
+    onStartTurn(
       submittedSessionId,
-      (items) => [...items, makeStreamingTurn(id, trimmed, topN, topK)],
+      makeStreamingTurn(id, trimmed, topN, topK),
       sessionTitleForQuestion(session, trimmed)
     );
     setQuery("");

@@ -100,7 +100,7 @@ test("restores persisted sessions after reload", async () => {
   expect(screen.getByText("先承接预算，再讨论缴费期和保障缺口。")).toBeInTheDocument();
 });
 
-test("creates and switches sessions", async () => {
+test("creates a clicked new session only after its first question is submitted", async () => {
   const user = userEvent.setup();
   installFetchStub();
   render(<App />);
@@ -111,14 +111,45 @@ test("creates and switches sessions", async () => {
     await screen.findByText("先承接预算，再讨论缴费期和保障缺口。")
   ).toBeInTheDocument();
 
+  const sidebar = screen.getByRole("navigation", { name: "历史会话" });
+  const persistedBeforeDraft = localStorage.getItem("xhbx-rag.chat-sessions.v1");
+  const sessionRows = () =>
+    within(sidebar)
+      .getAllByRole("button")
+      .filter((button) => button.hasAttribute("aria-pressed"));
+  expect(sessionRows()).toHaveLength(1);
+
   await user.click(screen.getByRole("button", { name: "新会话" }));
 
   expect(screen.getByText("暂无问答")).toBeInTheDocument();
-  expect(
-    screen.queryByText("先承接预算，再讨论缴费期和保障缺口。")
-  ).not.toBeInTheDocument();
+  expect(sessionRows()).toHaveLength(1);
+  expect(sessionRows()[0]).toHaveAttribute("aria-pressed", "false");
+  expect(localStorage.getItem("xhbx-rag.chat-sessions.v1")).toBe(
+    persistedBeforeDraft
+  );
 
-  await user.click(screen.getByRole("button", { name: /1 轮/ }));
+  await user.type(screen.getByLabelText("输入问题"), "保单整理有什么作用？");
+  await user.click(screen.getByRole("button", { name: "发送" }));
+
+  expect(
+    await within(sidebar).findByRole("button", {
+      name: /保单整理有什么作用？.*1 轮/
+    })
+  ).toBeInTheDocument();
+  expect(sessionRows()).toHaveLength(2);
+  const stored = JSON.parse(
+    localStorage.getItem("xhbx-rag.chat-sessions.v1") ?? ""
+  );
+  expect(stored.sessions).toHaveLength(2);
+  expect(stored.sessions[0]).toMatchObject({
+    title: "保单整理有什么作用？"
+  });
+
+  await user.click(
+    within(sidebar).getByRole("button", {
+      name: /客户说每年不能超过80万怎么办？.*1 轮/
+    })
+  );
 
   const qaPanel = screen.getByRole("main", { name: "RAG 问答" });
   expect(
@@ -127,6 +158,35 @@ test("creates and switches sessions", async () => {
   expect(
     within(qaPanel).getByText("先承接预算，再讨论缴费期和保障缺口。")
   ).toBeInTheDocument();
+});
+
+test("abandons an unsent new-session draft without persisting it", async () => {
+  const user = userEvent.setup();
+  installFetchStub();
+  render(<App />);
+
+  await user.type(screen.getByLabelText("输入问题"), "客户预算有限怎么办？");
+  await user.click(screen.getByRole("button", { name: "发送" }));
+  const historyButton = await screen.findByRole("button", {
+    name: /客户预算有限怎么办？.*1 轮/
+  });
+  const persistedBeforeDraft = localStorage.getItem("xhbx-rag.chat-sessions.v1");
+
+  await user.click(screen.getByRole("button", { name: "新会话" }));
+  await user.type(screen.getByLabelText("输入问题"), "这段文字不应保存");
+  await user.click(historyButton);
+
+  const qaPanel = screen.getByRole("main", { name: "RAG 问答" });
+  expect(
+    within(qaPanel).getByText("客户预算有限怎么办？")
+  ).toBeInTheDocument();
+  expect(localStorage.getItem("xhbx-rag.chat-sessions.v1")).toBe(
+    persistedBeforeDraft
+  );
+  const stored = JSON.parse(
+    localStorage.getItem("xhbx-rag.chat-sessions.v1") ?? ""
+  );
+  expect(stored.sessions).toHaveLength(1);
 });
 
 test("deletes sessions from persistent storage and keeps an empty fallback", async () => {
