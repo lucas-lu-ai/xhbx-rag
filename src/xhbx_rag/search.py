@@ -2,16 +2,16 @@ from __future__ import annotations
 
 from typing import Protocol
 
+from .knowledge_domain import infer_query_domains
 from .milvus_store import MilvusSearchHit
 from .observability import TraceSink, emit_trace
 from .query_understanding import QueryUnderstanding
 from .rerank import RerankResult
-from .tagging import infer_query_tags
 
-# 标签加权是软信号：每命中一条查询标签路径加 0.1，封顶 ×1.3，
+# 一级领域加权是软信号：每命中一个领域加 0.1，封顶 ×1.3，
 # 只调排序不做硬过滤，避免规则漏标把相关 chunk 挡在召回外。
-_TAG_BOOST_PER_MATCH = 0.1
-_TAG_BOOST_MATCH_CAP = 3
+_DOMAIN_BOOST_PER_MATCH = 0.1
+_DOMAIN_BOOST_MATCH_CAP = 3
 
 
 class _QueryAgent(Protocol):
@@ -159,7 +159,7 @@ def search_evidence(
                 "candidates": [_serialize_candidate(hit) for hit in keyword_hits],
             },
         )
-        # 先全量融合，标签加权后再截断，命中标签的候选才有机会挤进 top_n。
+        # 先全量融合，领域加权后再截断，命中领域的候选才有机会挤进 top_n。
         candidates = _rrf_fuse(vector_hits, keyword_hits, limit=None)
         emit_trace(
             trace,
@@ -173,16 +173,16 @@ def search_evidence(
         )
     else:
         candidates = vector_hits
-    query_tag_paths = infer_query_tags(rewritten_query)
+    query_domains = infer_query_domains(rewritten_query)
     boost_by_chunk_id: dict[str, dict] = {}
-    if query_tag_paths:
-        candidates, boost_details = _apply_tag_boost(candidates, query_tag_paths)
+    if query_domains:
+        candidates, boost_details = _apply_domain_boost(candidates, query_domains)
         boost_by_chunk_id = {item["chunk_id"]: item for item in boost_details}
         emit_trace(
             trace,
-            "search.tag_boosted",
+            "search.domain_boosted",
             {
-                "query_tag_paths": query_tag_paths,
+                "query_domains": query_domains,
                 "boosted_count": len(boost_details),
                 "boosted": boost_details,
             },
@@ -230,7 +230,19 @@ def _search_filters(understanding: QueryUnderstanding) -> dict:
         result["chunk_types"] = filters.chunk_types
     if filters.stage:
         result["stage"] = filters.stage
+    source_kinds = _source_kinds(understanding.collection_targets)
+    if source_kinds:
+        result["source_kinds"] = source_kinds
     return result
+
+
+def _source_kinds(targets: list[str]) -> list[str]:
+    unique = set(targets)
+    if unique == {"case"}:
+        return ["绩优案例"]
+    if unique == {"course"}:
+        return ["培训资料"]
+    return []
 
 
 def _keyword_search_if_available(
@@ -246,27 +258,34 @@ def _keyword_search_if_available(
     return keyword_search(query=query, top_k=top_k, filters=filters)
 
 
-def _apply_tag_boost(
+def _apply_domain_boost(
     hits: list[MilvusSearchHit],
-    query_tag_paths: list[str],
+    query_domains: list[str],
 ) -> tuple[list[MilvusSearchHit], list[dict]]:
-    query_paths = set(query_tag_paths)
+    query_domain_set = set(query_domains)
     boosted_hits: list[MilvusSearchHit] = []
     details: list[dict] = []
     for hit in hits:
-        chunk_paths = hit.chunk.metadata.get("tag_paths") or []
-        matched = [str(path) for path in chunk_paths if str(path) in query_paths]
+        chunk_domains = hit.chunk.metadata.get("domain_tags") or []
+        matched = [
+            str(domain)
+            for domain in chunk_domains
+            if str(domain) in query_domain_set
+        ]
         if not matched:
             boosted_hits.append(hit)
             continue
-        factor = 1 + _TAG_BOOST_PER_MATCH * min(len(matched), _TAG_BOOST_MATCH_CAP)
+        factor = 1 + _DOMAIN_BOOST_PER_MATCH * min(
+            len(matched),
+            _DOMAIN_BOOST_MATCH_CAP,
+        )
         boosted = MilvusSearchHit(chunk=hit.chunk, score=hit.score * factor)
         boosted_hits.append(boosted)
         details.append(
             {
                 "chunk_id": hit.chunk.chunk_id,
-                "matched_tag_paths": matched,
-                "boost_factor": round(factor, 2),
+                "matched_domains": matched,
+                "domain_boost_factor": round(factor, 2),
                 "fused_score": hit.score,
                 "boosted_score": boosted.score,
             }
@@ -319,8 +338,10 @@ def _serialize_hit(
         "text": hit.chunk.text,
         "score": hit.score,
         "rerank_score": rerank.relevance_score,
-        "matched_tag_paths": list(boost["matched_tag_paths"]) if boost else [],
-        "tag_boost_factor": boost["boost_factor"] if boost else 1.0,
+        "matched_domains": list(boost["matched_domains"]) if boost else [],
+        "domain_boost_factor": boost["domain_boost_factor"] if boost else 1.0,
+        "matched_tag_paths": [],
+        "tag_boost_factor": 1.0,
         "metadata": hit.chunk.metadata,
         "citations": [
             citation.model_dump(mode="json") for citation in hit.chunk.citations

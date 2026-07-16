@@ -599,6 +599,9 @@ _COMPLIANCE_GUIDANCE = {
     "竞品比较风险": "不得贬低或否定其他公司及其产品。",
     "误导销售风险": "不得出现返佣、返钱或夸大利益的误导表述。",
     "产品适配风险": "不得宣称产品适合所有人。",
+    "合规与风控领域": (
+        "证据属于合规与风控领域，回答需保留原文限制条件，不得扩展承诺。"
+    ),
 }
 
 
@@ -608,14 +611,20 @@ def _collect_compliance_risks(search_result: dict[str, Any]) -> list[str]:
     for item in search_result.get("results", []) or []:
         metadata = item.get("metadata") or {}
         values = metadata.get("compliance_risks") or []
-        if not isinstance(values, list):
-            continue
-        for value in values:
-            text = str(value).strip()
-            if not text or text in seen:
-                continue
-            seen.add(text)
-            risks.append(text)
+        if isinstance(values, list):
+            for value in values:
+                text = str(value).strip()
+                if not text or text in seen:
+                    continue
+                seen.add(text)
+                risks.append(text)
+        domain_tags = metadata.get("domain_tags") or []
+        is_compliance_domain = metadata.get("primary_domain") == "合规与风控" or (
+            isinstance(domain_tags, list) and "合规与风控" in domain_tags
+        )
+        if is_compliance_domain and "合规与风控领域" not in seen:
+            seen.add("合规与风控领域")
+            risks.append("合规与风控领域")
     return risks
 
 

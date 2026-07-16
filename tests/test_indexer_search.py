@@ -1,6 +1,8 @@
 import json
 from contextlib import contextmanager
 
+import pytest
+
 import xhbx_rag.indexer as indexer
 from xhbx_rag.indexer import index_chunks
 from xhbx_rag.milvus_store import MilvusSearchHit
@@ -8,7 +10,7 @@ from xhbx_rag.models import RagChunk
 from xhbx_rag.observability import MemoryTraceSink
 from xhbx_rag.query_understanding import QueryFilters, QueryUnderstanding
 from xhbx_rag.rerank import RerankResult
-from xhbx_rag.search import search_evidence
+from xhbx_rag.search import _search_filters, search_evidence
 
 
 class _FakeEmbedding:
@@ -392,24 +394,28 @@ def test_search_evidence_hybrid_retrieval_fuses_vector_and_keyword_hits() -> Non
         "search.vector_searched",
         "search.keyword_searched",
         "search.hybrid_fused",
-        "search.tag_boosted",
+        "search.domain_boosted",
         "search.reranked",
         "search.completed",
     ]
 
 
-def _tagged_chunk(chunk_id: str, text: str, tag_paths: list[str]) -> RagChunk:
+def _domain_chunk(chunk_id: str, text: str, domain_tags: list[str]) -> RagChunk:
     return RagChunk(
         chunk_id=chunk_id,
         chunk_type="script",
         text=text,
-        metadata={"case_name": "案例A", "stage": "需求分析", "tag_paths": tag_paths},
+        metadata={
+            "case_name": "案例A",
+            "stage": "需求分析",
+            "domain_tags": domain_tags,
+        },
         citations=[],
         source_file="case.sales_insights.json",
     )
 
 
-def test_search_evidence_tag_boost_promotes_tag_matched_candidate() -> None:
+def test_search_evidence_domain_boost_promotes_domain_matched_candidate() -> None:
     class _WealthQueryAgent:
         def understand(self, query: str) -> QueryUnderstanding:
             return QueryUnderstanding(
@@ -421,13 +427,13 @@ def test_search_evidence_tag_boost_promotes_tag_matched_candidate() -> None:
 
     embedding = _FakeEmbedding()
     store = _FakeHybridStore()
-    hit_a = MilvusSearchHit(chunk=_tagged_chunk("a", "开场寒暄", []), score=0.9)
-    hit_b = MilvusSearchHit(chunk=_tagged_chunk("b", "讲产品组合", []), score=0.8)
+    hit_a = MilvusSearchHit(chunk=_domain_chunk("a", "开场寒暄", []), score=0.9)
+    hit_b = MilvusSearchHit(chunk=_domain_chunk("b", "讲产品组合", []), score=0.8)
     hit_c = MilvusSearchHit(
-        chunk=_tagged_chunk(
+        chunk=_domain_chunk(
             "c",
             "高净值客户传承安排讲解",
-            ["客户画像/高净值客户", "客户需求/财富传承"],
+            ["客户经营"],
         ),
         score=0.7,
     )
@@ -448,35 +454,33 @@ def test_search_evidence_tag_boost_promotes_tag_matched_candidate() -> None:
     )
 
     # 无加权时 RRF 排序为 a > b > c，top_n=2 会截掉 c；
-    # 标签命中 2 条路径后 c 的融合分 ×1.2 超过 b，挤进 rerank 名单。
+    # 一级标签命中后 c 的融合分 ×1.1 超过 b，挤进 rerank 名单。
     assert reranker.calls[0]["documents"] == ["开场寒暄", "高净值客户传承安排讲解"]
     assert [item["chunk_id"] for item in result["results"]] == ["a", "c"]
 
     # 命中信息随证据序列化输出，Web 层证据卡片直接展示。
     boosted_item = next(item for item in result["results"] if item["chunk_id"] == "c")
-    assert boosted_item["matched_tag_paths"] == [
-        "客户画像/高净值客户",
-        "客户需求/财富传承",
-    ]
-    assert boosted_item["tag_boost_factor"] == 1.2
+    assert boosted_item["matched_domains"] == ["客户经营"]
+    assert boosted_item["domain_boost_factor"] == 1.1
+    assert boosted_item["matched_tag_paths"] == []
+    assert boosted_item["tag_boost_factor"] == 1.0
     plain_item = next(item for item in result["results"] if item["chunk_id"] == "a")
+    assert plain_item["matched_domains"] == []
+    assert plain_item["domain_boost_factor"] == 1.0
     assert plain_item["matched_tag_paths"] == []
     assert plain_item["tag_boost_factor"] == 1.0
 
     steps = [event.step for event in trace.events]
-    assert steps.index("search.tag_boosted") == steps.index("search.hybrid_fused") + 1
-    boost_event = trace.events[steps.index("search.tag_boosted")]
-    assert "客户画像/高净值客户" in boost_event.payload["query_tag_paths"]
+    assert steps.index("search.domain_boosted") == steps.index("search.hybrid_fused") + 1
+    boost_event = trace.events[steps.index("search.domain_boosted")]
+    assert boost_event.payload["query_domains"] == ["客户经营", "销售技能"]
     assert boost_event.payload["boosted_count"] == 1
     assert boost_event.payload["boosted"][0]["chunk_id"] == "c"
-    assert boost_event.payload["boosted"][0]["matched_tag_paths"] == [
-        "客户画像/高净值客户",
-        "客户需求/财富传承",
-    ]
-    assert boost_event.payload["boosted"][0]["boost_factor"] == 1.2
+    assert boost_event.payload["boosted"][0]["matched_domains"] == ["客户经营"]
+    assert boost_event.payload["boosted"][0]["domain_boost_factor"] == 1.1
 
 
-def test_search_evidence_skips_tag_boost_when_query_has_no_tags() -> None:
+def test_search_evidence_skips_domain_boost_when_query_has_no_domains() -> None:
     embedding = _FakeEmbedding()
     store = _FakeHybridStore()
     hit = MilvusSearchHit(chunk=_chunk("c1", "客户抗拒时先聊家庭话题"), score=0.5)
@@ -495,7 +499,30 @@ def test_search_evidence_skips_tag_boost_when_query_has_no_tags() -> None:
         trace=trace,
     )
 
-    assert "search.tag_boosted" not in [event.step for event in trace.events]
+    assert "search.domain_boosted" not in [event.step for event in trace.events]
+
+
+@pytest.mark.parametrize(
+    ("targets", "expected"),
+    [
+        (["case"], {"source_kinds": ["绩优案例"]}),
+        (["course"], {"source_kinds": ["培训资料"]}),
+        (["case", "course"], {}),
+    ],
+)
+def test_search_maps_logical_collection_targets_to_source_kind_filter(
+    targets: list[str],
+    expected: dict,
+) -> None:
+    understanding = QueryUnderstanding(
+        intent="general_sales_qa",
+        rewritten_query="保险销售知识",
+        needs_retrieval=True,
+        collection_targets=targets,
+        filters=QueryFilters(),
+    )
+
+    assert _search_filters(understanding) == expected
 
 
 def test_search_evidence_emits_step_trace_events() -> None:

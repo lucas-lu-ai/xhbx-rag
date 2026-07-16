@@ -22,7 +22,7 @@ CollectionTarget = Literal["case", "course"]
 _CASE_CHUNK_TYPES = frozenset(
     {"customer_journey", "strategy", "script", "objection_handling"}
 )
-_COURSE_CHUNK_TYPES = frozenset({"training_course"})
+_COURSE_CHUNK_TYPES = frozenset({"training_course", "knowledge_entry"})
 _CASE_ONLY_INTENTS = frozenset({"journey_search", "objection_handling"})
 _ALLOWED_CHUNK_TYPES = {
     *_CASE_CHUNK_TYPES,
@@ -198,19 +198,20 @@ _SYSTEM_PROMPT = """你是销售洞察 RAG 的查询理解节点。
 - needs_retrieval: boolean
 - collection_targets: 必须输出的字符串数组，只能使用 case | course
   - case 包含 customer_journey | strategy | script | objection_handling
-  - course 仅包含 training_course
+  - course 包含 training_course | knowledge_entry
   - 案例实战、绩优经验类问题选择 ["case"]
   - 课程教材、标准流程类问题选择 ["course"]
   - 同时需要案例和课程时选择 ["case", "course"]
   - 无法确定时选择 ["case", "course"]
+  - case/course 是来源语义，不代表两个物理 collection
 - filters: object，包含 chunk_types, stage, scenario, objection, strategy_names
-  - chunk_types 只能使用 customer_journey | strategy | script | objection_handling | training_course，不要输出 qa。
+  - chunk_types 只能使用 customer_journey | strategy | script | objection_handling | training_course | knowledge_entry，不要输出 qa。
 要求：
 1. 不要增加用户没有表达的事实约束。
 2. 不能直接回答用户问题。
 3. 如果问题不属于保险销售知识（案例经验、话术、异议、策略、客户旅程、培训课程），intent=out_of_scope 且 needs_retrieval=false。
 4. 通用解释、作用、价值、原因类问题使用 general_sales_qa，chunk_types 通常留空，除非用户明确限定只查某类知识。
-5. 知识库同时包含绩优案例经验与制式培训课程两类：问"怎么讲这门课/课程内容/标准流程/制式话术/培训教材"倾向 chunk_types=["training_course"]；问"某位绩优如何做成/实战经验"倾向案例四类；不确定时 chunk_types 留空同时检索两类。
+5. 知识库同时包含绩优案例经验与制式培训资料两类：问"怎么讲这门课/课程内容/标准流程/制式话术/培训教材"倾向 chunk_types=["training_course", "knowledge_entry"]；问"某位绩优如何做成/实战经验"倾向案例四类；不确定时 chunk_types 留空同时检索两类。
 6. collection_targets 必须与 intent 和 filters.chunk_types 一致；混合类型选择两者，不确定时也选择两者。
 7. script_search 和 strategy_search 本身不足以决定 collection_targets；制式话术、标准流程可属于 course。
 8. 结合用户问题、filters.chunk_types 和 collection_targets 判断目标库，确保目标与 chunk_types 一致。

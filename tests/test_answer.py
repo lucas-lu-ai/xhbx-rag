@@ -992,6 +992,24 @@ def test_answer_agent_injects_compliance_guidance_for_risky_evidence() -> None:
     assert "承诺一定赔付" in user_content
 
 
+def test_answer_agent_injects_generic_guardrail_for_compliance_domain() -> None:
+    http = _answer_sse_client()
+    agent = _agent(http)
+    search_result = _search_result()
+    search_result["results"][0]["metadata"].update(
+        {
+            "primary_domain": "合规与风控",
+            "domain_tags": ["合规与风控"],
+        }
+    )
+
+    agent.generate(search_result)
+
+    user_content = http.calls[0]["json"]["messages"][-1]["content"]
+    assert "证据属于合规与风控领域" in user_content
+    assert "不得扩展承诺" in user_content
+
+
 def test_answer_agent_omits_compliance_block_without_risky_evidence() -> None:
     http = _answer_sse_client()
     agent = _agent(http)

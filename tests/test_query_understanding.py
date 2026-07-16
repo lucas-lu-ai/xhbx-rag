@@ -119,6 +119,20 @@ def test_query_understanding_accepts_training_course_chunk_type() -> None:
     assert result.filters.chunk_types == ["training_course"]
 
 
+def test_query_understanding_accepts_knowledge_entry_chunk_type() -> None:
+    result = QueryUnderstanding.model_validate(
+        {
+            "intent": "general_sales_qa",
+            "rewritten_query": "培训课件中的产品责任是什么？",
+            "needs_retrieval": True,
+            "collection_targets": ["course"],
+            "filters": {"chunk_types": ["knowledge_entry"]},
+        }
+    )
+
+    assert result.filters.chunk_types == ["knowledge_entry"]
+
+
 @pytest.mark.parametrize(
     ("collection_targets", "expected"),
     [
@@ -340,12 +354,13 @@ def test_query_understanding_prompt_explains_collection_routing() -> None:
     from xhbx_rag.query_understanding import _SYSTEM_PROMPT
 
     assert "case 包含 customer_journey | strategy | script | objection_handling" in _SYSTEM_PROMPT
-    assert "course 仅包含 training_course" in _SYSTEM_PROMPT
+    assert "course 包含 training_course | knowledge_entry" in _SYSTEM_PROMPT
     assert '同时需要案例和课程时选择 ["case", "course"]' in _SYSTEM_PROMPT
     assert "collection_targets 必须与 intent 和 filters.chunk_types 一致" in _SYSTEM_PROMPT
     assert "script_search 和 strategy_search 本身不足以决定 collection_targets" in _SYSTEM_PROMPT
     assert "制式话术、标准流程可属于 course" in _SYSTEM_PROMPT
     assert '无法确定时选择 ["case", "course"]' in _SYSTEM_PROMPT
+    assert "不代表两个物理 collection" in _SYSTEM_PROMPT
 
 
 def test_query_understanding_normalizes_empty_filter_arrays_to_blank_strings() -> None:
