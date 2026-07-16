@@ -208,6 +208,9 @@ wait_for_service etcd
 wait_for_service minio
 wait_for_service standalone
 
+# 重建 collection 前停止可能存在的旧 API/Web，避免更新期间读取半成品索引。
+ENV_FILE="$RUNTIME_ENV_FILE" compose -f "$COMPOSE_FILE" stop api web
+
 ENV_FILE="$RUNTIME_ENV_FILE" compose -f "$COMPOSE_FILE" \
   run --rm --no-deps cli sh /app/scripts/index_parsed_offline.sh all
 

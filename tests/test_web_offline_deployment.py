@@ -108,10 +108,11 @@ def test_deploy_script_validates_before_loading_and_indexes_before_web() -> None
     main_flow = script[script.index("# 主部署流程") :]
     checksum = main_flow.index("verify_checksum")
     load = main_flow.index('docker load -i "$IMAGE_TAR"')
+    stop_web = main_flow.index("stop api web")
     index = main_flow.index("index_parsed_offline.sh all")
     web = main_flow.index("up -d --no-build api web")
     verify = main_flow.index("verify_web_offline.sh")
-    assert checksum < load < index < web < verify
+    assert checksum < load < stop_web < index < web < verify
     assert "uname -m" in script
     assert "package-manifest.txt" in script
     assert "缺少必要环境变量" in script
