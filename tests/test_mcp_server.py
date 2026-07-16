@@ -186,6 +186,8 @@ def test_kb_search_knowledge_returns_structured_content_with_text_fallback():
                 "knowledgeType": "SLICE",
                 "title": "切片",
                 "content": "完整正文",
+                "primaryDomain": "销售技能",
+                "domainTags": ["销售技能", "客户经营"],
             }
         ],
         "errorCode": None,
@@ -197,6 +199,10 @@ def test_kb_search_knowledge_returns_structured_content_with_text_fallback():
                 "results": [
                     {
                         "text": "完整正文",
+                        "metadata": {
+                            "primary_domain": "销售技能",
+                            "domain_tags": ["销售技能", "客户经营"],
+                        },
                         "citations": [{"source_id": "pptx:案例A.pptx"}],
                     }
                 ]
@@ -223,6 +229,8 @@ def test_kb_search_knowledge_protocol_result_contains_structured_content():
                 "knowledgeType": "SLICE",
                 "title": "切片",
                 "content": "完整正文",
+                "primaryDomain": "销售技能",
+                "domainTags": ["销售技能", "客户经营"],
             }
         ],
         "errorCode": None,
@@ -234,6 +242,10 @@ def test_kb_search_knowledge_protocol_result_contains_structured_content():
                 "results": [
                     {
                         "text": "完整正文",
+                        "metadata": {
+                            "primary_domain": "销售技能",
+                            "domain_tags": ["销售技能", "客户经营"],
+                        },
                         "citations": [{"source_id": "pptx:案例A.pptx"}],
                     }
                 ]
@@ -270,6 +282,8 @@ def test_kb_search_knowledge_returns_wrapped_slice_results():
                         "tag_paths": ["异议处理/预算"],
                         "parent_id": "p1",
                         "title_path": ["案例A", "预算异议"],
+                        "primary_domain": "销售技能",
+                        "domain_tags": ["销售技能", "客户经营"],
                     },
                     "citations": [{"source_path": "案例A/a.txt"}],
                 }
@@ -297,6 +311,8 @@ def test_kb_search_knowledge_returns_wrapped_slice_results():
             "id": "c1",
             "knowledgeType": "SLICE",
             "score": 0.98,
+            "primaryDomain": "销售技能",
+            "domainTags": ["销售技能", "客户经营"],
             "tags": ["异议处理/预算"],
             "qa": None,
             "slice": {
@@ -352,6 +368,10 @@ def test_kb_search_knowledge_returns_only_compact_fields_by_default_or_when_disa
                 {
                     "chunk_id": "c1",
                     "text": "完整正文",
+                    "metadata": {
+                        "primary_domain": "客户经营",
+                        "domain_tags": ["客户经营"],
+                    },
                     "citations": [
                         {
                             "source_id": "pptx:案例A.pptx",
@@ -384,6 +404,8 @@ def test_kb_search_knowledge_returns_only_compact_fields_by_default_or_when_disa
             "knowledgeType": "SLICE",
             "title": "切片",
             "content": "完整正文",
+            "primaryDomain": "客户经营",
+            "domainTags": ["客户经营"],
         }
     ]
 
@@ -416,6 +438,8 @@ def test_compact_kb_search_results_use_empty_doc_id_for_missing_citation(
             "knowledgeType": "SLICE",
             "title": "切片",
             "content": "正文",
+            "primaryDomain": "",
+            "domainTags": [],
         }
     ]
 
@@ -441,6 +465,8 @@ def test_compact_kb_search_results_use_empty_content_when_text_is_missing():
             "knowledgeType": "SLICE",
             "title": "切片",
             "content": "",
+            "primaryDomain": "",
+            "domainTags": [],
         }
     ]
 
@@ -474,8 +500,36 @@ def test_compact_kb_search_results_use_empty_doc_id_when_first_citation_source_i
             "knowledgeType": "SLICE",
             "title": "切片",
             "content": "正文",
+            "primaryDomain": "",
+            "domainTags": [],
         }
     ]
+
+
+def test_kb_search_knowledge_uses_safe_domain_defaults_for_dirty_metadata():
+    server = create_mcp_server(
+        searcher=FakeSearcher(
+            result={
+                "results": [
+                    {
+                        "chunk_id": "c1",
+                        "text": "正文",
+                        "metadata": {"domain_tags": "销售技能"},
+                        "citations": [],
+                    }
+                ]
+            }
+        )
+    )
+
+    payload = _call_tool(
+        server,
+        "kb_search_knowledge",
+        {"query": "客户经营", "primaryDomains": ["客户经营"]},
+    )
+
+    assert payload["data"][0]["primaryDomain"] == ""
+    assert payload["data"][0]["domainTags"] == []
 
 
 def test_kb_search_knowledge_filters_by_normalized_primary_domains():

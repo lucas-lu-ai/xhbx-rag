@@ -460,16 +460,23 @@ def _normalize_knowledge_types(knowledge_types: list[str] | None) -> list[str]:
     ]
 
 
+def _normalize_domain_tags(value: Any) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        return []
+    return [item for item in value if item]
+
+
 def _format_compact_kb_search_results(
     result: dict[str, Any],
-) -> list[dict[str, str]]:
-    items: list[dict[str, str]] = []
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
     raw_results = result.get("results", [])
     if not isinstance(raw_results, list):
         return items
     for raw in raw_results:
         if not isinstance(raw, dict):
             continue
+        metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
         citations = raw.get("citations")
         first_citation = (
             citations[0]
@@ -484,6 +491,8 @@ def _format_compact_kb_search_results(
                 "knowledgeType": "SLICE",
                 "title": "切片",
                 "content": str(raw.get("text") or ""),
+                "primaryDomain": str(metadata.get("primary_domain") or ""),
+                "domainTags": _normalize_domain_tags(metadata.get("domain_tags")),
             }
         )
     return items
@@ -506,6 +515,8 @@ def _format_kb_search_results(result: dict[str, Any]) -> list[dict[str, Any]]:
                 "id": raw.get("chunk_id"),
                 "knowledgeType": "SLICE",
                 "score": raw.get("rerank_score", raw.get("score")),
+                "primaryDomain": str(metadata.get("primary_domain") or ""),
+                "domainTags": _normalize_domain_tags(metadata.get("domain_tags")),
                 "tags": metadata.get("tag_paths") or None,
                 "qa": None,
                 "slice": {
