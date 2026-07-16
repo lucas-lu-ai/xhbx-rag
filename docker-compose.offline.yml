@@ -1,0 +1,167 @@
+name: xhbx-rag-offline
+
+x-app-service: &app-service
+  image: xhbx-rag-api:latest
+  env_file:
+    - ${ENV_FILE:-.env}
+  environment:
+    MILVUS_MODE: docker
+    MILVUS_URI: http://standalone:19530
+    MILVUS_COLLECTION: ${MILVUS_COLLECTION:-xhbx_sales_chunks}
+    MILVUS_COURSE_COLLECTION: ${MILVUS_COURSE_COLLECTION:-xhbx_course_chunks}
+    WEB_BATCH_CONCURRENCY: ${WEB_BATCH_CONCURRENCY:-3}
+    WEB_RETRIEVAL_TOP_N: ${WEB_RETRIEVAL_TOP_N:-20}
+    WEB_RETRIEVAL_TOP_K: ${WEB_RETRIEVAL_TOP_K:-5}
+    WEB_INGEST_MAX_UPLOAD_BYTES: ${WEB_INGEST_MAX_UPLOAD_BYTES:-536870912}
+    WEB_INGEST_MAX_ZIP_ENTRIES: ${WEB_INGEST_MAX_ZIP_ENTRIES:-2000}
+    WEB_INGEST_MAX_EXTRACTED_BYTES: ${WEB_INGEST_MAX_EXTRACTED_BYTES:-2147483648}
+    WEB_INGEST_MAX_ENTRY_BYTES: ${WEB_INGEST_MAX_ENTRY_BYTES:-536870912}
+    WEB_INGEST_MAX_COMPRESSION_RATIO: ${WEB_INGEST_MAX_COMPRESSION_RATIO:-100}
+  volumes:
+    - ./data:/app/data
+    - ./.local:/app/.local
+    - ./parsed:/app/parsed:ro
+    - ./scripts:/app/scripts:ro
+  depends_on:
+    standalone:
+      condition: service_healthy
+
+services:
+  api:
+    <<: *app-service
+    command:
+      - uvicorn
+      - xhbx_rag.web.app:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/status', timeout=5)"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  cli:
+    <<: *app-service
+    profiles:
+      - tools
+    command:
+      - xhbx-rag
+      - --help
+    restart: "no"
+
+  web:
+    image: xhbx-rag-web:latest
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${WEB_PORT:-18088}:80"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "wget -qO- http://127.0.0.1/ >/dev/null"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.25
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+      ETCD_SNAPSHOT_COUNT: "50000"
+    command:
+      - etcd
+      - -advertise-client-urls=http://etcd:2379
+      - -listen-client-urls
+      - http://0.0.0.0:2379
+      - --data-dir
+      - /etcd
+    volumes:
+      - milvus_etcd:/etcd
+    healthcheck:
+      test:
+        - CMD
+        - etcdctl
+        - endpoint
+        - health
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  minio:
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    command:
+      - minio
+      - server
+      - /minio_data
+      - --console-address
+      - ":9001"
+    volumes:
+      - milvus_minio:/minio_data
+    ports:
+      - "127.0.0.1:${MINIO_API_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
+    healthcheck:
+      test:
+        - CMD
+        - mc
+        - ready
+        - local
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  standalone:
+    image: milvusdb/milvus:v2.6.19
+    command:
+      - milvus
+      - run
+      - standalone
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MQ_TYPE: woodpecker
+    volumes:
+      - milvus_data:/var/lib/milvus
+    ports:
+      - "127.0.0.1:${MILVUS_PORT:-19530}:19530"
+      - "127.0.0.1:${MILVUS_HEALTH_PORT:-9091}:9091"
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - -f
+        - http://localhost:9091/healthz
+      interval: 30s
+      start_period: 90s
+      timeout: 20s
+      retries: 3
+
+volumes:
+  milvus_etcd:
+  milvus_minio:
+  milvus_data:
