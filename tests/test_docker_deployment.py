@@ -190,7 +190,7 @@ def test_load_mcp_offline_script_loads_images_and_starts_without_build() -> None
     assert 'compose -f docker-compose.mcp.yml up -d --no-build' in script
 
 
-def test_mcp_test_script_covers_kb_list_and_optional_search() -> None:
+def test_mcp_test_script_covers_primary_domain_search() -> None:
     script = read_repo_file("scripts/test_mcp.sh")
 
     assert 'MCP_URL="${MCP_URL:-http://127.0.0.1:${MCP_PORT:-9331}/mcp}"' in script
@@ -198,11 +198,13 @@ def test_mcp_test_script_covers_kb_list_and_optional_search() -> None:
     assert '"method":"initialize"' in script
     assert '"method":"tools/list"' in script
     assert 'TOOL_PROFILE="${MCP_TOOL_PROFILE:-kb}"' in script
-    assert '"name":"kb_list_knowledge_bases"' in script
+    assert 'PRIMARY_DOMAINS_JSON="${PRIMARY_DOMAINS_JSON:-[\\"销售技能\\"]}"' in script
+    assert '"name":"kb_list_knowledge_bases"' not in script
     assert '\\"name\\":\\"kb_search_knowledge\\"' in script
     assert '"name":"retrieval_status"' in script
     assert '\\"name\\":\\"search_knowledge\\"' in script
-    assert '\\"kbId\\":$KB_ID' in script
+    assert '\\"primaryDomains\\":$PRIMARY_DOMAINS_JSON' in script
+    assert '\\"kbId\\"' not in script
     assert '\\"topK\\":$TOP_K' in script
     assert 'QUERY="${1:-${QUERY:-}}"' in script
     assert "curl -fsS -N" in script

@@ -5,7 +5,7 @@ MCP_URL="${MCP_URL:-http://127.0.0.1:${MCP_PORT:-9331}/mcp}"
 MCP_PROTOCOL_VERSION="${MCP_PROTOCOL_VERSION:-2025-03-26}"
 TIMEOUT="${TIMEOUT:-30}"
 TOOL_PROFILE="${MCP_TOOL_PROFILE:-kb}"
-KB_ID="${KB_ID:-1}"
+PRIMARY_DOMAINS_JSON="${PRIMARY_DOMAINS_JSON:-[\"销售技能\"]}"
 TOP_K="${TOP_K:-10}"
 QUERY="${1:-${QUERY:-}}"
 SESSION_ID=""
@@ -87,15 +87,7 @@ post_rpc "tools/list" '{
 
 case "$TOOL_PROFILE" in
   kb|both)
-    post_rpc "kb_list_knowledge_bases" '{
-      "jsonrpc":"2.0",
-      "id":3,
-      "method":"tools/call",
-      "params":{
-        "name":"kb_list_knowledge_bases",
-        "arguments":{}
-      }
-    }'
+    :
     ;;
   legacy)
     post_rpc "retrieval_status" '{
@@ -120,13 +112,13 @@ if [ -n "$QUERY" ]; then
     kb|both)
       post_rpc "kb_search_knowledge" "{
         \"jsonrpc\":\"2.0\",
-        \"id\":4,
+        \"id\":3,
         \"method\":\"tools/call\",
         \"params\":{
           \"name\":\"kb_search_knowledge\",
           \"arguments\":{
             \"query\":\"$escaped_query\",
-            \"kbId\":$KB_ID,
+            \"primaryDomains\":$PRIMARY_DOMAINS_JSON,
             \"topK\":$TOP_K
           }
         }
@@ -155,5 +147,5 @@ else
       echo "未提供检索问题，跳过 kb_search_knowledge。"
       ;;
   esac
-  echo "如需检索测试：QUERY='客户说预算不够怎么办？' $0"
+  echo "如需检索测试：PRIMARY_DOMAINS_JSON='[\"销售技能\",\"客户经营\"]' QUERY='客户说预算不够怎么办？' $0"
 fi
