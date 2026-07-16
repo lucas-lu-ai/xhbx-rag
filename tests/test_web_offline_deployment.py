@@ -100,3 +100,30 @@ def test_index_script_rejects_unknown_target_without_running_cli(
 
     assert result.returncode == 2
     assert "all|case|course" in result.stderr
+
+
+def test_deploy_script_validates_before_loading_and_indexes_before_web() -> None:
+    script = read_repo_file("scripts/deploy_web_offline.sh")
+
+    main_flow = script[script.index("# 主部署流程") :]
+    checksum = main_flow.index("verify_checksum")
+    load = main_flow.index('docker load -i "$IMAGE_TAR"')
+    index = main_flow.index("index_parsed_offline.sh all")
+    web = main_flow.index("up -d --no-build api web")
+    verify = main_flow.index("verify_web_offline.sh")
+    assert checksum < load < index < web < verify
+    assert "uname -m" in script
+    assert "package-manifest.txt" in script
+    assert "缺少必要环境变量" in script
+
+
+def test_verify_script_checks_services_collections_and_real_answer() -> None:
+    script = read_repo_file("scripts/verify_web_offline.sh")
+
+    for service in ("etcd", "minio", "standalone", "api", "web"):
+        assert service in script
+    assert "get_collection_stats" in script
+    assert "/api/status" in script
+    assert "/api/answer" in script
+    assert "SMOKE_QUERY" in script
+    assert "row_count" in script
