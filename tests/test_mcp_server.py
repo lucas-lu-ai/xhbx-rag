@@ -280,8 +280,14 @@ def test_kb_search_knowledge_returns_only_compact_fields_by_default_or_when_disa
                     "chunk_id": "c1",
                     "text": "完整正文",
                     "citations": [
-                        {"source_path": "案例A/a.txt", "filename": "a.txt"},
-                        {"source_path": "案例B/b.txt", "filename": "b.txt"},
+                        {
+                            "source_id": "pptx:案例A.pptx",
+                            "source_path": "案例A/a.pptx",
+                        },
+                        {
+                            "source_id": "docx:案例B.docx",
+                            "source_path": "案例B/b.docx",
+                        },
                     ],
                 }
             ]
@@ -297,9 +303,10 @@ def test_kb_search_knowledge_returns_only_compact_fields_by_default_or_when_disa
 
     assert payload["data"] == [
         {
+            "docId": "pptx:案例A.pptx",
+            "knowledgeType": "SLICE",
+            "title": "切片",
             "content": "完整正文",
-            "source_path": "案例A/a.txt",
-            "filename": "a.txt",
         }
     ]
 
@@ -308,7 +315,7 @@ def test_kb_search_knowledge_returns_only_compact_fields_by_default_or_when_disa
     "citations",
     [None, [], ["不是对象"], [{}]],
 )
-def test_compact_kb_search_results_use_empty_source_fields_for_missing_citation(
+def test_compact_kb_search_results_use_empty_doc_id_for_missing_citation(
     citations,
 ):
     raw = {"text": "正文"}
@@ -323,7 +330,12 @@ def test_compact_kb_search_results_use_empty_source_fields_for_missing_citation(
     )
 
     assert payload["data"] == [
-        {"content": "正文", "source_path": "", "filename": ""}
+        {
+            "docId": "",
+            "knowledgeType": "SLICE",
+            "title": "切片",
+            "content": "正文",
+        }
     ]
 
 
@@ -339,23 +351,21 @@ def test_compact_kb_search_results_use_empty_content_when_text_is_missing():
     )
 
     assert payload["data"] == [
-        {"content": "", "source_path": "", "filename": ""}
+        {
+            "docId": "",
+            "knowledgeType": "SLICE",
+            "title": "切片",
+            "content": "",
+        }
     ]
 
 
 @pytest.mark.parametrize(
-    ("citation", "expected_source_path", "expected_filename"),
-    [
-        ({"filename": "a.txt"}, "", "a.txt"),
-        ({"source_path": "案例A/a.txt"}, "案例A/a.txt", ""),
-        ({"source_path": None, "filename": "a.txt"}, "", "a.txt"),
-        ({"source_path": "案例A/a.txt", "filename": None}, "案例A/a.txt", ""),
-    ],
+    "citation",
+    [{}, {"source_id": None}, {"source_id": ""}],
 )
-def test_compact_kb_search_results_use_empty_source_field_when_first_citation_field_is_missing_or_none(
+def test_compact_kb_search_results_use_empty_doc_id_when_first_citation_source_id_is_missing_or_empty(
     citation,
-    expected_source_path,
-    expected_filename,
 ):
     server = create_mcp_server(
         searcher=FakeSearcher(
@@ -371,9 +381,10 @@ def test_compact_kb_search_results_use_empty_source_field_when_first_citation_fi
 
     assert payload["data"] == [
         {
+            "docId": "",
+            "knowledgeType": "SLICE",
+            "title": "切片",
             "content": "正文",
-            "source_path": expected_source_path,
-            "filename": expected_filename,
         }
     ]
 

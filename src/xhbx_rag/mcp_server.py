@@ -480,9 +480,10 @@ def _format_compact_kb_search_results(
         )
         items.append(
             {
+                "docId": str(first_citation.get("source_id") or ""),
+                "knowledgeType": "SLICE",
+                "title": "切片",
                 "content": str(raw.get("text") or ""),
-                "source_path": str(first_citation.get("source_path") or ""),
-                "filename": str(first_citation.get("filename") or ""),
             }
         )
     return items

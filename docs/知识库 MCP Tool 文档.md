@@ -49,16 +49,17 @@
 
 ### 返回 data
 
-`includeDetails` 省略或为 `false` 时，每条结果只返回完整正文 `content`，以及第一条引用的 `source_path` 和 `filename`。正文或引用字段不存在时，对应字段为空字符串：
+`includeDetails` 省略或为 `false` 时，每条结果返回四字段精简切片摘要：`docId` 取第一条 citation 的 `source_id`，缺失时为空字符串；`knowledgeType` 固定为 `SLICE`，`title` 固定为 `切片`，`content` 为完整正文（缺失时为空字符串）：
 
 ```json
 {
   "success": true,
   "data": [
     {
-      "content": "先共情客户对预算的顾虑，再澄清其保障需求。",
-      "source_path": "案例A/预算异议.txt",
-      "filename": "预算异议.txt"
+      "docId": "pptx:案例A.pptx",
+      "knowledgeType": "SLICE",
+      "title": "切片",
+      "content": "完整正文"
     }
   ],
   "errorCode": null,
