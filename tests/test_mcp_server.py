@@ -81,7 +81,7 @@ def test_server_registers_expected_tools():
     server = create_mcp_server(searcher=FakeSearcher())
     tools = asyncio.run(server.list_tools())
     tool_names = {tool.name for tool in tools}
-    assert tool_names == {"kb_list_knowledge_bases", "kb_search_knowledge"}
+    assert tool_names == {"kb_search_knowledge"}
 
 
 def test_server_can_expose_legacy_tools_for_rollback():
@@ -89,7 +89,6 @@ def test_server_can_expose_legacy_tools_for_rollback():
     tools = asyncio.run(server.list_tools())
     tool_names = {tool.name for tool in tools}
     assert tool_names == {
-        "kb_list_knowledge_bases",
         "kb_search_knowledge",
         "search_knowledge",
         "retrieval_status",
@@ -109,7 +108,6 @@ def test_server_can_use_both_tool_profile():
     tools = asyncio.run(server.list_tools())
     tool_names = {tool.name for tool in tools}
     assert tool_names == {
-        "kb_list_knowledge_bases",
         "kb_search_knowledge",
         "search_knowledge",
         "retrieval_status",
@@ -152,33 +150,6 @@ def test_tool_profile_rejects_invalid_value(tmp_path, monkeypatch):
         mcp_server._tool_profile_from_env(env_file=env_file)
 
 
-def test_kb_list_knowledge_bases_returns_wrapped_visible_kbs():
-    server = create_mcp_server(searcher=FakeSearcher())
-
-    payload = _call_tool(server, "kb_list_knowledge_bases", {})
-
-    assert payload == {
-        "success": True,
-        "data": [
-            {
-                "kbId": 1,
-                "name": "保险绩优案例库",
-                "description": (
-                    "保险绩优案例销售知识，包含客户旅程、销售策略、"
-                    "场景话术和异议处理。"
-                ),
-            },
-            {
-                "kbId": 2,
-                "name": "培训课程库",
-                "description": "保险销售培训课程知识，包含课件、讲师备注和课程切片。",
-            },
-        ],
-        "errorCode": None,
-        "errorMessage": None,
-    }
-
-
 def test_kb_search_knowledge_exposes_documented_parameters():
     server = create_mcp_server(searcher=FakeSearcher())
     tools = asyncio.run(server.list_tools())
@@ -186,13 +157,24 @@ def test_kb_search_knowledge_exposes_documented_parameters():
 
     properties = search_tool.inputSchema["properties"]
     assert properties["query"] == {"title": "Query", "type": "string"}
-    assert properties["kbId"] == {"title": "Kbid", "type": "integer"}
+    assert "kbId" not in properties
+    assert properties["primaryDomains"]["type"] == "array"
+    assert properties["primaryDomains"]["items"] == {
+        "type": "string",
+        "enum": list(mcp_server.CANONICAL_DOMAINS),
+    }
+    assert properties["primaryDomains"]["minItems"] == 0
+    assert properties["primaryDomains"]["maxItems"] == 7
     assert properties["knowledgeTypes"]["default"] is None
     assert properties["retrievalMode"]["default"] == "HYBRID"
     assert properties["hybridWeights"]["default"] is None
     assert properties["topK"]["default"] == 10
     assert properties["includeDetails"]["default"] is False
-    assert search_tool.inputSchema["required"] == ["query", "kbId"]
+    assert search_tool.inputSchema["required"] == ["query", "primaryDomains"]
+    for domain in mcp_server.CANONICAL_DOMAINS:
+        assert domain in search_tool.description
+    assert "一个或多个最相关领域" in search_tool.description
+    assert "无法匹配现有体系时传入空数组" in search_tool.description
     assert search_tool.outputSchema is not None
     assert search_tool.outputSchema["type"] == "object"
 
@@ -206,6 +188,8 @@ def test_kb_search_knowledge_returns_structured_content_with_text_fallback():
                 "knowledgeType": "SLICE",
                 "title": "切片",
                 "content": "完整正文",
+                "primaryDomain": "销售技能",
+                "domainTags": ["销售技能", "客户经营"],
             }
         ],
         "errorCode": None,
@@ -217,6 +201,10 @@ def test_kb_search_knowledge_returns_structured_content_with_text_fallback():
                 "results": [
                     {
                         "text": "完整正文",
+                        "metadata": {
+                            "primary_domain": "销售技能",
+                            "domain_tags": ["销售技能", "客户经营"],
+                        },
                         "citations": [{"source_id": "pptx:案例A.pptx"}],
                     }
                 ]
@@ -227,7 +215,7 @@ def test_kb_search_knowledge_returns_structured_content_with_text_fallback():
     blocks, structured_content = _call_structured_tool(
         server,
         "kb_search_knowledge",
-        {"query": "客户经营", "kbId": 1},
+        {"query": "客户经营", "primaryDomains": ["客户经营"]},
     )
 
     assert structured_content == expected
@@ -243,6 +231,8 @@ def test_kb_search_knowledge_protocol_result_contains_structured_content():
                 "knowledgeType": "SLICE",
                 "title": "切片",
                 "content": "完整正文",
+                "primaryDomain": "销售技能",
+                "domainTags": ["销售技能", "客户经营"],
             }
         ],
         "errorCode": None,
@@ -254,6 +244,10 @@ def test_kb_search_knowledge_protocol_result_contains_structured_content():
                 "results": [
                     {
                         "text": "完整正文",
+                        "metadata": {
+                            "primary_domain": "销售技能",
+                            "domain_tags": ["销售技能", "客户经营"],
+                        },
                         "citations": [{"source_id": "pptx:案例A.pptx"}],
                     }
                 ]
@@ -265,7 +259,7 @@ def test_kb_search_knowledge_protocol_result_contains_structured_content():
         async with create_connected_server_and_client_session(server) as session:
             return await session.call_tool(
                 "kb_search_knowledge",
-                {"query": "客户经营", "kbId": 1},
+                {"query": "客户经营", "primaryDomains": ["客户经营"]},
             )
 
     result = asyncio.run(call_tool())
@@ -290,6 +284,8 @@ def test_kb_search_knowledge_returns_wrapped_slice_results():
                         "tag_paths": ["异议处理/预算"],
                         "parent_id": "p1",
                         "title_path": ["案例A", "预算异议"],
+                        "primary_domain": "销售技能",
+                        "domain_tags": ["销售技能", "客户经营"],
                     },
                     "citations": [{"source_path": "案例A/a.txt"}],
                 }
@@ -303,7 +299,7 @@ def test_kb_search_knowledge_returns_wrapped_slice_results():
         "kb_search_knowledge",
         {
             "query": "预算异议怎么处理",
-            "kbId": 1,
+            "primaryDomains": ["销售技能"],
             "topK": 5,
             "includeDetails": True,
         },
@@ -317,6 +313,8 @@ def test_kb_search_knowledge_returns_wrapped_slice_results():
             "id": "c1",
             "knowledgeType": "SLICE",
             "score": 0.98,
+            "primaryDomain": "销售技能",
+            "domainTags": ["销售技能", "客户经营"],
             "tags": ["异议处理/预算"],
             "qa": None,
             "slice": {
@@ -337,14 +335,7 @@ def test_kb_search_knowledge_returns_wrapped_slice_results():
             "query": "预算异议怎么处理",
             "top_n": 20,
             "top_k": 5,
-            "filters": {
-                "chunk_types": [
-                    "customer_journey",
-                    "strategy",
-                    "script",
-                    "objection_handling",
-                ]
-            },
+            "filters": {"primary_domains": ["销售技能"]},
         }
     ]
 
@@ -358,7 +349,11 @@ def test_kb_search_knowledge_returns_full_results_when_details_enabled():
     payload = _call_tool(
         server,
         "kb_search_knowledge",
-        {"query": "客户经营", "kbId": 1, "includeDetails": True},
+        {
+            "query": "客户经营",
+            "primaryDomains": ["客户经营"],
+            "includeDetails": True,
+        },
     )
 
     assert payload["data"][0]["id"] == "c1"
@@ -375,6 +370,10 @@ def test_kb_search_knowledge_returns_only_compact_fields_by_default_or_when_disa
                 {
                     "chunk_id": "c1",
                     "text": "完整正文",
+                    "metadata": {
+                        "primary_domain": "客户经营",
+                        "domain_tags": ["客户经营"],
+                    },
                     "citations": [
                         {
                             "source_id": "pptx:案例A.pptx",
@@ -394,7 +393,11 @@ def test_kb_search_knowledge_returns_only_compact_fields_by_default_or_when_disa
     payload = _call_tool(
         server,
         "kb_search_knowledge",
-        {"query": "客户经营", "kbId": 1, **details_argument},
+        {
+            "query": "客户经营",
+            "primaryDomains": ["客户经营"],
+            **details_argument,
+        },
     )
 
     assert payload["data"] == [
@@ -403,6 +406,8 @@ def test_kb_search_knowledge_returns_only_compact_fields_by_default_or_when_disa
             "knowledgeType": "SLICE",
             "title": "切片",
             "content": "完整正文",
+            "primaryDomain": "客户经营",
+            "domainTags": ["客户经营"],
         }
     ]
 
@@ -422,7 +427,11 @@ def test_compact_kb_search_results_use_empty_doc_id_for_missing_citation(
     payload = _call_tool(
         server,
         "kb_search_knowledge",
-        {"query": "客户经营", "kbId": 1, "includeDetails": False},
+        {
+            "query": "客户经营",
+            "primaryDomains": ["客户经营"],
+            "includeDetails": False,
+        },
     )
 
     assert payload["data"] == [
@@ -431,6 +440,8 @@ def test_compact_kb_search_results_use_empty_doc_id_for_missing_citation(
             "knowledgeType": "SLICE",
             "title": "切片",
             "content": "正文",
+            "primaryDomain": "",
+            "domainTags": [],
         }
     ]
 
@@ -443,7 +454,11 @@ def test_compact_kb_search_results_use_empty_content_when_text_is_missing():
     payload = _call_tool(
         server,
         "kb_search_knowledge",
-        {"query": "客户经营", "kbId": 1, "includeDetails": False},
+        {
+            "query": "客户经营",
+            "primaryDomains": ["客户经营"],
+            "includeDetails": False,
+        },
     )
 
     assert payload["data"] == [
@@ -452,6 +467,8 @@ def test_compact_kb_search_results_use_empty_content_when_text_is_missing():
             "knowledgeType": "SLICE",
             "title": "切片",
             "content": "",
+            "primaryDomain": "",
+            "domainTags": [],
         }
     ]
 
@@ -472,7 +489,11 @@ def test_compact_kb_search_results_use_empty_doc_id_when_first_citation_source_i
     payload = _call_tool(
         server,
         "kb_search_knowledge",
-        {"query": "客户经营", "kbId": 1, "includeDetails": False},
+        {
+            "query": "客户经营",
+            "primaryDomains": ["客户经营"],
+            "includeDetails": False,
+        },
     )
 
     assert payload["data"] == [
@@ -481,27 +502,98 @@ def test_compact_kb_search_results_use_empty_doc_id_when_first_citation_source_i
             "knowledgeType": "SLICE",
             "title": "切片",
             "content": "正文",
+            "primaryDomain": "",
+            "domainTags": [],
         }
     ]
 
 
-def test_kb_search_knowledge_maps_course_kb_to_training_chunk_filters():
+def test_kb_search_knowledge_uses_safe_domain_defaults_for_dirty_metadata():
+    server = create_mcp_server(
+        searcher=FakeSearcher(
+            result={
+                "results": [
+                    {
+                        "chunk_id": "c1",
+                        "text": "正文",
+                        "metadata": {"domain_tags": "销售技能"},
+                        "citations": [],
+                    }
+                ]
+            }
+        )
+    )
+
+    payload = _call_tool(
+        server,
+        "kb_search_knowledge",
+        {"query": "客户经营", "primaryDomains": ["客户经营"]},
+    )
+
+    assert payload["data"][0]["primaryDomain"] == ""
+    assert payload["data"][0]["domainTags"] == []
+
+
+def test_kb_search_knowledge_filters_by_normalized_primary_domains():
     searcher = FakeSearcher()
     server = create_mcp_server(searcher=searcher)
 
     payload = _call_tool(
         server,
         "kb_search_knowledge",
-        {"query": "促成课程", "kbId": 2},
+        {
+            "query": "  客户担心保费太高怎么沟通  ",
+            "primaryDomains": ["销售技能", " 客户经营 ", "销售技能"],
+        },
     )
 
     assert payload["success"] is True
     assert searcher.calls == [
         {
-            "query": "促成课程",
+            "query": "客户担心保费太高怎么沟通",
             "top_n": 20,
             "top_k": 10,
-            "filters": {"chunk_types": ["training_course", "knowledge_entry"]},
+            "filters": {"primary_domains": ["销售技能", "客户经营"]},
+        }
+    ]
+
+
+def test_kb_search_knowledge_accepts_all_canonical_domains():
+    searcher = FakeSearcher()
+    server = create_mcp_server(searcher=searcher)
+
+    payload = _call_tool(
+        server,
+        "kb_search_knowledge",
+        {
+            "query": "综合问题",
+            "primaryDomains": list(mcp_server.CANONICAL_DOMAINS),
+        },
+    )
+
+    assert payload["success"] is True
+    assert searcher.calls[0]["filters"] == {
+        "primary_domains": list(mcp_server.CANONICAL_DOMAINS)
+    }
+
+
+def test_kb_search_knowledge_empty_primary_domains_searches_all_documents():
+    searcher = FakeSearcher()
+    server = create_mcp_server(searcher=searcher)
+
+    payload = _call_tool(
+        server,
+        "kb_search_knowledge",
+        {"query": "无法匹配现有体系的问题", "primaryDomains": []},
+    )
+
+    assert payload["success"] is True
+    assert searcher.calls == [
+        {
+            "query": "无法匹配现有体系的问题",
+            "top_n": 20,
+            "top_k": 10,
+            "filters": {},
         }
     ]
 
@@ -513,7 +605,11 @@ def test_kb_search_knowledge_returns_empty_data_when_slice_not_requested():
     payload = _call_tool(
         server,
         "kb_search_knowledge",
-        {"query": "预算异议", "kbId": 1, "knowledgeTypes": ["QA"]},
+        {
+            "query": "预算异议",
+            "primaryDomains": ["销售技能"],
+            "knowledgeTypes": ["QA"],
+        },
     )
 
     assert payload == {
@@ -532,7 +628,7 @@ def test_kb_search_knowledge_returns_parameter_error_for_empty_query():
     payload = _call_tool(
         server,
         "kb_search_knowledge",
-        {"query": "   ", "kbId": 1},
+        {"query": "   ", "primaryDomains": ["销售技能"]},
     )
 
     assert payload["success"] is False
@@ -542,23 +638,38 @@ def test_kb_search_knowledge_returns_parameter_error_for_empty_query():
     assert searcher.calls == []
 
 
-def test_kb_search_knowledge_returns_permission_error_for_unknown_kb():
+@pytest.mark.parametrize(
+    "primary_domains",
+    ["销售技能", ["不存在的领域"], ["销售技能", 1], ["销售技能"] * 8],
+)
+def test_kb_search_knowledge_wraps_invalid_primary_domains(primary_domains):
     searcher = FakeSearcher()
     server = create_mcp_server(searcher=searcher)
 
     payload = _call_tool(
         server,
         "kb_search_knowledge",
-        {"query": "客户经营", "kbId": 999},
+        {"query": "客户经营", "primaryDomains": primary_domains},
     )
 
     assert payload == {
         "success": False,
         "data": None,
-        "errorCode": "10003",
-        "errorMessage": "当前用户对指定知识库无访问权限",
+        "errorCode": "10004",
+        "errorMessage": "参数错误: primaryDomains 必须是由 0 到 7 个合法一级领域组成的数组",
     }
     assert searcher.calls == []
+
+
+def test_kb_search_knowledge_rejects_old_kb_id_only_call():
+    server = create_mcp_server(searcher=FakeSearcher())
+
+    with pytest.raises(ToolError, match="primaryDomains"):
+        _call_tool(
+            server,
+            "kb_search_knowledge",
+            {"query": "客户经营", "kbId": 1},
+        )
 
 
 def test_kb_search_knowledge_returns_parameter_error_for_unsupported_mode():
@@ -567,7 +678,11 @@ def test_kb_search_knowledge_returns_parameter_error_for_unsupported_mode():
     payload = _call_tool(
         server,
         "kb_search_knowledge",
-        {"query": "客户经营", "kbId": 1, "retrievalMode": "VECTOR"},
+        {
+            "query": "客户经营",
+            "primaryDomains": ["客户经营"],
+            "retrievalMode": "VECTOR",
+        },
     )
 
     assert payload["success"] is False
@@ -584,7 +699,11 @@ def test_kb_search_knowledge_returns_parameter_error_for_invalid_top_k():
     payload = _call_tool(
         server,
         "kb_search_knowledge",
-        {"query": "客户经营", "kbId": 1, "topK": 51},
+        {
+            "query": "客户经营",
+            "primaryDomains": ["客户经营"],
+            "topK": 51,
+        },
     )
 
     assert payload["success"] is False
@@ -602,7 +721,7 @@ def test_kb_search_knowledge_masks_internal_error_in_wrapped_response():
     payload = _call_tool(
         server,
         "kb_search_knowledge",
-        {"query": "客户经营", "kbId": 1},
+        {"query": "客户经营", "primaryDomains": ["客户经营"]},
     )
 
     assert payload["success"] is False
@@ -847,10 +966,7 @@ def test_default_retrieval_status_does_not_require_chat_config(monkeypatch):
 def test_create_default_server_without_injection():
     server = create_mcp_server()
     tools = asyncio.run(server.list_tools())
-    assert {tool.name for tool in tools} == {
-        "kb_list_knowledge_bases",
-        "kb_search_knowledge",
-    }
+    assert {tool.name for tool in tools} == {"kb_search_knowledge"}
 
 
 def test_create_server_uses_default_http_binding():

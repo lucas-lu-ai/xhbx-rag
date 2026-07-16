@@ -12,21 +12,24 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 from threading import Lock
-from typing import Any, Callable, Mapping, Protocol, Sequence
+from typing import Annotated, Any, Callable, Mapping, Protocol, Sequence
 
 from mcp.server.fastmcp import FastMCP
+from pydantic import Field
 
 from .config import RetrievalConfig, load_env_values
 from .embedding import EmbeddingClient
+from .knowledge_domain import CANONICAL_DOMAINS
 from .milvus_store import MilvusSearchHit, create_retrieval_store
 from .rerank import RerankClient
 from .resource_utils import close_resources, is_local_index_open_failure
 
 SERVER_NAME = "xhbx-rag"
 KB_SERVER_INSTRUCTIONS = (
-    "保险绩优案例销售知识检索服务。"
-    "用 kb_list_knowledge_bases 查看可用知识库；用 kb_search_knowledge "
-    "输入自然语言问题和知识库 ID，返回统一 McpResponse 包装的知识切片结果。"
+    "保险知识检索服务。调用 kb_search_knowledge 时，primaryDomains 必须传入。"
+    "能够匹配现有一级体系时，服务器问答智能体应根据问题"
+    "从产品知识、合规与风控、销售技能、客户经营、行业与公司、个人成长、组织发展"
+    "中选择一个或多个最相关领域；无法匹配现有体系时传入空数组，由 MCP 查询全部文档。"
 )
 LEGACY_SERVER_INSTRUCTIONS = (
     "保险绩优案例销售知识检索服务。"
@@ -34,8 +37,11 @@ LEGACY_SERVER_INSTRUCTIONS = (
     "（含知识类型、原文引用与定位）；用 retrieval_status 查看索引与配置状态。"
 )
 BOTH_SERVER_INSTRUCTIONS = (
-    "保险绩优案例销售知识检索服务。默认建议使用 kb_list_knowledge_bases 和 "
-    "kb_search_knowledge；旧客户端也可继续使用 search_knowledge。"
+    "保险知识检索服务。新调用方应使用 kb_search_knowledge，primaryDomains 必须"
+    "传入。能够匹配现有一级体系时，从产品知识、"
+    "合规与风控、销售技能、客户经营、行业与公司、个人成长、组织发展中选择"
+    "一个或多个最相关领域；无法匹配现有体系时传入空数组，由 MCP 查询全部文档；"
+    "旧客户端也可继续使用 search_knowledge。"
 )
 SERVER_INSTRUCTIONS = KB_SERVER_INSTRUCTIONS
 
@@ -54,27 +60,6 @@ CHUNK_TYPE_LABELS = {
     "objection_handling": "异议处理",
     "training_course": "培训课程",
 }
-KB_CASE_ID = 1
-KB_COURSE_ID = 2
-VISIBLE_KNOWLEDGE_BASES = [
-    {
-        "kbId": KB_CASE_ID,
-        "name": "保险绩优案例库",
-        "description": "保险绩优案例销售知识，包含客户旅程、销售策略、场景话术和异议处理。",
-    },
-    {
-        "kbId": KB_COURSE_ID,
-        "name": "培训课程库",
-        "description": "保险销售培训课程知识，包含课件、讲师备注和课程切片。",
-    },
-]
-CASE_KB_CHUNK_TYPES = [
-    "customer_journey",
-    "strategy",
-    "script",
-    "objection_handling",
-]
-COURSE_KB_CHUNK_TYPES = ["training_course", "knowledge_entry"]
 DEFAULT_KB_TOP_K = 10
 MAX_KB_TOP_K = 50
 SLICE_PREVIEW_CHARS = 240
@@ -89,6 +74,21 @@ SUPPORTED_TOOL_PROFILES = {
     TOOL_PROFILE_LEGACY,
     TOOL_PROFILE_BOTH,
 }
+PRIMARY_DOMAINS_ERROR = (
+    "参数错误: primaryDomains 必须是由 0 到 7 个合法一级领域组成的数组"
+)
+PrimaryDomainsInput = Annotated[
+    Any,
+    Field(
+        description="必传一级领域数组；空数组表示全库检索，非空项仅允许七类固定标签。",
+        json_schema_extra={
+            "type": "array",
+            "items": {"type": "string", "enum": list(CANONICAL_DOMAINS)},
+            "minItems": 0,
+            "maxItems": len(CANONICAL_DOMAINS),
+        },
+    ),
+]
 
 UNAVAILABLE_SEARCH_ERROR = "检索服务暂时不可用"
 SAFE_CONFIG_PARSE_ERROR = "配置解析失败，请检查 .env 中的数值配置。"
@@ -260,12 +260,9 @@ def create_mcp_server(
         streamable_http_path=streamable_http_path,
     )
 
-    def kb_list_knowledge_bases() -> dict:
-        return _mcp_success([dict(item) for item in VISIBLE_KNOWLEDGE_BASES])
-
     def kb_search_knowledge(
         query: str,
-        kbId: int,
+        primaryDomains: PrimaryDomainsInput,
         knowledgeTypes: list[str] | None = None,
         retrievalMode: str = SUPPORTED_KB_RETRIEVAL_MODE,
         hybridWeights: dict[str, Any] | None = None,
@@ -276,11 +273,8 @@ def create_mcp_server(
         if not stripped_query:
             return _mcp_error("10004", "参数错误: query 不能为空")
 
-        filters = _kb_filters(kbId)
-        if filters is None:
-            return _mcp_error("10003", "当前用户对指定知识库无访问权限")
-
         try:
+            primary_domains = _normalize_primary_domains(primaryDomains)
             top_k = _normalize_kb_top_k(topK)
             retrieval_mode = str(retrievalMode or "").strip().upper()
             if retrieval_mode != SUPPORTED_KB_RETRIEVAL_MODE:
@@ -297,6 +291,7 @@ def create_mcp_server(
         if "SLICE" not in knowledge_types:
             return _mcp_success([])
 
+        filters = {"primary_domains": primary_domains} if primary_domains else {}
         try:
             result = active_searcher.search(
                 query=stripped_query,
@@ -351,14 +346,13 @@ def create_mcp_server(
 
     if active_tool_profile in {TOOL_PROFILE_KB, TOOL_PROFILE_BOTH}:
         server.tool(
-            name="kb_list_knowledge_bases",
-            description="列出当前用户有权限查阅的知识库。",
-        )(kb_list_knowledge_bases)
-        server.tool(
             name="kb_search_knowledge",
             description=(
-                "在指定知识库中统一检索 QA、文档切片、知识点。调用前应先使用 "
-                "kb_list_knowledge_bases 获取可见知识库 ID。"
+                "在统一知识库中检索文档切片，primaryDomains 必须传入。"
+                "能够匹配现有一级体系时，调用方应根据问题从产品知识、"
+                "合规与风控、销售技能、客户经营、行业与公司、个人成长、组织发展"
+                "中选择一个或多个最相关领域；无法匹配现有体系时传入空数组，"
+                "由 MCP 查询全部文档。"
             ),
         )(kb_search_knowledge)
 
@@ -432,12 +426,21 @@ def _mcp_error(error_code: str, error_message: str) -> dict[str, Any]:
     }
 
 
-def _kb_filters(kb_id: int) -> dict[str, Any] | None:
-    if kb_id == KB_CASE_ID:
-        return {"chunk_types": CASE_KB_CHUNK_TYPES}
-    if kb_id == KB_COURSE_ID:
-        return {"chunk_types": COURSE_KB_CHUNK_TYPES}
-    return None
+def _normalize_primary_domains(value: Any) -> list[str]:
+    if not isinstance(value, list) or len(value) > len(CANONICAL_DOMAINS):
+        raise ValueError(PRIMARY_DOMAINS_ERROR)
+
+    normalized: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError(PRIMARY_DOMAINS_ERROR)
+        domain = item.strip()
+        if domain not in CANONICAL_DOMAINS:
+            raise ValueError(PRIMARY_DOMAINS_ERROR)
+        if domain not in normalized:
+            normalized.append(domain)
+
+    return normalized
 
 
 def _normalize_kb_top_k(top_k: int | None) -> int:
@@ -460,16 +463,23 @@ def _normalize_knowledge_types(knowledge_types: list[str] | None) -> list[str]:
     ]
 
 
+def _normalize_domain_tags(value: Any) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        return []
+    return [item for item in value if item]
+
+
 def _format_compact_kb_search_results(
     result: dict[str, Any],
-) -> list[dict[str, str]]:
-    items: list[dict[str, str]] = []
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
     raw_results = result.get("results", [])
     if not isinstance(raw_results, list):
         return items
     for raw in raw_results:
         if not isinstance(raw, dict):
             continue
+        metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
         citations = raw.get("citations")
         first_citation = (
             citations[0]
@@ -484,6 +494,8 @@ def _format_compact_kb_search_results(
                 "knowledgeType": "SLICE",
                 "title": "切片",
                 "content": str(raw.get("text") or ""),
+                "primaryDomain": str(metadata.get("primary_domain") or ""),
+                "domainTags": _normalize_domain_tags(metadata.get("domain_tags")),
             }
         )
     return items
@@ -506,6 +518,8 @@ def _format_kb_search_results(result: dict[str, Any]) -> list[dict[str, Any]]:
                 "id": raw.get("chunk_id"),
                 "knowledgeType": "SLICE",
                 "score": raw.get("rerank_score", raw.get("score")),
+                "primaryDomain": str(metadata.get("primary_domain") or ""),
+                "domainTags": _normalize_domain_tags(metadata.get("domain_tags")),
                 "tags": metadata.get("tag_paths") or None,
                 "qa": None,
                 "slice": {
