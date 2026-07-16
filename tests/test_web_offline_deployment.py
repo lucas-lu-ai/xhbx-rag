@@ -158,3 +158,31 @@ def test_package_script_rejects_invalid_platform_without_docker() -> None:
     assert result.returncode == 2
     assert "amd|arm" in result.stderr
     assert "docker" not in result.stdout.lower()
+
+
+def test_offline_deployment_doc_covers_delivery_and_operations() -> None:
+    docs = read_repo_file("docs/Web问答界面离线部署文档.md")
+
+    for text in (
+        "sh scripts/package_web_offline.sh amd",
+        "sh scripts/package_web_offline.sh arm",
+        "sh deploy_web_offline.sh",
+        "sh verify_web_offline.sh",
+        "http://服务器IP:18088",
+        "xhbx_sales_chunks",
+        "xhbx_course_chunks",
+        "parsed/chunk/*.chunks.jsonl",
+        "docker compose -f docker-compose.offline.yml logs",
+        "docker compose down -v",
+        "不携带 data/",
+    ):
+        assert text in docs
+
+
+def test_offline_deployment_doc_does_not_contain_real_secrets() -> None:
+    docs = read_repo_file("docs/Web问答界面离线部署文档.md")
+
+    assert "sk-" not in docs
+    assert "API_KEY=not-required" in docs
+    assert "EMBEDDING_API_KEY=not-required" in docs
+    assert "RERANK_API_KEY=not-required" in docs
