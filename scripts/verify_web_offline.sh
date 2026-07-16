@@ -77,10 +77,7 @@ from xhbx_rag.config import RetrievalConfig
 from xhbx_rag.milvus_store import create_milvus_store
 
 config = RetrievalConfig.from_env(require_chat=False)
-collections = (
-    ("案例库", config.milvus_collection),
-    ("课程库", config.milvus_course_collection),
-)
+collections = (("统一知识库", config.milvus_collection),)
 for label, collection_name in collections:
     store = create_milvus_store(config, collection_name=collection_name)
     if not store.collection_exists():

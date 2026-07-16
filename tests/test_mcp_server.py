@@ -442,7 +442,7 @@ def test_compact_kb_search_results_use_empty_doc_id_when_first_citation_source_i
     ]
 
 
-def test_kb_search_knowledge_maps_course_kb_to_training_course_filter():
+def test_kb_search_knowledge_maps_course_kb_to_training_chunk_filters():
     searcher = FakeSearcher()
     server = create_mcp_server(searcher=searcher)
 
@@ -458,7 +458,7 @@ def test_kb_search_knowledge_maps_course_kb_to_training_course_filter():
             "query": "促成课程",
             "top_n": 20,
             "top_k": 10,
-            "filters": {"chunk_types": ["training_course"]},
+            "filters": {"chunk_types": ["training_course", "knowledge_entry"]},
         }
     ]
 

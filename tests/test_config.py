@@ -51,7 +51,7 @@ def test_retrieval_config_reads_env_file_without_exposing_secrets(tmp_path) -> N
     assert config.embedding_api_key == "embedding-secret"
     assert config.rerank_api_key == "rerank-secret"
     assert config.milvus_lite_path == Path(".local/milvus/xhbx_rag.db")
-    assert config.milvus_collection == "xhbx_sales_chunks"
+    assert config.milvus_collection == "xhbx_knowledge_chunks"
     assert config.milvus_vector_dim is None
     assert config.vision_model_name == ""
     assert "secret" not in config.safe_summary()

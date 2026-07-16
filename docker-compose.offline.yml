@@ -7,7 +7,7 @@ x-app-service: &app-service
   environment:
     MILVUS_MODE: docker
     MILVUS_URI: http://standalone:19530
-    MILVUS_COLLECTION: ${MILVUS_COLLECTION:-xhbx_sales_chunks}
+    MILVUS_COLLECTION: ${MILVUS_COLLECTION:-xhbx_knowledge_chunks}
     MILVUS_COURSE_COLLECTION: ${MILVUS_COURSE_COLLECTION:-xhbx_course_chunks}
     WEB_BATCH_CONCURRENCY: ${WEB_BATCH_CONCURRENCY:-3}
     WEB_RETRIEVAL_TOP_N: ${WEB_RETRIEVAL_TOP_N:-20}

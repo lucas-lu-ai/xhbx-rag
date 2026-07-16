@@ -214,14 +214,9 @@ def _build_ingestion_runner(
             api_key=config.embedding_api_key,
             model=config.embedding_model_name,
         )
-        collection_name = (
-            config.milvus_course_collection
-            if target == "course"
-            else config.milvus_collection
-        )
         milvus_store = create_milvus_store(
             config,
-            collection_name=collection_name,
+            collection_name=config.milvus_collection,
         )
         return AtomicIndexer(
             embedding_client=embedding_client,

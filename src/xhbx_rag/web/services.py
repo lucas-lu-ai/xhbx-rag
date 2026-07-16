@@ -140,16 +140,8 @@ def _collection_names_for_targets(
     config: RetrievalConfig,
     targets: Sequence[CollectionTarget],
 ) -> list[str]:
-    collection_by_target = {
-        "case": config.milvus_collection,
-        "course": config.milvus_course_collection,
-    }
-    selected: list[str] = []
-    for target in targets:
-        collection_name = collection_by_target.get(target)
-        if collection_name and collection_name not in selected:
-            selected.append(collection_name)
-    return selected or configured_collection_names(config)
+    del targets
+    return [config.milvus_collection]
 
 
 # 兼容旧名，避免存量调用点/测试破坏。
@@ -411,7 +403,7 @@ _STREAM_STEP_MESSAGES = {
     "search.vector_searched": "已完成向量检索",
     "search.keyword_searched": "已完成关键词检索",
     "search.hybrid_fused": "已完成混合召回融合",
-    "search.tag_boosted": "已完成标签加权",
+    "search.domain_boosted": "已完成一级标签加权",
     "search.reranked": "已完成证据重排",
     "search.completed": "已完成检索",
     "answer.skipped": "已跳过回答生成",

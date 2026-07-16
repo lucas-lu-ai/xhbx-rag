@@ -74,7 +74,7 @@ CASE_KB_CHUNK_TYPES = [
     "script",
     "objection_handling",
 ]
-COURSE_KB_CHUNK_TYPES = ["training_course"]
+COURSE_KB_CHUNK_TYPES = ["training_course", "knowledge_entry"]
 DEFAULT_KB_TOP_K = 10
 MAX_KB_TOP_K = 50
 SLICE_PREVIEW_CHARS = 240

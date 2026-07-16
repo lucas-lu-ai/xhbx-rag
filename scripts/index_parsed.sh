@@ -2,31 +2,23 @@
 set -eu
 
 PARSED_DIR="${PARSED_DIR:-parsed}"
-INDEX_MODE="${INDEX_MODE:-incremental}"
-RESET_COLLECTION="${RESET_COLLECTION:-false}"
-CHUNKS_LIST="/tmp/xhbx-rag-parsed-chunks.txt"
+NORMALIZED_DIR="${NORMALIZED_DIR:-parsed_normalized}"
+COLLECTION_NAME="${COLLECTION_NAME:-xhbx_knowledge_chunks}"
+BATCH_SIZE="${BATCH_SIZE:-64}"
 
 if [ ! -d "$PARSED_DIR" ]; then
   echo "parsed 目录不存在: $PARSED_DIR" >&2
   exit 1
 fi
 
-find "$PARSED_DIR" -type f -name "chunks.jsonl" | sort > "$CHUNKS_LIST"
+uv run xhbx-rag normalize-knowledge \
+  --input-dir "$PARSED_DIR" \
+  --out "$NORMALIZED_DIR"
 
-if [ ! -s "$CHUNKS_LIST" ]; then
-  echo "未在 $PARSED_DIR 下找到 chunks.jsonl" >&2
-  exit 1
-fi
+uv run xhbx-rag index-dir \
+  --chunks-dir "$NORMALIZED_DIR" \
+  --collection-name "$COLLECTION_NAME" \
+  --mode rebuild \
+  --batch-size "$BATCH_SIZE"
 
-count=0
-while IFS= read -r chunks_file; do
-  count=$((count + 1))
-  current_mode="$INDEX_MODE"
-  if [ "$RESET_COLLECTION" = "true" ] && [ "$count" -eq 1 ]; then
-    current_mode="rebuild"
-  fi
-  echo "[${count}] 入库 ${chunks_file}，模式: ${current_mode}"
-  xhbx-rag index --chunks "$chunks_file" --mode "$current_mode"
-done < "$CHUNKS_LIST"
-
-echo "完成：已处理 ${count} 个 chunks.jsonl，默认模式: ${INDEX_MODE}，重建开关: ${RESET_COLLECTION}"
+echo "统一知识库入库完成：collection=${COLLECTION_NAME}"

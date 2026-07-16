@@ -137,7 +137,7 @@ def test_mcp_env_template_documents_server_binding_and_collections() -> None:
     assert "both   = 新旧 tool 都暴露" in env_template
     assert "MILVUS_MODE=docker" in env_template
     assert "MILVUS_URI=http://localhost:19530" in env_template
-    assert "MILVUS_COLLECTION=xhbx_sales_chunks" in env_template
+    assert "MILVUS_COLLECTION=xhbx_knowledge_chunks" in env_template
     assert "MILVUS_COURSE_COLLECTION=xhbx_course_chunks" in env_template
     assert "DOCKER_PLATFORM=linux/amd64" in env_template
 
@@ -146,10 +146,11 @@ def test_index_parsed_script_indexes_every_chunks_jsonl_under_parsed() -> None:
     script = read_repo_file("scripts/index_parsed.sh")
 
     assert 'PARSED_DIR="${PARSED_DIR:-parsed}"' in script
-    assert 'RESET_COLLECTION="${RESET_COLLECTION:-false}"' in script
-    assert 'find "$PARSED_DIR" -type f -name "chunks.jsonl"' in script
-    assert 'current_mode="rebuild"' in script
-    assert 'xhbx-rag index --chunks "$chunks_file" --mode "$current_mode"' in script
+    assert 'NORMALIZED_DIR="${NORMALIZED_DIR:-parsed_normalized}"' in script
+    assert 'COLLECTION_NAME="${COLLECTION_NAME:-xhbx_knowledge_chunks}"' in script
+    assert "uv run xhbx-rag normalize-knowledge" in script
+    assert "uv run xhbx-rag index-dir" in script
+    assert '--mode rebuild' in script
 
 
 def test_package_mcp_offline_script_exports_images_and_deploy_files() -> None:

@@ -87,9 +87,9 @@ class RetrievalConfig:
             milvus_token=values.get("MILVUS_TOKEN", "").strip(),
             milvus_collection=values.get(
                 "MILVUS_COLLECTION",
-                "xhbx_sales_chunks",
+                "xhbx_knowledge_chunks",
             ).strip()
-            or "xhbx_sales_chunks",
+            or "xhbx_knowledge_chunks",
             milvus_course_collection=values.get(
                 "MILVUS_COURSE_COLLECTION",
                 "xhbx_course_chunks",

@@ -25,7 +25,7 @@ def test_offline_compose_is_image_only_and_uses_uncommon_web_port() -> None:
         assert f"  {service_name}:" in compose
 
 
-def test_offline_env_has_model_and_dual_collection_settings() -> None:
+def test_offline_env_has_model_and_unified_collection_settings() -> None:
     env_template = read_repo_file(".env.offline.example")
 
     for setting in (
@@ -38,14 +38,14 @@ def test_offline_env_has_model_and_dual_collection_settings() -> None:
         "RERANK_BASE_URL=",
         "RERANK_MODEL_NAME=",
         "RERANK_API_KEY=",
-        "MILVUS_COLLECTION=xhbx_sales_chunks",
+        "MILVUS_COLLECTION=xhbx_knowledge_chunks",
         "MILVUS_COURSE_COLLECTION=xhbx_course_chunks",
         "WEB_PORT=18088",
     ):
         assert setting in env_template
 
 
-def test_index_script_routes_case_and_course_files(tmp_path: Path) -> None:
+def test_index_script_normalizes_and_rebuilds_unified_collection(tmp_path: Path) -> None:
     parsed = tmp_path / "parsed"
     (parsed / "case-a").mkdir(parents=True)
     (parsed / "case-b").mkdir()
@@ -80,11 +80,12 @@ def test_index_script_routes_case_and_course_files(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     calls = call_log.read_text(encoding="utf-8").splitlines()
-    assert len(calls) == 3
-    assert "--collection case --mode rebuild" in calls[0]
-    assert "--collection case --mode incremental" in calls[1]
-    assert "--collection course --mode rebuild" in calls[2]
-    assert all("parsed/chunk" not in call for call in calls[:2])
+    assert len(calls) == 2
+    assert calls[0].startswith("normalize-knowledge --input-dir")
+    assert "--out" in calls[0]
+    assert calls[1].startswith("index-dir --chunks-dir")
+    assert "--collection-name xhbx_knowledge_chunks" in calls[1]
+    assert "--mode rebuild" in calls[1]
 
 
 def test_index_script_rejects_unknown_target_without_running_cli(
@@ -99,7 +100,7 @@ def test_index_script_rejects_unknown_target_without_running_cli(
     )
 
     assert result.returncode == 2
-    assert "all|case|course" in result.stderr
+    assert "all" in result.stderr
 
 
 def test_deploy_script_validates_before_loading_and_indexes_before_web() -> None:

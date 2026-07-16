@@ -12,9 +12,11 @@ from .chunk_builder import build_chunks
 from .config import RetrievalConfig
 from .course_enrichment import CourseEnrichmentAgentScopeAgent
 from .course_parser import parse_course_dir
+from .directory_indexer import DirectoryIndexError, index_directory
 from .embedding import EmbeddingClient
 from .evaluation.command import run_evaluate_command
 from .indexer import index_chunks
+from .knowledge_normalizer import normalize_knowledge
 from .milvus_store import (
     MilvusStore,
     MultiCollectionStore,
@@ -214,6 +216,37 @@ def _build_parser() -> argparse.ArgumentParser:
         default="localhost:4317",
         help="AgentScope Studio OTLP gRPC endpoint，默认 localhost:4317",
     )
+
+    normalize_knowledge_parser = subparsers.add_parser(
+        "normalize-knowledge",
+        help="规范化 parsed chunk 的来源类型与一级标签",
+    )
+    normalize_knowledge_parser.add_argument(
+        "--input-dir",
+        required=True,
+        type=Path,
+    )
+    normalize_knowledge_parser.add_argument(
+        "--out",
+        required=True,
+        type=Path,
+    )
+
+    index_dir_parser = subparsers.add_parser(
+        "index-dir",
+        help="从规范化目录原子重建统一知识库",
+    )
+    index_dir_parser.add_argument("--chunks-dir", required=True, type=Path)
+    index_dir_parser.add_argument(
+        "--collection-name",
+        default="xhbx_knowledge_chunks",
+    )
+    index_dir_parser.add_argument(
+        "--mode",
+        choices=["rebuild"],
+        default="rebuild",
+    )
+    index_dir_parser.add_argument("--batch-size", type=int, default=64)
 
     parse_course_parser = subparsers.add_parser(
         "parse-course",
@@ -520,6 +553,66 @@ def _cmd_index(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_normalize_knowledge(args: argparse.Namespace) -> int:
+    try:
+        result = normalize_knowledge(args.input_dir, args.out)
+    except ValueError as exc:
+        print(
+            json.dumps(
+                {"success": False, "error": str(exc)},
+                ensure_ascii=False,
+            )
+        )
+        return 1
+    print(
+        json.dumps(
+            {
+                "success": result.success,
+                "report_path": str(result.report_path),
+                "input_files": result.input_files,
+                "chunks": result.chunks,
+            },
+            ensure_ascii=False,
+        )
+    )
+    return 0 if result.success else 1
+
+
+def _cmd_index_dir(args: argparse.Namespace) -> int:
+    try:
+        config = RetrievalConfig.from_env(require_chat=False)
+        result = index_directory(
+            args.chunks_dir,
+            _embedding_client(config),
+            lambda name: create_milvus_store(config, collection_name=name),
+            args.collection_name,
+            batch_size=args.batch_size,
+            mode=args.mode,
+        )
+    except (DirectoryIndexError, ValueError) as exc:
+        print(
+            json.dumps(
+                {"success": False, "error": str(exc)},
+                ensure_ascii=False,
+            )
+        )
+        return 1
+    print(
+        json.dumps(
+            {
+                "success": True,
+                "collection": result.collection,
+                "files": result.files,
+                "indexed": result.indexed,
+                "vector_dim": result.vector_dim,
+                "primary_domain_counts": result.primary_domain_counts,
+            },
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
 def _cmd_parse_course(args: argparse.Namespace) -> int:
     config = RetrievalConfig.from_env()
     trace = _trace_sink(args, "xhbx-rag.parse-course")
@@ -649,6 +742,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _cmd_ingest(args)
     if args.command == "index":
         return _cmd_index(args)
+    if args.command == "normalize-knowledge":
+        return _cmd_normalize_knowledge(args)
+    if args.command == "index-dir":
+        return _cmd_index_dir(args)
     if args.command == "parse-course":
         return _cmd_parse_course(args)
     if args.command == "ingest-course":

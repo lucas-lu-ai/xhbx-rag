@@ -796,15 +796,15 @@ def test_answer_question_stream_events_emit_steps_deltas_and_final(
     ):
         trace.emit("search.query_understood", {"rewritten_query": "预算不超过80万"})
         trace.emit(
-            "search.tag_boosted",
+            "search.domain_boosted",
             {
-                "query_tag_paths": ["客户需求/保费预算"],
+                "query_domains": ["客户经营"],
                 "boosted_count": 1,
                 "boosted": [
                     {
                         "chunk_id": "c1",
-                        "matched_tag_paths": ["客户需求/保费预算"],
-                        "boost_factor": 1.1,
+                        "matched_domains": ["客户经营"],
+                        "domain_boost_factor": 1.1,
                     }
                 ],
             },
@@ -840,9 +840,9 @@ def test_answer_question_stream_events_emit_steps_deltas_and_final(
     assert events[0]["step"] == "search.query_understood"
     assert events[0]["message"] == "已完成问题理解"
     assert events[0]["payload"] == {"rewritten_query": "预算不超过80万"}
-    assert events[1]["step"] == "search.tag_boosted"
-    assert events[1]["message"] == "已完成标签加权"
-    assert events[1]["payload"]["query_tag_paths"] == ["客户需求/保费预算"]
+    assert events[1]["step"] == "search.domain_boosted"
+    assert events[1]["message"] == "已完成一级标签加权"
+    assert events[1]["payload"]["query_domains"] == ["客户经营"]
     assert events[1]["payload"]["boosted"][0]["chunk_id"] == "c1"
     assert events[2] == {"type": "thinking_delta", "text": "先分析预算约束，"}
     assert events[3] == {"type": "thinking_delta", "text": "再匹配可行方案。"}
@@ -1005,8 +1005,8 @@ def test_answer_question_strips_query_before_rag_call(monkeypatch) -> None:
     ("targets", "expected_collections"),
     [
         (["case"], ["xhbx_sales_chunks"]),
-        (["course"], ["xhbx_course_chunks"]),
-        (["case", "course"], ["xhbx_sales_chunks", "xhbx_course_chunks"]),
+        (["course"], ["xhbx_sales_chunks"]),
+        (["case", "course"], ["xhbx_sales_chunks"]),
     ],
 )
 def test_answer_question_routes_model_targets_and_reuses_understanding(

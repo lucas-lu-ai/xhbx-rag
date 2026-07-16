@@ -1172,7 +1172,7 @@ def test_lifespan_stop_failures_are_isolated(caplog) -> None:
     assert any(record.message == "批量执行 Runner 停止失败" for record in caplog.records)
 
 
-def test_production_ingestion_factory_is_lazy_and_selects_target_collection(
+def test_production_ingestion_factory_is_lazy_and_uses_unified_collection(
     monkeypatch, tmp_path: Path
 ) -> None:
     config_calls: list[str] = []
@@ -1220,10 +1220,10 @@ def test_production_ingestion_factory_is_lazy_and_selects_target_collection(
 
     assert config_calls == ["config", "config"]
     assert case_indexer.store.collection_name == "case_collection"
-    assert course_indexer.store.collection_name == "course_collection"
+    assert course_indexer.store.collection_name == "case_collection"
     assert [value for kind, value in constructed if kind == "milvus"] == [
         "case_collection",
-        "course_collection",
+        "case_collection",
     ]
 
 
