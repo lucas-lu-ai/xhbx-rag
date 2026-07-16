@@ -148,4 +148,5 @@ else
       ;;
   esac
   echo "如需检索测试：PRIMARY_DOMAINS_JSON='[\"销售技能\",\"客户经营\"]' QUERY='客户说预算不够怎么办？' $0"
+  echo "全库检索测试：PRIMARY_DOMAINS_JSON='[]' QUERY='无法匹配现有体系的问题' $0"
 fi

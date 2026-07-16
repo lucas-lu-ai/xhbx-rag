@@ -151,6 +151,13 @@ PRIMARY_DOMAINS_JSON='["销售技能","客户经营"]' \
   scripts/test_mcp.sh "客户说预算不够怎么办？"
 ```
 
+无法匹配现有一级体系时，传空数组查询全部文档：
+
+```bash
+PRIMARY_DOMAINS_JSON='[]' \
+  scripts/test_mcp.sh "无法匹配现有体系的问题"
+```
+
 如果 `kb_search_knowledge` 只返回安全兜底错误，用下面命令查看容器内真实异常：
 
 ```bash
@@ -168,7 +175,7 @@ MCP_BIND=0.0.0.0
 Tool 暴露模式也在 `.env.mcp` 中设置：
 
 ```env
-MCP_TOOL_PROFILE=kb      # 默认，只暴露 kb_search_knowledge（必传 primaryDomains）
+MCP_TOOL_PROFILE=kb      # 默认，只暴露 kb_search_knowledge（primaryDomains 必传，[] 全库）
 MCP_TOOL_PROFILE=legacy  # 只暴露旧 search_knowledge / retrieval_status / list_filter_options
 MCP_TOOL_PROFILE=both    # 新旧工具都暴露
 ```

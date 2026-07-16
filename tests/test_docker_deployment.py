@@ -177,6 +177,10 @@ def test_package_mcp_offline_script_exports_images_and_deploy_files() -> None:
     assert "MCP_TOOL_PROFILE=legacy" in script
     assert "MCP_TOOL_PROFILE=both" in script
     assert 'INCLUDE_PARSED="${INCLUDE_PARSED:-true}"' in script
+    assert (
+        '  scripts/test_mcp.sh "客户说预算不够怎么办？"\n```\n\n'
+        "无法匹配现有一级体系时"
+    ) in script
 
 
 def test_load_mcp_offline_script_loads_images_and_starts_without_build() -> None:
@@ -206,6 +210,8 @@ def test_mcp_test_script_covers_primary_domain_search() -> None:
     assert '\\"primaryDomains\\":$PRIMARY_DOMAINS_JSON' in script
     assert '\\"kbId\\"' not in script
     assert '\\"topK\\":$TOP_K' in script
+    assert "PRIMARY_DOMAINS_JSON='[]'" in script
+    assert "无法匹配现有体系" in script
     assert 'QUERY="${1:-${QUERY:-}}"' in script
     assert "curl -fsS -N" in script
 
