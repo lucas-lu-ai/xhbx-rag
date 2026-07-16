@@ -47,9 +47,10 @@
 |topK|int|否|返回数量，默认 10，最大 50|
 |includeDetails|boolean|否|是否返回完整切片结构，默认 false。省略或设为 false 时返回精简结构；设为 true 时返回原完整结构|
 
-标准 MCP 调用结果将业务对象放在 `CallToolResult.structuredContent`；
+`kb_search_knowledge` 的标准 MCP 调用结果将业务对象放在 `CallToolResult.structuredContent`；
 新调用方应直接读取该字段，无需解析 `content[].text`。
 `content[].text` 仅作为旧客户端兼容回退保留。
+`kb_list_knowledge_bases` 的返回行为未变，调用方仍从 `content[].text` 读取列表结果。
 
 ### 返回 data
 

@@ -3,6 +3,7 @@ import json
 
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
+from mcp.shared.memory import create_connected_server_and_client_session
 
 import xhbx_rag.mcp_server as mcp_server
 from xhbx_rag.config import ConfigError
@@ -231,6 +232,48 @@ def test_kb_search_knowledge_returns_structured_content_with_text_fallback():
 
     assert structured_content == expected
     assert json.loads(blocks[0].text) == expected
+
+
+def test_kb_search_knowledge_protocol_result_contains_structured_content():
+    expected = {
+        "success": True,
+        "data": [
+            {
+                "docId": "pptx:案例A.pptx",
+                "knowledgeType": "SLICE",
+                "title": "切片",
+                "content": "完整正文",
+            }
+        ],
+        "errorCode": None,
+        "errorMessage": None,
+    }
+    server = create_mcp_server(
+        searcher=FakeSearcher(
+            result={
+                "results": [
+                    {
+                        "text": "完整正文",
+                        "citations": [{"source_id": "pptx:案例A.pptx"}],
+                    }
+                ]
+            }
+        )
+    )
+
+    async def call_tool():
+        async with create_connected_server_and_client_session(server) as session:
+            return await session.call_tool(
+                "kb_search_knowledge",
+                {"query": "客户经营", "kbId": 1},
+            )
+
+    result = asyncio.run(call_tool())
+
+    assert result.structuredContent == expected
+    assert result.content
+    assert json.loads(result.content[0].text) == expected
+    assert result.isError is False
 
 
 def test_kb_search_knowledge_returns_wrapped_slice_results():
