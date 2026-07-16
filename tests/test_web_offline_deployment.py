@@ -127,3 +127,34 @@ def test_verify_script_checks_services_collections_and_real_answer() -> None:
     assert "/api/answer" in script
     assert "SMOKE_QUERY" in script
     assert "row_count" in script
+
+
+def test_package_script_maps_platforms_and_exports_required_assets() -> None:
+    script = read_repo_file("scripts/package_web_offline.sh")
+
+    assert 'amd) PLATFORM_SUFFIX="amd64"; DOCKER_PLATFORM="linux/amd64"' in script
+    assert 'arm) PLATFORM_SUFFIX="arm64"; DOCKER_PLATFORM="linux/arm64"' in script
+    assert "docker buildx build" in script
+    assert "xhbx-rag-api:latest" in script
+    assert "xhbx-rag-web:latest" in script
+    assert 'docker pull --platform "$DOCKER_PLATFORM" "$image"' in script
+    assert "docker save" in script
+    assert "images.sha256" in script
+    assert "package-manifest.txt" in script
+    assert "parsed/chunk" in script
+    assert "README.offline.md" in script
+    assert "cp -R data" not in script
+
+
+def test_package_script_rejects_invalid_platform_without_docker() -> None:
+    result = subprocess.run(
+        ["sh", str(ROOT / "scripts/package_web_offline.sh"), "invalid"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "amd|arm" in result.stderr
+    assert "docker" not in result.stdout.lower()
