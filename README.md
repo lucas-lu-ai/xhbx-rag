@@ -143,9 +143,34 @@ uv run xhbx-rag index --chunks parsed/<case_id>/chunks.jsonl
 uv run xhbx-rag answer --query "客户说每年不能超过80万怎么办？" --top-n 20 --top-k 5
 ```
 
-## 培训课程知识入库（parse-course / ingest-course）
+## 统一知识库入库（现有 parsed 数据）
 
-除绩优案例外，还支持把培训课程资产（制式课件、教材、书稿）入库为独立的课程知识库。课程管线不走案例级 LLM 抽取，而是**规则切块**：pptx 按页切（正文 + 讲师备注合并，备注中"教学时间/教学方式"剔除、"教学目标"进 metadata），docx 按标题层级切，pdf 按页切；每门课额外产出一个课程概览 chunk。
+`parsed/` 下现有切片不需要重新解析或重新切片。先为全部 chunk 补齐来源类型和一级业务标签，审查报告后再统一 embedding 并原子重建一个 collection：
+
+```bash
+uv run xhbx-rag normalize-knowledge \
+  --input-dir parsed \
+  --out parsed_normalized
+
+uv run xhbx-rag index-dir \
+  --chunks-dir parsed_normalized \
+  --collection-name xhbx_knowledge_chunks \
+  --mode rebuild \
+  --batch-size 64
+```
+
+- `parsed/chunk/*.chunks.jsonl` 固定标记为 `source_kind=培训资料`。
+- `parsed/<案例目录>/chunks.jsonl` 固定标记为 `source_kind=绩优案例`。
+- 一级标签只允许 `产品知识`、`合规与风控`、`销售技能`、`客户经营`、`行业与公司`、`个人成长`、`组织发展`；一条 chunk 可以多标签，但只有一个 `primary_domain`。
+- 第一步只运行本地确定性规则，不调用模型。成功报告位于 `parsed_normalized/classification_report.json`；同一来源类型内重复的 `chunk_id` 按稳定路径保留首条、后续版本记录为 `deduplicated_chunk_id`，跨来源类型的 ID 冲突、坏 JSON、未分类或路径不支持都会返回非零且不发布半成品目录，空文件记录为 `skipped_empty`。报告同时给出输入 chunk 数、去重数和最终可入库数。
+- 第二步会产生 embedding 成本。它在全量预检后分批生成向量，写入 staging collection，校验数量、向量维度和全部 chunk ID 后才切换目标 collection。
+- 旧的 `xhbx_sales_chunks` 与 `xhbx_course_chunks` 不会被自动删除；迁移验证完成后再人工决定是否清理。
+
+检索只打开 `MILVUS_COLLECTION` 指定的一个物理 collection。查询理解仍保留 `case | course` 语义，并分别转换成 `source_kind=绩优案例 | 培训资料` 过滤；一级领域标签默认只做软加权，不做硬过滤。
+
+## 旧培训课程管线（兼容保留）
+
+`parse-course / ingest-course` 继续兼容旧的单课程解析流程。课程管线不走案例级 LLM 抽取，而是**规则切块**：pptx 按页切（正文 + 讲师备注合并，备注中"教学时间/教学方式"剔除、"教学目标"进 metadata），docx 按标题层级切，pdf 按页切；每门课额外产出一个课程概览 chunk。生产统一库迁移应优先使用上面的 `normalize-knowledge / index-dir`。
 
 ```bash
 # 一键：解析切块 → 写入课程库（MILVUS_COURSE_COLLECTION）
@@ -166,7 +191,7 @@ uv run python scripts/convert_legacy_formats.py --dir "data/培训数据" --dry-
 uv run python scripts/convert_legacy_formats.py --dir "data/培训数据"             # 执行转换
 ```
 
-检索时案例库与课程库**聚合召回**：向量召回按分数跨库合并，BM25 关键词召回把两库候选合池后统一打分，聚合后走同一条 RRF 融合 → 标签软加权 → rerank 链路。`search / answer` / Web / MCP 无需额外参数。
+旧命令仍可用于存量兼容，但生产 `search / answer` / Web / MCP 默认只读取统一 collection。
 
 ## Milvus Lite 本地入库
 
@@ -469,12 +494,12 @@ MILVUS_MODE=lite
 MILVUS_LITE_PATH=.local/milvus/xhbx_rag.db
 MILVUS_URI=http://localhost:19530
 MILVUS_TOKEN=
-MILVUS_COLLECTION=xhbx_sales_chunks
+MILVUS_COLLECTION=xhbx_knowledge_chunks
 MILVUS_COURSE_COLLECTION=xhbx_course_chunks
 MILVUS_VECTOR_DIM=
 ```
 
-`MILVUS_COLLECTION` 存放绩优案例知识；`MILVUS_COURSE_COLLECTION`（默认 `xhbx_course_chunks`）存放培训课程知识，检索时两库聚合召回。
+`MILVUS_COLLECTION` 是生产统一知识库。`MILVUS_COURSE_COLLECTION` 仅保留旧命令和旧配置解析兼容，不再作为第二个生产读库。
 
 Web AgentScope Studio trace：
 

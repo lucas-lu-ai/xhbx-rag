@@ -481,6 +481,15 @@ def test_search_evidence_domain_boost_promotes_domain_matched_candidate() -> Non
 
 
 def test_search_evidence_skips_domain_boost_when_query_has_no_domains() -> None:
+    class _NeutralQueryAgent:
+        def understand(self, query: str) -> QueryUnderstanding:
+            return QueryUnderstanding(
+                intent="general_sales_qa",
+                rewritten_query="今天天气怎么样",
+                needs_retrieval=True,
+                filters=QueryFilters(),
+            )
+
     embedding = _FakeEmbedding()
     store = _FakeHybridStore()
     hit = MilvusSearchHit(chunk=_chunk("c1", "客户抗拒时先聊家庭话题"), score=0.5)
@@ -489,8 +498,8 @@ def test_search_evidence_skips_domain_boost_when_query_has_no_domains() -> None:
     trace = MemoryTraceSink()
 
     search_evidence(
-        query="客户不想聊保险怎么开场？",
-        query_agent=_FakeQueryAgent(),
+        query="今天天气怎么样？",
+        query_agent=_NeutralQueryAgent(),
         embedding_client=embedding,
         store=store,
         reranker=_EmptyReranker(),
@@ -550,10 +559,11 @@ def test_search_evidence_emits_step_trace_events() -> None:
         "search.query_understood",
         "search.query_embedded",
         "search.vector_searched",
+        "search.domain_boosted",
         "search.reranked",
         "search.completed",
     ]
     assert trace.events[1].payload["rewritten_query"] == "客户抗拒谈保险时如何开场"
     assert trace.events[1].payload["collection_targets"] == ["case", "course"]
     assert trace.events[3].payload["candidate_count"] == 2
-    assert trace.events[4].payload["results"][0]["chunk_id"] == "c2"
+    assert trace.events[5].payload["results"][0]["chunk_id"] == "c2"

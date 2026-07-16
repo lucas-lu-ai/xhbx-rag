@@ -242,7 +242,7 @@ def test_preflight_rejects_non_local_docker_uri_without_constructing_client() ->
     assert constructed is False
 
 
-def test_preflight_loads_nonempty_collections_with_bounded_rpc_timeouts() -> None:
+def test_preflight_loads_unified_collection_with_bounded_rpc_timeouts() -> None:
     client = _ReadOnlyMilvusClient({"case": 3, "course": 5})
     received_kwargs: dict[str, object] = {}
 
@@ -261,17 +261,12 @@ def test_preflight_loads_nonempty_collections_with_bounded_rpc_timeouts() -> Non
     }
     assert stats == {
         "case": {"存在": True, "数据量": 3},
-        "course": {"存在": True, "数据量": 5},
     }
     assert client.calls == [
         ("has_collection:30", "case"),
         ("get_collection_stats:30", "case"),
         ("load_collection:30", "case"),
         ("get_load_state:30", "case"),
-        ("has_collection:30", "course"),
-        ("get_collection_stats:30", "course"),
-        ("load_collection:30", "course"),
-        ("get_load_state:30", "course"),
         ("close", None),
     ]
 
@@ -307,12 +302,12 @@ def test_preflight_rejects_all_missing_or_empty_collections() -> None:
     assert client.calls[-1] == ("close", None)
 
 
-def test_preflight_rejects_empty_primary_collection_when_course_is_nonempty() -> None:
+def test_preflight_ignores_legacy_course_when_unified_collection_is_empty() -> None:
     client = _ReadOnlyMilvusClient({"case": 0, "course": 2})
 
     with pytest.raises(
         EvaluationPreflightError,
-        match="主案例 collection 为空：case",
+        match="目标 collection 均为空",
     ):
         preflight_docker_milvus(
             _retrieval_config(),

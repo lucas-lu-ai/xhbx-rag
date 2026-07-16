@@ -82,6 +82,8 @@ def normalize_knowledge(input_dir: Path, out_dir: Path) -> NormalizationResult:
         domain: [] for domain in CANONICAL_DOMAINS
     }
     seen_ids: dict[str, dict[str, Any]] = {}
+    seen_source_kinds: dict[str, SourceKind] = {}
+    input_chunk_count = 0
     chunk_count = 0
     multi_domain_chunks = 0
 
@@ -134,23 +136,42 @@ def normalize_knowledge(input_dir: Path, out_dir: Path) -> NormalizationResult:
                 chunk = _parse_chunk(line, relative, line_no, errors)
                 if chunk is None:
                     continue
+                input_chunk_count += 1
                 location = {"path": relative, "line": line_no}
                 previous = seen_ids.get(chunk.chunk_id)
                 if previous is not None:
-                    errors.append(
+                    first_source_kind = seen_source_kinds[chunk.chunk_id]
+                    if first_source_kind != source_kind:
+                        errors.append(
+                            {
+                                **_issue(
+                                    "duplicate_chunk_id_source_conflict",
+                                    relative,
+                                    line_no,
+                                    "chunk_id 在培训资料与绩优案例之间冲突",
+                                ),
+                                "chunk_id": chunk.chunk_id,
+                                "source_kind": source_kind,
+                                "first_source_kind": first_source_kind,
+                                "first_location": previous,
+                            }
+                        )
+                        continue
+                    warnings.append(
                         {
                             **_issue(
-                                "duplicate_chunk_id",
+                                "deduplicated_chunk_id",
                                 relative,
                                 line_no,
-                                "chunk_id 在输入目录中重复",
+                                "chunk_id 与较早记录重复，已保留首个稳定版本",
                             ),
                             "chunk_id": chunk.chunk_id,
                             "first_location": previous,
                         }
                     )
-                else:
-                    seen_ids[chunk.chunk_id] = location
+                    continue
+                seen_ids[chunk.chunk_id] = location
+                seen_source_kinds[chunk.chunk_id] = source_kind
 
                 classification = infer_chunk_domains(chunk)
                 if classification is None:
@@ -209,6 +230,7 @@ def normalize_knowledge(input_dir: Path, out_dir: Path) -> NormalizationResult:
 
         report = _build_report(
             files=file_reports,
+            input_chunks=input_chunk_count,
             chunks=chunk_count,
             source_counts=source_counts,
             primary_counts=primary_counts,
@@ -321,6 +343,7 @@ def _append_sample(
 def _build_report(
     *,
     files: list[dict[str, Any]],
+    input_chunks: int,
     chunks: int,
     source_counts: Counter[str],
     primary_counts: Counter[str],
@@ -336,7 +359,11 @@ def _build_report(
             "input_files": len(files),
             "valid_files": sum(item["status"] == "normalized" for item in files),
             "empty_files": sum(item["status"] == "skipped_empty" for item in files),
+            "input_chunks": input_chunks,
             "chunks": chunks,
+            "deduplicated_chunks": sum(
+                item["code"] == "deduplicated_chunk_id" for item in warnings
+            ),
             "multi_domain_chunks": multi_domain_chunks,
         },
         "source_kind_distribution": dict(sorted(source_counts.items())),

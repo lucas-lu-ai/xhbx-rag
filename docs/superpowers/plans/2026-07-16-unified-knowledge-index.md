@@ -16,7 +16,7 @@
 - 一级标签只能是：`产品知识`、`合规与风控`、`销售技能`、`客户经营`、`行业与公司`、`个人成长`、`组织发展`。
 - 每条 chunk 必须有非空 `domain_tags`，且 `primary_domain` 必须包含于其中；规则版本固定为 `2026-07-16`。
 - 规范化不得调用大模型；运行时不得引入 XLSX 依赖。
-- 全量文件、schema、重复 ID 和标签合同校验必须发生在 Milvus client 创建与 embedding 调用之前。
+- 全量文件、schema、同来源重复 ID 审计、跨来源 ID 冲突和标签合同校验必须发生在 Milvus client 创建与 embedding 调用之前。
 - embedding 必须按 `--batch-size` 分批，默认 `64`。
 - 重建必须写 staging collection；失败保留旧目标 collection，成功后在写锁中 rename 切换。
 - `MILVUS_COURSE_COLLECTION` 继续解析兼容，但统一读路径只暴露 `MILVUS_COLLECTION=xhbx_knowledge_chunks`。
@@ -31,10 +31,10 @@
 ### 新增文件
 
 - `src/xhbx_rag/knowledge_domain.py`：七个一级标签的枚举、可解释规则评分、查询标签推断和 metadata 合同校验。
-- `src/xhbx_rag/knowledge_normalizer.py`：目录发现、来源判定、逐行校验、全局 ID 去重、报告生成和原子目录发布。
+- `src/xhbx_rag/knowledge_normalizer.py`：目录发现、来源判定、逐行校验、同来源 ID 稳定去重、跨来源冲突检查、报告生成和原子目录发布。
 - `src/xhbx_rag/directory_indexer.py`：规范化目录预检、批量 embedding、staging 写入校验和原子 collection 切换。
 - `tests/test_knowledge_domain.py`：规则、权重、多标签、主标签、幂等与合同测试。
-- `tests/test_knowledge_normalizer.py`：双 glob、来源路径、失败报告、空文件、重复 ID 和原子发布测试。
+- `tests/test_knowledge_normalizer.py`：双 glob、来源路径、失败报告、空文件、同来源重复版本、跨来源 ID 冲突和原子发布测试。
 - `tests/test_directory_indexer.py`：零副作用预检、batch、staging、校验、切换和失败回滚测试。
 
 ### 修改文件
@@ -277,20 +277,20 @@ def source_kind_for_path(root: Path, path: Path) -> SourceKind:
 2. 在 `out_dir.parent/.<name>.tmp-<uuid>` 写数据。
 3. 逐行 `json.loads` + `RagChunk.model_validate`，错误记录 `relative_path` 和 `line` 后继续扫描。
 4. 空文件记录 `status=skipped_empty`，不创建空产物。
-5. 用 `dict[chunk_id, location]` 检测全局重复并记录冲突双方。
+5. 用 `dict[chunk_id, location]` 检测全局重复；同一来源类型稳定保留首条并记录 `deduplicated_chunk_id` warning，跨来源类型记录阻塞错误。
 6. 每条有效记录调用领域分类；`None` 时记录 `unclassified`，不得写正式输出。
 7. 按输入相对路径写 compact JSONL，每行 `model_dump(mode="json")`，结尾保留换行。
-8. 报告包含 `counts`、`source_kind_distribution`、`primary_domain_distribution`、`domain_tag_distribution`、`multi_domain_chunks`、`warnings`、`errors`、`samples`、`files[{input_sha256, output_sha256}]`。
+8. 报告包含 `counts.input_chunks/chunks/deduplicated_chunks`、`source_kind_distribution`、`primary_domain_distribution`、`domain_tag_distribution`、`multi_domain_chunks`、`warnings`、`errors`、`samples`、`files[{input_sha256, output_sha256}]`。
 9. 成功时把报告写进 staging 后原子发布；失败时删除 staging，并把报告写到 `out_dir.with_name(out_dir.name + ".classification_report.json")`。
 
 - [ ] **Step 4: 写失败安全测试**
 
 ```python
-def test_empty_file_is_warning_but_bad_json_and_duplicates_fail_without_publish(tmp_path: Path) -> None:
+def test_empty_file_and_same_source_duplicates_warn_but_bad_json_fails_without_publish(tmp_path: Path) -> None:
     input_dir, out_dir = tmp_path / "parsed", tmp_path / "normalized"
     _write_jsonl(input_dir / "chunk" / "ok.chunks.jsonl", [_chunk("same", metadata={"tags": ["销售技能"]})])
     (input_dir / "chunk" / "empty.chunks.jsonl").write_text("", encoding="utf-8")
-    _write_jsonl(input_dir / "案例A" / "chunks.jsonl", [_chunk("same", metadata={"tags": ["客户经营"]})])
+    _write_jsonl(input_dir / "chunk" / "duplicate.chunks.jsonl", [_chunk("same", metadata={"tags": ["客户经营"]})])
     (input_dir / "案例B").mkdir(parents=True)
     (input_dir / "案例B" / "chunks.jsonl").write_text("{bad json}\n", encoding="utf-8")
     result = normalize_knowledge(input_dir, out_dir)
@@ -298,7 +298,8 @@ def test_empty_file_is_warning_but_bad_json_and_duplicates_fail_without_publish(
     assert result.success is False
     assert not out_dir.exists()
     assert report["counts"]["empty_files"] == 1
-    assert {error["code"] for error in report["errors"]} == {"duplicate_chunk_id", "invalid_json"}
+    assert {error["code"] for error in report["errors"]} == {"invalid_json"}
+    assert "deduplicated_chunk_id" in {warning["code"] for warning in report["warnings"]}
 
 
 def test_successful_rerun_atomically_replaces_old_output(tmp_path: Path) -> None:
@@ -885,7 +886,7 @@ uv run xhbx-rag normalize-knowledge \
   --out /tmp/xhbx-parsed-normalized-check
 ```
 
-Expected: exit 0；报告发现 1,078 个文件；977 个培训文件、101 个绩优案例文件；两个已知空文件为 `skipped_empty`；所有有效 chunk 都满足领域合同；无 duplicate、invalid、unclassified。若真实规则仍有 unclassified，只调整可解释关键词规则并新增对应回归测试，不添加兜底分类。
+Expected: exit 0；报告发现 1,078 个文件；977 个培训文件、101 个绩优案例文件；18,930 条输入记录中 260 条同来源重复版本为 `deduplicated_chunk_id`，得到 18,670 条唯一 chunk；两个已知空文件为 `skipped_empty`；所有有效 chunk 都满足领域合同；无 invalid、跨来源冲突或 unclassified。若真实规则仍有 unclassified，只调整可解释关键词规则并新增对应回归测试，不添加兜底分类。
 
 - [ ] **Step 4: 审计真实报告与幂等性**
 

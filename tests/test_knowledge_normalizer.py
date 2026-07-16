@@ -118,7 +118,7 @@ def test_normalize_preserves_relative_path_and_original_chunk_fields(
     assert report["files"][0]["output_sha256"]
 
 
-def test_empty_file_is_warning_but_bad_json_and_duplicate_ids_fail_without_publish(
+def test_empty_file_and_duplicate_ids_warn_but_bad_json_fails_without_publish(
     tmp_path: Path,
 ) -> None:
     input_dir = tmp_path / "parsed"
@@ -131,7 +131,7 @@ def test_empty_file_is_warning_but_bad_json_and_duplicate_ids_fail_without_publi
     empty_path.parent.mkdir(parents=True, exist_ok=True)
     empty_path.write_text("", encoding="utf-8")
     _write_jsonl(
-        input_dir / "案例A" / "chunks.jsonl",
+        input_dir / "chunk" / "duplicate.chunks.jsonl",
         [_chunk("same", metadata={"tags": ["客户经营"]})],
     )
     bad_path = input_dir / "案例B" / "chunks.jsonl"
@@ -144,11 +144,69 @@ def test_empty_file_is_warning_but_bad_json_and_duplicate_ids_fail_without_publi
     assert result.success is False
     assert not out_dir.exists()
     assert report["counts"]["empty_files"] == 1
-    assert {error["code"] for error in report["errors"]} == {
-        "duplicate_chunk_id",
-        "invalid_json",
+    assert {error["code"] for error in report["errors"]} == {"invalid_json"}
+    assert {warning["code"] for warning in report["warnings"]} == {
+        "deduplicated_chunk_id",
+        "skipped_empty",
     }
-    assert report["warnings"][0]["code"] == "skipped_empty"
+    assert report["counts"]["deduplicated_chunks"] == 1
+
+
+def test_duplicate_id_across_source_kinds_is_a_blocking_conflict(
+    tmp_path: Path,
+) -> None:
+    input_dir = tmp_path / "parsed"
+    out_dir = tmp_path / "normalized"
+    _write_jsonl(input_dir / "chunk" / "course.chunks.jsonl", [_chunk("same")])
+    _write_jsonl(input_dir / "案例A" / "chunks.jsonl", [_chunk("same")])
+
+    result = normalize_knowledge(input_dir, out_dir)
+
+    report = json.loads(result.report_path.read_text(encoding="utf-8"))
+    assert result.success is False
+    assert not out_dir.exists()
+    assert {error["code"] for error in report["errors"]} == {
+        "duplicate_chunk_id_source_conflict"
+    }
+
+
+def test_duplicate_ids_keep_first_stable_record_and_report_both_locations(
+    tmp_path: Path,
+) -> None:
+    input_dir = tmp_path / "parsed"
+    out_dir = tmp_path / "normalized"
+    _write_jsonl(
+        input_dir / "chunk" / "a.chunks.jsonl",
+        [_chunk("same", text="首个稳定版本")],
+    )
+    _write_jsonl(
+        input_dir / "chunk" / "b.chunks.jsonl",
+        [
+            _chunk("same", text="后续抽取版本"),
+            _chunk("unique", text="唯一记录"),
+        ],
+    )
+
+    result = normalize_knowledge(input_dir, out_dir)
+
+    report = json.loads(result.report_path.read_text(encoding="utf-8"))
+    first = load_chunks_jsonl(out_dir / "chunk" / "a.chunks.jsonl")
+    second = load_chunks_jsonl(out_dir / "chunk" / "b.chunks.jsonl")
+    warning = next(
+        item
+        for item in report["warnings"]
+        if item["code"] == "deduplicated_chunk_id"
+    )
+    assert result.success is True
+    assert report["counts"]["input_chunks"] == 3
+    assert report["counts"]["chunks"] == 2
+    assert report["counts"]["deduplicated_chunks"] == 1
+    assert first[0].text == "首个稳定版本"
+    assert [chunk.chunk_id for chunk in second] == ["unique"]
+    assert warning["first_location"] == {
+        "path": "chunk/a.chunks.jsonl",
+        "line": 1,
+    }
 
 
 def test_unclassified_chunk_fails_without_silent_fallback(tmp_path: Path) -> None:

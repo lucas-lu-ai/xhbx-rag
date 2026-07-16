@@ -137,7 +137,7 @@ def preflight_docker_milvus(
     primary_stats = stats.get(config.milvus_collection)
     if primary_stats is None or int(primary_stats["数据量"]) <= 0:
         raise EvaluationPreflightError(
-            f"Docker Milvus 主案例 collection 为空：{config.milvus_collection}"
+            f"Docker Milvus 统一 collection 为空：{config.milvus_collection}"
         )
     return stats
 
