@@ -163,7 +163,7 @@ def test_kb_search_knowledge_exposes_documented_parameters():
         "type": "string",
         "enum": list(mcp_server.CANONICAL_DOMAINS),
     }
-    assert properties["primaryDomains"]["minItems"] == 1
+    assert properties["primaryDomains"]["minItems"] == 0
     assert properties["primaryDomains"]["maxItems"] == 7
     assert properties["knowledgeTypes"]["default"] is None
     assert properties["retrievalMode"]["default"] == "HYBRID"
@@ -173,8 +173,8 @@ def test_kb_search_knowledge_exposes_documented_parameters():
     assert search_tool.inputSchema["required"] == ["query", "primaryDomains"]
     for domain in mcp_server.CANONICAL_DOMAINS:
         assert domain in search_tool.description
-    assert "1 至 3 个最相关领域" in search_tool.description
-    assert "无法可靠判断时传入全部七类" in search_tool.description
+    assert "一个或多个最相关领域" in search_tool.description
+    assert "无法匹配现有体系时传入空数组" in search_tool.description
     assert search_tool.outputSchema is not None
     assert search_tool.outputSchema["type"] == "object"
 
@@ -577,6 +577,27 @@ def test_kb_search_knowledge_accepts_all_canonical_domains():
     }
 
 
+def test_kb_search_knowledge_empty_primary_domains_searches_all_documents():
+    searcher = FakeSearcher()
+    server = create_mcp_server(searcher=searcher)
+
+    payload = _call_tool(
+        server,
+        "kb_search_knowledge",
+        {"query": "无法匹配现有体系的问题", "primaryDomains": []},
+    )
+
+    assert payload["success"] is True
+    assert searcher.calls == [
+        {
+            "query": "无法匹配现有体系的问题",
+            "top_n": 20,
+            "top_k": 10,
+            "filters": {},
+        }
+    ]
+
+
 def test_kb_search_knowledge_returns_empty_data_when_slice_not_requested():
     searcher = FakeSearcher()
     server = create_mcp_server(searcher=searcher)
@@ -619,7 +640,7 @@ def test_kb_search_knowledge_returns_parameter_error_for_empty_query():
 
 @pytest.mark.parametrize(
     "primary_domains",
-    [[], "销售技能", ["不存在的领域"], ["销售技能", 1]],
+    ["销售技能", ["不存在的领域"], ["销售技能", 1], ["销售技能"] * 8],
 )
 def test_kb_search_knowledge_wraps_invalid_primary_domains(primary_domains):
     searcher = FakeSearcher()
@@ -635,9 +656,7 @@ def test_kb_search_knowledge_wraps_invalid_primary_domains(primary_domains):
         "success": False,
         "data": None,
         "errorCode": "10004",
-        "errorMessage": (
-            "参数错误: primaryDomains 必须包含 1 到 7 个合法一级领域"
-        ),
+        "errorMessage": "参数错误: primaryDomains 必须是由 0 到 7 个合法一级领域组成的数组",
     }
     assert searcher.calls == []
 

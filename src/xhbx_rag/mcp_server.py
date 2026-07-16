@@ -26,10 +26,10 @@ from .resource_utils import close_resources, is_local_index_open_failure
 
 SERVER_NAME = "xhbx-rag"
 KB_SERVER_INSTRUCTIONS = (
-    "保险知识检索服务。调用 kb_search_knowledge 时，服务器问答智能体必须根据问题"
+    "保险知识检索服务。调用 kb_search_knowledge 时，primaryDomains 必须传入。"
+    "能够匹配现有一级体系时，服务器问答智能体应根据问题"
     "从产品知识、合规与风控、销售技能、客户经营、行业与公司、个人成长、组织发展"
-    "中选择 1 至 3 个最相关领域并通过 primaryDomains 传入；无法可靠判断时传入"
-    "全部七类。"
+    "中选择一个或多个最相关领域；无法匹配现有体系时传入空数组，由 MCP 查询全部文档。"
 )
 LEGACY_SERVER_INSTRUCTIONS = (
     "保险绩优案例销售知识检索服务。"
@@ -37,9 +37,10 @@ LEGACY_SERVER_INSTRUCTIONS = (
     "（含知识类型、原文引用与定位）；用 retrieval_status 查看索引与配置状态。"
 )
 BOTH_SERVER_INSTRUCTIONS = (
-    "保险知识检索服务。新调用方应使用 kb_search_knowledge，并从产品知识、"
+    "保险知识检索服务。新调用方应使用 kb_search_knowledge，primaryDomains 必须"
+    "传入。能够匹配现有一级体系时，从产品知识、"
     "合规与风控、销售技能、客户经营、行业与公司、个人成长、组织发展中选择"
-    "1 至 3 个最相关领域传入 primaryDomains，无法可靠判断时传入全部七类；"
+    "一个或多个最相关领域；无法匹配现有体系时传入空数组，由 MCP 查询全部文档；"
     "旧客户端也可继续使用 search_knowledge。"
 )
 SERVER_INSTRUCTIONS = KB_SERVER_INSTRUCTIONS
@@ -74,16 +75,16 @@ SUPPORTED_TOOL_PROFILES = {
     TOOL_PROFILE_BOTH,
 }
 PRIMARY_DOMAINS_ERROR = (
-    "参数错误: primaryDomains 必须包含 1 到 7 个合法一级领域"
+    "参数错误: primaryDomains 必须是由 0 到 7 个合法一级领域组成的数组"
 )
 PrimaryDomainsInput = Annotated[
     Any,
     Field(
-        description="一级领域数组，仅允许七类固定标签。",
+        description="必传一级领域数组；空数组表示全库检索，非空项仅允许七类固定标签。",
         json_schema_extra={
             "type": "array",
             "items": {"type": "string", "enum": list(CANONICAL_DOMAINS)},
-            "minItems": 1,
+            "minItems": 0,
             "maxItems": len(CANONICAL_DOMAINS),
         },
     ),
@@ -290,7 +291,7 @@ def create_mcp_server(
         if "SLICE" not in knowledge_types:
             return _mcp_success([])
 
-        filters = {"primary_domains": primary_domains}
+        filters = {"primary_domains": primary_domains} if primary_domains else {}
         try:
             result = active_searcher.search(
                 query=stripped_query,
@@ -347,10 +348,11 @@ def create_mcp_server(
         server.tool(
             name="kb_search_knowledge",
             description=(
-                "在统一知识库中检索文档切片。调用方必须根据问题从产品知识、"
+                "在统一知识库中检索文档切片，primaryDomains 必须传入。"
+                "能够匹配现有一级体系时，调用方应根据问题从产品知识、"
                 "合规与风控、销售技能、客户经营、行业与公司、个人成长、组织发展"
-                "中选择 1 至 3 个最相关领域，并通过 primaryDomains 传入；"
-                "无法可靠判断时传入全部七类。"
+                "中选择一个或多个最相关领域；无法匹配现有体系时传入空数组，"
+                "由 MCP 查询全部文档。"
             ),
         )(kb_search_knowledge)
 
@@ -425,7 +427,7 @@ def _mcp_error(error_code: str, error_message: str) -> dict[str, Any]:
 
 
 def _normalize_primary_domains(value: Any) -> list[str]:
-    if not isinstance(value, list) or not 1 <= len(value) <= len(CANONICAL_DOMAINS):
+    if not isinstance(value, list) or len(value) > len(CANONICAL_DOMAINS):
         raise ValueError(PRIMARY_DOMAINS_ERROR)
 
     normalized: list[str] = []
@@ -438,8 +440,6 @@ def _normalize_primary_domains(value: Any) -> list[str]:
         if domain not in normalized:
             normalized.append(domain)
 
-    if not normalized:
-        raise ValueError(PRIMARY_DOMAINS_ERROR)
     return normalized
 
 
