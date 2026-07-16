@@ -33,6 +33,8 @@ RAW_SCHEMA = sorted(
         "chunk_type",
         "stage",
         "scenario",
+        "source_kind",
+        "primary_domain",
         "metadata_json",
         "citations_json",
     }
@@ -186,6 +188,8 @@ def raw_row(chunk_id: str, text: str, vector: list[float]) -> dict[str, Any]:
         "chunk_type": "script",
         "stage": "成交",
         "scenario": "旧场景",
+        "source_kind": "绩优案例",
+        "primary_domain": "销售技能",
         "metadata_json": json.dumps({"case_name": "旧案例"}, ensure_ascii=False),
         "citations_json": json.dumps(
             [{"section_name": "旧章节", "quote": "旧引文"}], ensure_ascii=False

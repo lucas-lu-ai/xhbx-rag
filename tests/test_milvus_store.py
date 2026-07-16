@@ -20,6 +20,9 @@ def test_milvus_chunk_record_flattens_metadata_and_json_fields() -> None:
             "strategy_names": ["风险唤醒"],
             "knowledge_type": "场景话术",
             "tag_paths": ["销售技能/沟通谈判/保险理念沟通"],
+            "source_kind": "绩优案例",
+            "primary_domain": "销售技能",
+            "domain_tags": ["销售技能"],
         },
         citations=[EvidenceRef(section_name="第1节", quote="原文")],
         source_file="case.sales_insights.json",
@@ -33,6 +36,8 @@ def test_milvus_chunk_record_flattens_metadata_and_json_fields() -> None:
     assert row["case_name"] == "案例A"
     assert row["chunk_type"] == "script"
     assert row["stage"] == "售前"
+    assert row["source_kind"] == "绩优案例"
+    assert row["primary_domain"] == "销售技能"
     assert '"strategy_names"' in row["metadata_json"]
     assert '"knowledge_type": "场景话术"' in row["metadata_json"]
     assert "销售技能/沟通谈判/保险理念沟通" in row["metadata_json"]
@@ -141,7 +146,7 @@ def test_create_milvus_store_uses_docker_uri_and_token(monkeypatch) -> None:
     assert calls == [{"uri": "http://127.0.0.1:19530", "kwargs": {"token": "root:Milvus"}}]
 
 
-def test_create_retrieval_store_uses_selected_collection_names(monkeypatch) -> None:
+def test_create_retrieval_store_uses_only_unified_collection(monkeypatch) -> None:
     created = []
 
     def fake_create_milvus_store(config, collection_name=None):
@@ -162,11 +167,33 @@ def test_create_retrieval_store_uses_selected_collection_names(monkeypatch) -> N
         collection_names=["course_chunks", "case_chunks", "course_chunks"],
     )
 
-    assert created == ["course_chunks", "case_chunks"]
-    assert [item.collection_name for item in store.stores] == [
-        "course_chunks",
-        "case_chunks",
+    assert created == ["case_chunks"]
+    assert [item.collection_name for item in store.stores] == ["case_chunks"]
+
+
+def test_configured_collection_names_excludes_legacy_course_collection() -> None:
+    config = SimpleNamespace(
+        milvus_collection="xhbx_knowledge_chunks",
+        milvus_course_collection="xhbx_course_chunks",
+    )
+
+    assert milvus_store.configured_collection_names(config) == [
+        "xhbx_knowledge_chunks"
     ]
+
+
+def test_filter_expr_supports_source_kinds_and_primary_domains() -> None:
+    expression = milvus_store._build_filter_expr(
+        {
+            "source_kinds": ["培训资料"],
+            "primary_domains": ["产品知识", "合规与风控"],
+        }
+    )
+
+    assert expression == (
+        'source_kind in ["培训资料"] and '
+        'primary_domain in ["产品知识", "合规与风控"]'
+    )
 
 
 def test_milvus_lite_store_round_trips_records(tmp_path) -> None:
@@ -178,7 +205,13 @@ def test_milvus_lite_store_round_trips_records(tmp_path) -> None:
         chunk_id="chunk-1",
         chunk_type="script",
         text="客户不想聊保险时先聊家庭责任",
-        metadata={"case_name": "案例A", "stage": "售前"},
+        metadata={
+            "case_name": "案例A",
+            "stage": "售前",
+            "source_kind": "绩优案例",
+            "primary_domain": "销售技能",
+            "domain_tags": ["销售技能"],
+        },
         citations=[],
         source_file="case.sales_insights.json",
     )
@@ -189,12 +222,59 @@ def test_milvus_lite_store_round_trips_records(tmp_path) -> None:
     results = store.search(
         vector=[0.1, 0.2, 0.3],
         top_k=1,
-        filters={"chunk_types": ["script"], "stage": "售前"},
+        filters={
+            "chunk_types": ["script"],
+            "stage": "售前",
+            "source_kinds": ["绩优案例"],
+            "primary_domains": ["销售技能"],
+        },
     )
 
     assert len(results) == 1
     assert results[0].chunk.chunk_id == "chunk-1"
     assert results[0].chunk.text == "客户不想聊保险时先聊家庭责任"
+
+
+def test_milvus_lite_store_counts_ids_and_renames_collection(tmp_path) -> None:
+    store = MilvusLiteStore(
+        db_path=tmp_path / "rag.db",
+        collection_name="staging_chunks",
+    )
+    chunks = [
+        RagChunk(
+            chunk_id=f"chunk-{index}",
+            chunk_type="knowledge_entry",
+            text=f"培训知识 {index}",
+            metadata={
+                "source_kind": "培训资料",
+                "primary_domain": "产品知识",
+                "domain_tags": ["产品知识"],
+            },
+            citations=[],
+            source_file="course.pptx",
+        )
+        for index in range(3)
+    ]
+    store.ensure_collection(vector_dim=2)
+    store.upsert(
+        [
+            MilvusChunkRecord.from_chunk(chunk, [float(index), 0.1])
+            for index, chunk in enumerate(chunks)
+        ]
+    )
+
+    assert store.row_count() == 3
+    assert store.fetch_all_chunk_ids(batch_size=2) == {
+        "chunk-0",
+        "chunk-1",
+        "chunk-2",
+    }
+
+    store.rename_collection("knowledge_chunks")
+
+    assert store.collection_name == "knowledge_chunks"
+    assert store.client.has_collection("knowledge_chunks") is True
+    assert store.client.has_collection("staging_chunks") is False
 
 
 def test_milvus_lite_store_loads_released_collection_before_search(tmp_path) -> None:
@@ -551,6 +631,8 @@ def test_milvus_store_lists_distinct_filter_options(tmp_path) -> None:
         "chunk_types": ["objection_handling", "script", "training_course"],
         "stages": ["售前", "异议处理"],
         "case_names": ["案例A", "案例B"],
+        "source_kinds": [],
+        "primary_domains": [],
     }
 
 
@@ -597,6 +679,8 @@ def test_multi_collection_store_merges_filter_options(tmp_path) -> None:
         "chunk_types": ["script", "training_course"],
         "stages": ["售前"],
         "case_names": ["案例A"],
+        "source_kinds": [],
+        "primary_domains": [],
     }
 
 

@@ -26,12 +26,20 @@ _CHUNK_OUTPUT_FIELDS = [
     "chunk_type",
     "stage",
     "scenario",
+    "source_kind",
+    "primary_domain",
     "metadata_json",
     "citations_json",
 ]
 _ROLLBACK_OUTPUT_FIELDS = [*_CHUNK_OUTPUT_FIELDS, "text_hash", "vector"]
 _KEYWORD_CANDIDATE_OUTPUT_FIELDS = ["chunk_id", "text"]
-_FILTER_OPTION_OUTPUT_FIELDS = ["case_name", "chunk_type", "stage"]
+_FILTER_OPTION_OUTPUT_FIELDS = [
+    "case_name",
+    "chunk_type",
+    "stage",
+    "source_kind",
+    "primary_domain",
+]
 _KEYWORD_MIN_CANDIDATES = 50
 _KEYWORD_MAX_CANDIDATES = 200
 _KEYWORD_CANDIDATE_MULTIPLIER = 10
@@ -90,6 +98,8 @@ class MilvusChunkRecord:
             "chunk_type": self.chunk.chunk_type,
             "stage": str(metadata.get("stage", "")),
             "scenario": str(metadata.get("scenario", "")),
+            "source_kind": str(metadata.get("source_kind", "")),
+            "primary_domain": str(metadata.get("primary_domain", "")),
             "metadata_json": json.dumps(metadata, ensure_ascii=False),
             "citations_json": _citations_json(self.chunk.chunk_id, self.chunk.citations),
         }
@@ -132,6 +142,12 @@ class MilvusStore:
         schema.add_field(field_name="chunk_type", datatype=DataType.VARCHAR, max_length=64)
         schema.add_field(field_name="stage", datatype=DataType.VARCHAR, max_length=256)
         schema.add_field(field_name="scenario", datatype=DataType.VARCHAR, max_length=512)
+        schema.add_field(field_name="source_kind", datatype=DataType.VARCHAR, max_length=64)
+        schema.add_field(
+            field_name="primary_domain",
+            datatype=DataType.VARCHAR,
+            max_length=64,
+        )
         schema.add_field(field_name="metadata_json", datatype=DataType.VARCHAR, max_length=65535)
         schema.add_field(field_name="citations_json", datatype=DataType.VARCHAR, max_length=65535)
 
@@ -190,6 +206,36 @@ class MilvusStore:
     def drop_collection(self) -> None:
         if self.client.has_collection(self.collection_name):
             self.client.drop_collection(self.collection_name)
+
+    def row_count(self) -> int:
+        if not self.collection_exists():
+            return 0
+        stats = self.client.get_collection_stats(self.collection_name)
+        return int(stats.get("row_count", 0))
+
+    def fetch_all_chunk_ids(self, batch_size: int = 1000) -> set[str]:
+        if not self.collection_exists():
+            return set()
+        iterator = self.client.query_iterator(
+            collection_name=self.collection_name,
+            filter="",
+            output_fields=["chunk_id"],
+            batch_size=batch_size,
+        )
+        chunk_ids: set[str] = set()
+        try:
+            while True:
+                rows = iterator.next()
+                if not rows:
+                    break
+                chunk_ids.update(str(row["chunk_id"]) for row in rows)
+        finally:
+            iterator.close()
+        return chunk_ids
+
+    def rename_collection(self, new_name: str) -> None:
+        self.client.rename_collection(self.collection_name, new_name)
+        self.collection_name = new_name
 
     def search(
         self,
@@ -484,12 +530,7 @@ def create_retrieval_store(
 
 
 def configured_collection_names(config: Any) -> list[str]:
-    return _dedupe_collection_names(
-        [
-            getattr(config, "milvus_collection", ""),
-            getattr(config, "milvus_course_collection", ""),
-        ]
-    )
+    return _dedupe_collection_names([getattr(config, "milvus_collection", "")])
 
 
 def _selected_collection_names(
@@ -498,8 +539,10 @@ def _selected_collection_names(
 ) -> list[str]:
     if collection_names is None:
         return configured_collection_names(config)
-    selected = _dedupe_collection_names(collection_names)
-    return selected or configured_collection_names(config)
+    configured = configured_collection_names(config)
+    selected = set(_dedupe_collection_names(collection_names))
+    matched = [name for name in configured if name in selected]
+    return matched or configured
 
 
 def _dedupe_collection_names(collection_names: Sequence[str]) -> list[str]:
@@ -521,6 +564,14 @@ def _build_filter_expr(filters: dict[str, Any]) -> str:
         parts.append(f'stage == "{_escape(str(filters["stage"]))}"')
     if filters.get("case_name"):
         parts.append(f'case_name == "{_escape(str(filters["case_name"]))}"')
+    source_kinds = filters.get("source_kinds") or []
+    if source_kinds:
+        quoted = ", ".join(f'"{_escape(value)}"' for value in source_kinds)
+        parts.append(f"source_kind in [{quoted}]")
+    primary_domains = filters.get("primary_domains") or []
+    if primary_domains:
+        quoted = ", ".join(f'"{_escape(value)}"' for value in primary_domains)
+        parts.append(f"primary_domain in [{quoted}]")
     return " and ".join(parts)
 
 
@@ -529,6 +580,10 @@ def _filter_options_from_rows(rows: list[dict[str, Any]]) -> dict[str, list[str]
         "chunk_types": _distinct_sorted(row.get("chunk_type") for row in rows),
         "stages": _distinct_sorted(row.get("stage") for row in rows),
         "case_names": _distinct_sorted(row.get("case_name") for row in rows),
+        "source_kinds": _distinct_sorted(row.get("source_kind") for row in rows),
+        "primary_domains": _distinct_sorted(
+            row.get("primary_domain") for row in rows
+        ),
     }
 
 
@@ -550,6 +605,16 @@ def _merge_filter_options(
             value
             for options in options_by_store
             for value in options.get("case_names", [])
+        ),
+        "source_kinds": _distinct_sorted(
+            value
+            for options in options_by_store
+            for value in options.get("source_kinds", [])
+        ),
+        "primary_domains": _distinct_sorted(
+            value
+            for options in options_by_store
+            for value in options.get("primary_domains", [])
         ),
     }
 

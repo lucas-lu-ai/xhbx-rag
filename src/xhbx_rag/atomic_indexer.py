@@ -26,6 +26,8 @@ _RAW_ROW_STRING_FIELDS = (
     "chunk_type",
     "stage",
     "scenario",
+    "source_kind",
+    "primary_domain",
     "metadata_json",
     "citations_json",
 )
