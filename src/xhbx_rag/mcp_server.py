@@ -28,7 +28,8 @@ SERVER_NAME = "xhbx-rag"
 KB_SERVER_INSTRUCTIONS = (
     "保险知识检索服务。调用 kb_search_knowledge 时，服务器问答智能体必须根据问题"
     "从产品知识、合规与风控、销售技能、客户经营、行业与公司、个人成长、组织发展"
-    "中选择一级领域并通过 primaryDomains 传入。"
+    "中选择 1 至 3 个最相关领域并通过 primaryDomains 传入；无法可靠判断时传入"
+    "全部七类。"
 )
 LEGACY_SERVER_INSTRUCTIONS = (
     "保险绩优案例销售知识检索服务。"
@@ -38,7 +39,8 @@ LEGACY_SERVER_INSTRUCTIONS = (
 BOTH_SERVER_INSTRUCTIONS = (
     "保险知识检索服务。新调用方应使用 kb_search_knowledge，并从产品知识、"
     "合规与风控、销售技能、客户经营、行业与公司、个人成长、组织发展中选择"
-    "一级领域传入 primaryDomains；旧客户端也可继续使用 search_knowledge。"
+    "1 至 3 个最相关领域传入 primaryDomains，无法可靠判断时传入全部七类；"
+    "旧客户端也可继续使用 search_knowledge。"
 )
 SERVER_INSTRUCTIONS = KB_SERVER_INSTRUCTIONS
 
@@ -347,7 +349,8 @@ def create_mcp_server(
             description=(
                 "在统一知识库中检索文档切片。调用方必须根据问题从产品知识、"
                 "合规与风控、销售技能、客户经营、行业与公司、个人成长、组织发展"
-                "中选择 1 至 7 个一级领域，并通过 primaryDomains 传入。"
+                "中选择 1 至 3 个最相关领域，并通过 primaryDomains 传入；"
+                "无法可靠判断时传入全部七类。"
             ),
         )(kb_search_knowledge)
 

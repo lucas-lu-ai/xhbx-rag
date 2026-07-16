@@ -173,6 +173,8 @@ def test_kb_search_knowledge_exposes_documented_parameters():
     assert search_tool.inputSchema["required"] == ["query", "primaryDomains"]
     for domain in mcp_server.CANONICAL_DOMAINS:
         assert domain in search_tool.description
+    assert "1 至 3 个最相关领域" in search_tool.description
+    assert "无法可靠判断时传入全部七类" in search_tool.description
     assert search_tool.outputSchema is not None
     assert search_tool.outputSchema["type"] == "object"
 
