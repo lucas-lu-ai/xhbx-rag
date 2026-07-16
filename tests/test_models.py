@@ -1,5 +1,18 @@
-from xhbx_rag.models import CaseSalesInsightsSource, CaseSalesStrategy, EvidenceRef
+from xhbx_rag.models import CaseSalesInsightsSource, CaseSalesStrategy, EvidenceRef, RagChunk
 from xhbx_rag.models import StrategyCandidate
+
+
+def test_rag_chunk_accepts_knowledge_entry() -> None:
+    chunk = RagChunk(
+        chunk_id="knowledge-1",
+        chunk_type="knowledge_entry",
+        text="培训知识条目",
+        metadata={},
+        citations=[],
+        source_file="training.pptx",
+    )
+
+    assert chunk.chunk_type == "knowledge_entry"
 
 
 def test_missing_top_level_lists_default_to_empty() -> None:

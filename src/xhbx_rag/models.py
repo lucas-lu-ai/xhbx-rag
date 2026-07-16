@@ -444,6 +444,7 @@ ChunkType = Literal[
     "script",
     "objection_handling",
     "training_course",
+    "knowledge_entry",
 ]
 
 
