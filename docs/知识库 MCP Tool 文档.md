@@ -47,6 +47,10 @@
 |topK|int|否|返回数量，默认 10，最大 50|
 |includeDetails|boolean|否|是否返回完整切片结构，默认 false。省略或设为 false 时返回精简结构；设为 true 时返回原完整结构|
 
+标准 MCP 调用结果将业务对象放在 `CallToolResult.structuredContent`；
+新调用方应直接读取该字段，无需解析 `content[].text`。
+`content[].text` 仅作为旧客户端兼容回退保留。
+
 ### 返回 data
 
 `includeDetails` 省略或为 `false` 时，每条结果返回四字段精简切片摘要：`docId` 取第一条 citation 的 `source_id`，缺失时为空字符串；`knowledgeType` 固定为 `SLICE`，`title` 固定为 `切片`，`content` 为完整正文（缺失时为空字符串）：

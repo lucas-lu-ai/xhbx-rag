@@ -57,9 +57,23 @@ class FakeFilterOptionsProvider:
 
 
 def _call_tool(server, name: str, arguments: dict) -> dict:
-    blocks = asyncio.run(server.call_tool(name, arguments))
-    assert blocks, "工具应返回内容"
-    return json.loads(blocks[0].text)
+    result = asyncio.run(server.call_tool(name, arguments))
+    if isinstance(result, tuple):
+        blocks, structured_content = result
+        assert blocks, "工具应保留兼容文本内容"
+        assert isinstance(structured_content, dict)
+        return structured_content
+    assert result, "工具应返回内容"
+    return json.loads(result[0].text)
+
+
+def _call_structured_tool(server, name: str, arguments: dict) -> tuple[list, dict]:
+    result = asyncio.run(server.call_tool(name, arguments))
+    assert isinstance(result, tuple), "工具应返回兼容文本和 structuredContent"
+    blocks, structured_content = result
+    assert blocks
+    assert isinstance(structured_content, dict)
+    return list(blocks), structured_content
 
 
 def test_server_registers_expected_tools():
@@ -178,6 +192,45 @@ def test_kb_search_knowledge_exposes_documented_parameters():
     assert properties["topK"]["default"] == 10
     assert properties["includeDetails"]["default"] is False
     assert search_tool.inputSchema["required"] == ["query", "kbId"]
+    assert search_tool.outputSchema is not None
+    assert search_tool.outputSchema["type"] == "object"
+
+
+def test_kb_search_knowledge_returns_structured_content_with_text_fallback():
+    expected = {
+        "success": True,
+        "data": [
+            {
+                "docId": "pptx:案例A.pptx",
+                "knowledgeType": "SLICE",
+                "title": "切片",
+                "content": "完整正文",
+            }
+        ],
+        "errorCode": None,
+        "errorMessage": None,
+    }
+    server = create_mcp_server(
+        searcher=FakeSearcher(
+            result={
+                "results": [
+                    {
+                        "text": "完整正文",
+                        "citations": [{"source_id": "pptx:案例A.pptx"}],
+                    }
+                ]
+            }
+        )
+    )
+
+    blocks, structured_content = _call_structured_tool(
+        server,
+        "kb_search_knowledge",
+        {"query": "客户经营", "kbId": 1},
+    )
+
+    assert structured_content == expected
+    assert json.loads(blocks[0].text) == expected
 
 
 def test_kb_search_knowledge_returns_wrapped_slice_results():

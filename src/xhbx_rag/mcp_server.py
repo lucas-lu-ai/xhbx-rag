@@ -271,7 +271,7 @@ def create_mcp_server(
         hybridWeights: dict[str, Any] | None = None,
         topK: int = DEFAULT_KB_TOP_K,
         includeDetails: bool = False,
-    ) -> dict:
+    ) -> dict[str, Any]:
         stripped_query = str(query or "").strip()
         if not stripped_query:
             return _mcp_error("10004", "参数错误: query 不能为空")
