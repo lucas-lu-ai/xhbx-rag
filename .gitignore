@@ -10,7 +10,7 @@ build/
 data/
 .env
 .env.mcp
-output/
+outputs/
 .local/
 parsed/
 .superpowers/
@@ -19,3 +19,4 @@ CLAUDE.md
 .claude/
 generated/
 .DS_Store
+parsed_normalized/
