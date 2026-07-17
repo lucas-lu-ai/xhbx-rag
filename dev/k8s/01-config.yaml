@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: xhbx-rag-config
+  namespace: xhbx-rag
+data:
+  BASE_URL: http://chat-model.xhbx-models.svc.cluster.local:8000/v1
+  MODEL_NAME: private-chat-model
+  VISION_MODEL_NAME: private-vision-model
+  EMBEDDING_BASE_URL: http://embedding-model.xhbx-models.svc.cluster.local:8000/v1
+  EMBEDDING_MODEL_NAME: private-embedding-model
+  RERANK_BASE_URL: http://rerank-model.xhbx-models.svc.cluster.local:8000/v1
+  RERANK_MODEL_NAME: private-rerank-model
+  MILVUS_MODE: docker
+  MILVUS_URI: http://standalone:19530
+  MILVUS_COLLECTION: xhbx_knowledge_chunks
+  MILVUS_COURSE_COLLECTION: xhbx_course_chunks
+  MILVUS_VECTOR_DIM: ""
+  WEB_STUDIO_TRACE: "false"
+  WEB_BATCH_CONCURRENCY: "3"
+  WEB_RETRIEVAL_TOP_N: "20"
+  WEB_RETRIEVAL_TOP_K: "5"
+  WEB_INGEST_MAX_UPLOAD_BYTES: "536870912"
+  WEB_INGEST_MAX_ZIP_ENTRIES: "2000"
+  WEB_INGEST_MAX_EXTRACTED_BYTES: "2147483648"
+  WEB_INGEST_MAX_ENTRY_BYTES: "536870912"
+  WEB_INGEST_MAX_COMPRESSION_RATIO: "100"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: xhbx-rag-secrets
+  namespace: xhbx-rag
+type: Opaque
+stringData:
+  API_KEY: not-required
+  EMBEDDING_API_KEY: not-required
+  RERANK_API_KEY: not-required
+  MINIO_ROOT_USER: xhbx-minio
+  MINIO_ROOT_PASSWORD: replace-before-deploy

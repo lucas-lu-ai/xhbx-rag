@@ -1,0 +1,79 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: xhbx-rag-index
+  namespace: xhbx-rag
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 21600
+  template:
+    metadata:
+      labels:
+        app: xhbx-rag-index
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        xhbx-rag/offline: "true"
+      initContainers:
+        - name: seed-knowledge
+          image: localhost/xhbx-rag-data:offline
+          imagePullPolicy: Never
+          command:
+            - sh
+            - -ec
+          args:
+            - |
+              rm -rf /work/parsed
+              mkdir -p /work/parsed
+              cp -R /seed/parsed/. /work/parsed/
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+              ephemeral-storage: 1Gi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+              ephemeral-storage: 4Gi
+          volumeMounts:
+            - name: knowledge-work
+              mountPath: /work
+      containers:
+        - name: index
+          image: localhost/xhbx-rag-api:offline
+          imagePullPolicy: Never
+          command:
+            - sh
+            - -ec
+          args:
+            - |
+              rm -rf /work/normalized
+              xhbx-rag normalize-knowledge \
+                --input-dir /work/parsed \
+                --out /work/normalized
+              xhbx-rag index-dir \
+                --chunks-dir /work/normalized \
+                --collection-name xhbx_knowledge_chunks \
+                --mode rebuild \
+                --batch-size 64
+          envFrom:
+            - configMapRef:
+                name: xhbx-rag-config
+            - secretRef:
+                name: xhbx-rag-secrets
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+              ephemeral-storage: 2Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+              ephemeral-storage: 8Gi
+          volumeMounts:
+            - name: knowledge-work
+              mountPath: /work
+      volumes:
+        - name: knowledge-work
+          emptyDir:
+            sizeLimit: 8Gi
