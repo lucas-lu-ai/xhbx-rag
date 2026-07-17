@@ -65,6 +65,53 @@ function EvidenceObjectionText({
   );
 }
 
+function EvidenceKnowledgeText({
+  segments
+}: {
+  segments: EvidenceTextSegment[];
+}) {
+  const summary = segments.find(
+    (
+      segment
+    ): segment is Extract<EvidenceTextSegment, { kind: "field" }> =>
+      segment.kind === "field" && segment.label === "摘要"
+  );
+  const keyPoints = segments.flatMap((segment) => {
+    if (segment.kind === "plain" || segment.label !== "关键要点") {
+      return [];
+    }
+    if (segment.kind === "block") {
+      return segment.items;
+    }
+    return [segment.value];
+  });
+
+  if (!summary && keyPoints.length === 0) {
+    return <p className="evidence-text">暂无知识摘要。</p>;
+  }
+
+  return (
+    <div className="evidence-text evidence-struct">
+      {summary && (
+        <p className="evidence-struct-row">
+          <span className="evidence-field-label">摘要</span>
+          <span className="evidence-field-value">{summary.value}</span>
+        </p>
+      )}
+      {keyPoints.length > 0 && (
+        <div className="evidence-struct-block">
+          <span className="evidence-field-label">关键要点</span>
+          <ul>
+            {keyPoints.map((item, index) => (
+              <li key={`key-point-${index}`}>{item}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // 来源引用默认最多显示这么多条，超出的收进“展开其余”，避免多副本/多片段刷屏。
 const MAX_VISIBLE_CITATIONS = 4;
 
@@ -284,7 +331,11 @@ export function EvidenceDetail({
           {score && <span>重排 {score}</span>}
         </span>
       </div>
-      <EvidenceObjectionText segments={textSegments} />
+      {evidence.chunk_type === "knowledge_entry" ? (
+        <EvidenceKnowledgeText segments={textSegments} />
+      ) : (
+        <EvidenceObjectionText segments={textSegments} />
+      )}
       {citations.length > 0 && (
         <div className="evidence-source-list" aria-label="证据来源">
           {(showAllCitations

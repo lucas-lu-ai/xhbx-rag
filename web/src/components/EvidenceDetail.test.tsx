@@ -859,6 +859,64 @@ test("没有提交回调时不渲染反馈区", () => {
   expect(screen.queryByText("召回是否准确？")).not.toBeInTheDocument();
 });
 
+test("产品知识正文只展示摘要和关键要点", () => {
+  const productKnowledge: RetrievalEvidence = {
+    ...evidence,
+    chunk_type: "knowledge_entry",
+    text: [
+      "案例：多倍保障重大疾病保险",
+      "知识类型：知识条目",
+      "标题：产品四大特色",
+      "分类：产品知识",
+      "摘要：概括产品的多次赔付和保费豁免特点。",
+      "关键要点：",
+      "- 六组重疾最高可赔付六次",
+      "- 首次理赔后仍享有其余保障",
+      "标签：",
+      "- 多次赔付",
+      "来源原文：",
+      "- 产品课件.pptx：六组重疾最高六次赔付"
+    ].join("\n")
+  };
+
+  render(<EvidenceDetail evidence={productKnowledge} index={0} />);
+
+  const detail = screen.getByRole("article", { name: "引用1明细" });
+  const labels = Array.from(
+    detail.querySelectorAll(".evidence-field-label")
+  ).map((node) => node.textContent);
+  expect(labels).toEqual(["摘要", "关键要点"]);
+  expect(
+    screen.getByText("概括产品的多次赔付和保费豁免特点。")
+  ).toBeInTheDocument();
+  expect(screen.getByText("六组重疾最高可赔付六次")).toBeInTheDocument();
+  expect(screen.getByText("首次理赔后仍享有其余保障")).toBeInTheDocument();
+  expect(screen.queryByText("产品四大特色")).not.toBeInTheDocument();
+  expect(screen.queryByText("产品知识")).not.toBeInTheDocument();
+  expect(screen.queryByText("多次赔付")).not.toBeInTheDocument();
+  expect(
+    screen.queryByText("暂无异议处理内容。")
+  ).not.toBeInTheDocument();
+});
+
+test("产品知识缺少摘要和关键要点时显示专属空状态", () => {
+  render(
+    <EvidenceDetail
+      evidence={{
+        ...evidence,
+        chunk_type: "knowledge_entry",
+        text: "案例：多倍保障重大疾病保险\n知识类型：知识条目"
+      }}
+      index={0}
+    />
+  );
+
+  expect(screen.getByText("暂无知识摘要。")).toBeInTheDocument();
+  expect(
+    screen.queryByText("暂无异议处理内容。")
+  ).not.toBeInTheDocument();
+});
+
 test("正文只按固定顺序展示三个异议字段", () => {
   const structured: RetrievalEvidence = {
     ...evidence,
