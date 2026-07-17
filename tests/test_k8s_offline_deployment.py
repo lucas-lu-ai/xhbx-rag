@@ -140,7 +140,6 @@ def test_all_kubernetes_documents_parse_and_have_expected_resources() -> None:
         ("Job", "xhbx-rag-index"),
         ("Deployment", "api"),
         ("Deployment", "web"),
-        ("Service", "web-nodeport"),
         ("Ingress", "xhbx-rag"),
     ):
         assert key in resources
@@ -238,14 +237,17 @@ def test_api_is_single_replica_recreate_and_web_proxies_to_it() -> None:
     assert resources[("Service", "web")]["spec"].get("type", "ClusterIP") == "ClusterIP"
 
 
-def test_access_offers_nodeport_and_ingress_without_exposing_api() -> None:
+def test_access_uses_web_hostport_and_ingress_without_exposing_api() -> None:
     resources = load_resources()
-    nodeport = resources[("Service", "web-nodeport")]
+    web = resources[("Deployment", "web")]
+    web_port = pod_spec(web)["containers"][0]["ports"][0]
     ingress = resources[("Ingress", "xhbx-rag")]
 
-    assert nodeport["spec"]["type"] == "NodePort"
-    assert nodeport["spec"]["ports"][0]["nodePort"] == 30088
+    assert web_port["containerPort"] == 80
+    assert web_port["hostPort"] == 33004
+    assert web_port["protocol"] == "TCP"
     assert ingress["spec"]["rules"][0]["host"] == "xhbx-rag.internal.example"
+    assert ("Service", "web-nodeport") not in resources
     assert ("Service", "api-nodeport") not in resources
     assert ("Ingress", "api") not in resources
 
@@ -260,7 +262,9 @@ def test_deployment_doc_covers_offline_delivery_and_operations() -> None:
         "kubectl label node",
         "xhbx-rag/offline=true",
         "kubectl wait --for=condition=complete job/xhbx-rag-index",
-        "http://<节点IP>:30088",
+        "http://<节点IP>:33004",
+        "hostPort: 33004",
+        "ss -lntp",
         "kubectl logs job/xhbx-rag-index",
         "kubectl rollout undo deployment/api",
         "kubectl delete namespace xhbx-rag",
@@ -270,4 +274,5 @@ def test_deployment_doc_covers_offline_delivery_and_operations() -> None:
         "不包含 `data/`",
     ):
         assert text in docs
+    assert "30088" not in docs
     assert "sk-" not in docs

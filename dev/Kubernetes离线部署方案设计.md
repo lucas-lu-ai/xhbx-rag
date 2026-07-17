@@ -78,7 +78,7 @@ dist/xhbx-rag-k8s-offline-amd64.tar.gz
 | MinIO | StatefulSet | 1 | 50Gi PVC | ClusterIP |
 | Milvus Standalone | StatefulSet | 1 | 50Gi PVC | ClusterIP |
 | API | Deployment，`Recreate` | 1 | `data` 100Gi、`.local` 10Gi | ClusterIP |
-| Web | Deployment | 1 | 无 | ClusterIP、NodePort、可选 Ingress |
+| Web | Deployment | 1 | 无 | ClusterIP、`hostPort: 33004`、可选 Ingress |
 
 首次入库使用 `batch/v1 Job`，成功后不再常驻。
 
@@ -103,9 +103,10 @@ dist/xhbx-rag-k8s-offline-amd64.tar.gz
 
 ## 7. 访问和安全边界
 
-- 兜底访问地址为 `http://<节点IP>:30088`。Kubernetes 默认 NodePort 范围不支持 `18088`。
+- 兜底访问地址为 `http://<节点IP>:33004`。由于 `33004` 超出 Kubernetes 默认 NodePort 范围，Web Pod 直接使用 `hostPort: 33004`。
 - 已有 Ingress Controller 时可使用内网域名，并在部署前替换示例域名。
-- API、Milvus、etcd、MinIO 不通过 NodePort 暴露。
+- API、Milvus、etcd、MinIO 仅使用 ClusterIP；Web 的 ClusterIP 继续供 Ingress 使用。
+- 目标工作节点的 TCP `33004` 必须未被占用，集群准入策略必须允许该 hostPort。
 - 当前应用没有企业身份认证层，生产环境由 Ingress、内网网关或访问控制设备承担 TLS 与认证。
 - Milvus 沿用现有 Compose 的 `seccomp: unconfined` 要求；严格 Pod Security Admission 环境需要配置例外。
 - PVC 使用默认 StorageClass；没有默认 StorageClass 时必须填写实际的 `storageClassName`。
@@ -117,7 +118,7 @@ dist/xhbx-rag-k8s-offline-amd64.tar.gz
 - 所有容器和 init container 都使用 `localhost/` 镜像并设置 `imagePullPolicy: Never`。
 - API 副本数为 1，更新策略为 `Recreate`。
 - 索引 Job 先复制数据，再规范化并原子重建 `xhbx_knowledge_chunks`。
-- NodePort 为 `30088`，API 和基础设施服务仅为 ClusterIP。
+- Web 容器设置 `hostPort: 33004`，不再创建 NodePort Service；API 和基础设施服务仅为 ClusterIP。
 - 打包脚本对错误架构参数返回非零，且使用显式镜像参数执行 `docker save`。
 - 导入脚本把 containerd 镜像导入 `k8s.io` 命名空间。
 - 文档覆盖首次部署、验证、日志、升级、重新入库、备份、回滚和卸载风险边界。

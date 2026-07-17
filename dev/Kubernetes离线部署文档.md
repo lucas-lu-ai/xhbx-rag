@@ -49,10 +49,10 @@ kubectl apply -f k8s/05-application.yaml
 kubectl apply -f k8s/06-access.yaml
 ```
 
-NodePort 访问地址：
+Web hostPort 访问地址：
 
 ```text
-http://<节点IP>:30088
+http://<节点IP>:33004
 ```
 
 以上是执行顺序摘要。首次操作前必须继续阅读环境检查、模型配置、StorageClass 和失败处理章节。
@@ -69,7 +69,7 @@ http://<节点IP>:30088
 | 索引任务 | Job | 一次性 | API + 数据镜像 | 规范化 chunk 并原子重建统一知识库 |
 | API | Deployment + ClusterIP | 1 | `localhost/xhbx-rag-api:offline` | FastAPI/Uvicorn 问答和 Web 入库服务 |
 | Web | Deployment + ClusterIP | 1 | `localhost/xhbx-rag-web:offline` | Nginx 托管前端并反代 `/api/` |
-| 外部访问 | NodePort + Ingress | - | - | NodePort 兜底，Ingress 可选 |
+| 外部访问 | Web hostPort + Ingress | - | - | 节点 `33004` 直连，Ingress 可选 |
 
 所有 Pod 都包含：
 
@@ -80,6 +80,8 @@ nodeSelector:
 ```
 
 这意味着只有已经导入镜像、并添加了该标签的节点才能运行服务。
+
+Web 容器把内部端口 `80` 映射到所在节点的 `hostPort: 33004`。之所以不使用 NodePort，是因为 `33004` 超出 Kubernetes 默认 NodePort 范围 `30000–32767`。
 
 ### 2.1 为什么 API 只能是一个副本
 
@@ -408,14 +410,14 @@ storageClassName: <客户实际StorageClass名称>
 
 ### 10.4 Ingress
 
-NodePort 不需要额外修改。使用 Ingress 时编辑 `k8s/06-access.yaml`：
+hostPort 已在 `k8s/05-application.yaml` 中固定为 `33004`。使用 Ingress 时编辑 `k8s/06-access.yaml`：
 
 ```yaml
 ingressClassName: nginx
 host: xhbx-rag.internal.example
 ```
 
-替换成客户实际 IngressClass 和内网域名。集群没有 Ingress Controller 时，Ingress 对象不会提供访问能力，直接使用 NodePort。
+替换成客户实际 IngressClass 和内网域名。集群没有 Ingress Controller 时，Ingress 对象不会提供访问能力，直接使用节点 hostPort。
 
 ## 11. 创建命名空间、配置和 PVC
 
@@ -542,6 +544,16 @@ kubectl wait --for=condition=complete job/xhbx-rag-index -n xhbx-rag --timeout=6
 
 只有索引 Job 显示 `Complete` 后才执行：
 
+先登录目标工作节点检查 TCP `33004` 是否被占用：
+
+```bash
+sudo ss -lntp | grep ':33004 ' || true
+```
+
+预期无输出。已有进程占用时必须先释放端口，否则 Web Pod 无法启动。集群准入策略还必须允许 `hostPort: 33004`；严格 Pod Security 或自定义策略拒绝 hostPort 时，需要集群管理员为该工作负载配置例外。
+
+确认后创建应用：
+
 ```bash
 kubectl apply -f k8s/05-application.yaml
 ```
@@ -553,7 +565,7 @@ kubectl rollout status deployment/api -n xhbx-rag --timeout=10m
 kubectl rollout status deployment/web -n xhbx-rag --timeout=5m
 ```
 
-创建访问资源：
+如需 Ingress，再创建 Ingress 资源：
 
 ```bash
 kubectl apply -f k8s/06-access.yaml
@@ -567,7 +579,7 @@ kubectl get deploy,pod,svc,ingress -n xhbx-rag -o wide
 
 ## 15. 访问方式
 
-### 15.1 NodePort
+### 15.1 节点 hostPort
 
 获取离线节点 IP：
 
@@ -578,10 +590,10 @@ kubectl get node <节点名> -o wide
 访问：
 
 ```text
-http://<节点IP>:30088
+http://<节点IP>:33004
 ```
 
-集群防火墙、安全组和节点防火墙必须允许内网用户访问 TCP `30088`。
+Web Pod 将容器端口 `80` 直接映射到所在节点 TCP `33004`。集群防火墙、安全组和节点防火墙必须允许批准的内网用户访问 TCP `33004`。
 
 ### 15.2 Ingress
 
@@ -617,11 +629,11 @@ kubectl get all,pvc,ingress -n xhbx-rag
 
 ### 16.2 API 和 Web
 
-通过 NodePort：
+通过节点 hostPort：
 
 ```bash
-curl -fsS http://<节点IP>:30088/api/status
-curl -fsS -o /dev/null http://<节点IP>:30088/
+curl -fsS http://<节点IP>:33004/api/status
+curl -fsS -o /dev/null http://<节点IP>:33004/
 ```
 
 `/api/status` 应包含：
@@ -657,7 +669,7 @@ PY
 curl -fsS \
   -H 'Content-Type: application/json' \
   -d '{"query":"保单整理有什么作用？","top_n":20,"top_k":5}' \
-  http://<节点IP>:30088/api/answer
+  http://<节点IP>:33004/api/answer
 ```
 
 响应必须包含非空 `answer`。这一步同时验证 Chat、Embedding、Milvus、Rerank 和答案生成链路。
@@ -941,15 +953,16 @@ kubectl get configmap xhbx-rag-config -n xhbx-rag -o yaml
 
 依次检查 Chat、Embedding、Rerank 根地址，确认没有重复拼接最终路径；再检查统一 collection 的 `row_count`。
 
-### 23.7 NodePort 无法访问
+### 23.7 hostPort 无法访问
 
 ```bash
-kubectl get svc web-nodeport -n xhbx-rag
+kubectl get pod -l app=web -n xhbx-rag -o wide
 kubectl get endpoints web -n xhbx-rag
-curl -fsS http://<节点IP>:30088/api/status
+sudo ss -lntp | grep ':33004 ' || true
+curl -fsS http://<节点IP>:33004/api/status
 ```
 
-确认节点防火墙、客户安全组和网络策略允许 TCP 30088。
+确认访问的节点 IP 与 Web Pod 所在节点一致，目标节点没有其他进程占用 `33004`，并检查客户安全组、节点防火墙和集群准入策略。
 
 ## 24. 上线前检查清单
 
@@ -966,5 +979,5 @@ curl -fsS http://<节点IP>:30088/api/status
 - [ ] API 与 Web Pod Ready。
 - [ ] `/api/status` 返回 `ok=true`。
 - [ ] 真实 `/api/answer` 返回非空答案。
-- [ ] NodePort 或 Ingress 只在批准的内网范围开放。
+- [ ] Web 所在节点的 `33004` 未被占用，hostPort 或 Ingress 只在批准的内网范围开放。
 - [ ] 已保存当前和上一版离线包及 PVC 备份策略。

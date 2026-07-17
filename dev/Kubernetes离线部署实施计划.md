@@ -49,7 +49,7 @@ EXPECTED_FILES = (
 )
 ```
 
-同一测试文件使用 `yaml.safe_load_all` 解析清单，遍历 StatefulSet、Deployment 和 Job 的 PodSpec，断言 `nodeSelector`、`imagePullPolicy` 和 `localhost/` 镜像前缀；同时检查索引 Job、单副本 API、`30088` NodePort、打包脚本和导入脚本。
+同一测试文件使用 `yaml.safe_load_all` 解析清单，遍历 StatefulSet、Deployment 和 Job 的 PodSpec，断言 `nodeSelector`、`imagePullPolicy` 和 `localhost/` 镜像前缀；同时检查索引 Job、单副本 API、Web `hostPort: 33004`、打包脚本和导入脚本。
 
 - [ ] **Step 2: 运行测试确认正确失败**
 
@@ -161,7 +161,9 @@ assert resources[("Namespace", "xhbx-rag")]
 assert resources[("ConfigMap", "xhbx-rag-config")]["data"]["MILVUS_COLLECTION"] == "xhbx_knowledge_chunks"
 assert resources[("Deployment", "api")]["spec"]["replicas"] == 1
 assert resources[("Deployment", "api")]["spec"]["strategy"]["type"] == "Recreate"
-assert resources[("Service", "web-nodeport")]["spec"]["ports"][0]["nodePort"] == 30088
+web_container = pod_spec(resources[("Deployment", "web")])["containers"][0]
+assert web_container["ports"][0]["hostPort"] == 33004
+assert ("Service", "web-nodeport") not in resources
 ```
 
 索引 Job 还要确认数据镜像位于 init container，主容器命令包含 `normalize-knowledge`、`index-dir`、`--mode rebuild` 和 `xhbx_knowledge_chunks`。
@@ -183,7 +185,7 @@ xhbx-rag normalize-knowledge --input-dir /work/parsed --out /work/normalized
 xhbx-rag index-dir --chunks-dir /work/normalized --collection-name xhbx_knowledge_chunks --mode rebuild --batch-size 64
 ```
 
-API 使用一个副本、`Recreate`、两个 PVC、`/api/status` 探针和 ClusterIP Service；Web 提供 ClusterIP、`30088` NodePort 与可编辑主机名的 Ingress。
+API 使用一个副本、`Recreate`、两个 PVC、`/api/status` 探针和 ClusterIP Service；Web 提供 ClusterIP、`hostPort: 33004` 与可编辑主机名的 Ingress，不再创建 NodePort Service。
 
 - [ ] **Step 5: 验证并提交**
 
@@ -206,7 +208,7 @@ git commit -m "feat: add registryless kubernetes manifests"
 
 - [ ] **Step 1: 编写文档覆盖失败测试**
 
-检查文档包含打包、containerd 导入、节点标签、资源 apply/wait、`30088` 访问、日志、升级、重新入库、备份、回滚和 namespace/PV 删除风险。
+检查文档包含打包、containerd 导入、节点标签、资源 apply/wait、`33004` 访问、hostPort 占用检查、日志、升级、重新入库、备份、回滚和 namespace/PV 删除风险。
 
 - [ ] **Step 2: 运行测试确认文档缺失**
 
