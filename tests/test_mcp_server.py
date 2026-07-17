@@ -188,8 +188,6 @@ def test_kb_search_knowledge_returns_structured_content_with_text_fallback():
                 "knowledgeType": "SLICE",
                 "title": "切片",
                 "content": "完整正文",
-                "primaryDomain": "销售技能",
-                "domainTags": ["销售技能", "客户经营"],
             }
         ],
         "errorCode": None,
@@ -231,8 +229,6 @@ def test_kb_search_knowledge_protocol_result_contains_structured_content():
                 "knowledgeType": "SLICE",
                 "title": "切片",
                 "content": "完整正文",
-                "primaryDomain": "销售技能",
-                "domainTags": ["销售技能", "客户经营"],
             }
         ],
         "errorCode": None,
@@ -406,9 +402,48 @@ def test_kb_search_knowledge_returns_only_compact_fields_by_default_or_when_disa
             "knowledgeType": "SLICE",
             "title": "切片",
             "content": "完整正文",
-            "primaryDomain": "客户经营",
-            "domainTags": ["客户经营"],
         }
+    ]
+
+
+def test_kb_search_knowledge_compact_results_do_not_exceed_top_k():
+    server = create_mcp_server(
+        searcher=FakeSearcher(
+            result={
+                "results": [
+                    {
+                        "text": f"正文{index}",
+                        "citations": [{"source_id": f"doc:{index}"}],
+                    }
+                    for index in range(3)
+                ]
+            }
+        )
+    )
+
+    payload = _call_tool(
+        server,
+        "kb_search_knowledge",
+        {
+            "query": "客户经营",
+            "primaryDomains": ["客户经营"],
+            "topK": 2,
+        },
+    )
+
+    assert payload["data"] == [
+        {
+            "docId": "doc:0",
+            "knowledgeType": "SLICE",
+            "title": "切片",
+            "content": "正文0",
+        },
+        {
+            "docId": "doc:1",
+            "knowledgeType": "SLICE",
+            "title": "切片",
+            "content": "正文1",
+        },
     ]
 
 
@@ -440,8 +475,6 @@ def test_compact_kb_search_results_use_empty_doc_id_for_missing_citation(
             "knowledgeType": "SLICE",
             "title": "切片",
             "content": "正文",
-            "primaryDomain": "",
-            "domainTags": [],
         }
     ]
 
@@ -467,8 +500,6 @@ def test_compact_kb_search_results_use_empty_content_when_text_is_missing():
             "knowledgeType": "SLICE",
             "title": "切片",
             "content": "",
-            "primaryDomain": "",
-            "domainTags": [],
         }
     ]
 
@@ -502,13 +533,11 @@ def test_compact_kb_search_results_use_empty_doc_id_when_first_citation_source_i
             "knowledgeType": "SLICE",
             "title": "切片",
             "content": "正文",
-            "primaryDomain": "",
-            "domainTags": [],
         }
     ]
 
 
-def test_kb_search_knowledge_uses_safe_domain_defaults_for_dirty_metadata():
+def test_kb_search_knowledge_compact_results_do_not_leak_dirty_metadata():
     server = create_mcp_server(
         searcher=FakeSearcher(
             result={
@@ -530,8 +559,14 @@ def test_kb_search_knowledge_uses_safe_domain_defaults_for_dirty_metadata():
         {"query": "客户经营", "primaryDomains": ["客户经营"]},
     )
 
-    assert payload["data"][0]["primaryDomain"] == ""
-    assert payload["data"][0]["domainTags"] == []
+    assert payload["data"] == [
+        {
+            "docId": "",
+            "knowledgeType": "SLICE",
+            "title": "切片",
+            "content": "正文",
+        }
+    ]
 
 
 def test_kb_search_knowledge_filters_by_normalized_primary_domains():

@@ -77,7 +77,7 @@ primary_domain in ["销售技能", "客户经营"]
 
 ### 精简响应
 
-`includeDetails` 省略或为 `false` 时，每条结果返回六个字段：
+`includeDetails` 省略或为 `false` 时，每条结果返回四个字段：
 
 ```json
 {
@@ -87,9 +87,7 @@ primary_domain in ["销售技能", "客户经营"]
       "docId": "pptx:案例A.pptx",
       "knowledgeType": "SLICE",
       "title": "切片",
-      "content": "完整正文",
-      "primaryDomain": "销售技能",
-      "domainTags": ["销售技能", "客户经营"]
+      "content": "完整正文"
     }
   ],
   "errorCode": null,
@@ -97,8 +95,9 @@ primary_domain in ["销售技能", "客户经营"]
 }
 ```
 
-`docId` 取第一条 citation 的 `source_id`，缺失时为空字符串；`primaryDomain` 缺失时为空
-字符串；`domainTags` 缺失或格式非法时为空数组。
+`docId` 取第一条 citation 的 `source_id`，缺失时为空字符串。`data` 按检索排序返回，
+数量最多为 `topK`；结果不足时按实际数量返回。领域元数据仅在
+`includeDetails=true` 的完整模式中返回。
 
 ### 完整响应
 

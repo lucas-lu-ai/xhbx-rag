@@ -304,7 +304,7 @@ def create_mcp_server(
         formatted = (
             _format_kb_search_results(result)
             if includeDetails
-            else _format_compact_kb_search_results(result)
+            else _format_compact_kb_search_results(result, top_k=top_k)
         )
         return _mcp_success(formatted)
 
@@ -471,15 +471,16 @@ def _normalize_domain_tags(value: Any) -> list[str]:
 
 def _format_compact_kb_search_results(
     result: dict[str, Any],
+    *,
+    top_k: int,
 ) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     raw_results = result.get("results", [])
     if not isinstance(raw_results, list):
         return items
-    for raw in raw_results:
+    for raw in raw_results[:top_k]:
         if not isinstance(raw, dict):
             continue
-        metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
         citations = raw.get("citations")
         first_citation = (
             citations[0]
@@ -494,8 +495,6 @@ def _format_compact_kb_search_results(
                 "knowledgeType": "SLICE",
                 "title": "切片",
                 "content": str(raw.get("text") or ""),
-                "primaryDomain": str(metadata.get("primary_domain") or ""),
-                "domainTags": _normalize_domain_tags(metadata.get("domain_tags")),
             }
         )
     return items
