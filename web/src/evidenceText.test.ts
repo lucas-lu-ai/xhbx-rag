@@ -147,6 +147,37 @@ test("tag_chunk 插入的标签行按 AI 归纳字段解析", () => {
   ]);
 });
 
+test("解析产品知识摘要和关键要点", () => {
+  const segments = parseEvidenceText(
+    [
+      "案例：多倍保障重大疾病保险",
+      "知识类型：知识条目",
+      "摘要：概括产品的多次赔付和保费豁免特点。",
+      "关键要点：",
+      "- 六组重疾最高可赔付六次",
+      "- 首次理赔后仍享有其余保障",
+      "标签：",
+      "- 多次赔付"
+    ].join("\n")
+  );
+
+  expect(segments).toContainEqual({
+    kind: "field",
+    label: "摘要",
+    value: "概括产品的多次赔付和保费豁免特点。",
+    origin: "generated"
+  });
+  expect(segments).toContainEqual({
+    kind: "block",
+    label: "关键要点",
+    items: [
+      "六组重疾最高可赔付六次",
+      "首次理赔后仍享有其余保障"
+    ],
+    origin: "generated"
+  });
+});
+
 test("空行被跳过，字段值里的冒号不影响解析", () => {
   const text = "定义：先谈价值：再谈价格\n\n置信度：high";
 

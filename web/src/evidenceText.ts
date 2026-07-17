@@ -29,6 +29,8 @@ const GENERATED_FIELD_LABELS = new Set([
   "避免做法",
   "置信度",
   "模型归纳",
+  "摘要",
+  "关键要点",
   "话术 ID",
   "场景",
   "客户触发点",
